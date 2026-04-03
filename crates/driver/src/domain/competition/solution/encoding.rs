@@ -746,14 +746,14 @@ mod test {
                 };
                 let (sell, buy, side) = fulfillment_assets(dto, &trade);
 
-                let quote = crate::domain::competition::order::Quote { 
+                let quote = crate::domain::competition::order::Quote {
                     sell: eth::Asset {
                         token: sell.token,
                         amount: TokenAmount::from(1000000000000),
                     },
                     buy: eth::Asset {
                         token: buy.token,
-                        amount: TokenAmount::from(1000000000000),
+                        amount: TokenAmount::from(1000016249548),
                     },
                     fee: eth::Asset {
                         token: buy.token,
