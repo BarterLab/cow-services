@@ -621,7 +621,10 @@ pub fn tx2(solution: &super::Solution) -> Result<(), Error> {
         trades.push(trade);
     }
 
-    dbg!(tokens, clearing_prices);
+    dbg!(&clearing_prices);
+    assert_eq!(clearing_prices[0], clearing_prices[2]);
+    assert_eq!(clearing_prices[1], clearing_prices[3]);
+
 
     Ok(())
 }
@@ -633,8 +636,8 @@ mod test {
         super::*,
         crate::{
             domain::{
-                competition::{self, order::{self, FeePolicy, TargetAmount}},
-                eth::{self, TokenAmount}, quote::Quote,
+                competition::{self, order::{self, TargetAmount}},
+                eth::{self, TokenAmount},
             },
             infra::config::file::FeeHandler,
         },
@@ -735,31 +738,29 @@ mod test {
 
     fn convert_trade(dto: &DtoSolution, trade: DtoTrade) -> super::super::Trade {
         match trade {
-            DtoTrade::Fulfillment(trade) => {
+            DtoTrade::Fulfillment(mut trade) => {
                 let uid = competition::order::Uid::from(&trade.order);
                 let owner = uid.owner();
-                let fee = trade.fee.unwrap_or_default();
+                trade.fee = None;
+                // let fee = trade.fee.unwrap_or_default();
                 let kind = if trade.fee.is_some() {
                     order::Kind::Limit
                 } else {
                     order::Kind::Market
                 };
-                let (sell, buy, side) = fulfillment_assets(dto, &trade);
+                let (mut sell, mut buy, side) = fulfillment_assets(dto, &trade);
+                sell.amount = TokenAmount::from(1000000000000);
+                buy.amount = TokenAmount::from(1000000000000);
 
-                let quote = crate::domain::competition::order::Quote {
-                    sell: eth::Asset {
-                        token: sell.token,
-                        amount: TokenAmount::from(1000000000000),
-                    },
-                    buy: eth::Asset {
-                        token: buy.token,
-                        amount: TokenAmount::from(1000016249548),
-                    },
-                    fee: eth::Asset {
-                        token: buy.token,
-                        amount: TokenAmount::from(505064),
-                    },
-                    solver: address!("0xa7842153fde380a864726d0e91f14f6ffab7d46c"),
+                let fee = match trade.fee {
+                    Some(fee) => {
+                        if fee == U256::ZERO {
+                            super::super::trade::Fee::Static
+                        } else {
+                            super::super::trade::Fee::Dynamic(order::SellAmount(fee))
+                        }
+                    }
+                    None => super::super::trade::Fee::Static,
                 };
 
                 super::super::Trade::Fulfillment(
@@ -784,19 +785,11 @@ mod test {
                                 data: Default::default(),
                                 signer: owner,
                             },
-                            protocol_fees: vec![
-                                FeePolicy::PriceImprovement { factor: 0.5, max_volume_factor: 0.0098, quote },
-                                FeePolicy::Volume { factor: 0.00003 }
-                            ],
+                            protocol_fees: vec![],
                             quote: None,
                         },
                         trade.executed_amount.into(),
-                        match trade.fee {
-                            Some(fee) => {
-                                super::super::trade::Fee::Dynamic(order::SellAmount(fee))
-                            }
-                            None => super::super::trade::Fee::Static,
-                        },
+                        fee,
                         eth::U256::ZERO,
                     )
                     .expect("dto fulfillment should convert into a valid domain fulfillment"),
@@ -810,11 +803,7 @@ mod test {
         let surplus_capturing_jit_order_owners = HashSet::new();
         super::super::Solution::new(
             super::super::Id::new(dto.id),
-            dto.trades
-                .clone()
-                .into_iter()
-                .map(|trade| convert_trade(&dto, trade))
-                .collect(),
+            dto.trades.clone().into_iter().map(|trade| convert_trade(&dto, trade)).collect(),
             dto.prices
                 .into_iter()
                 .map(|(token, price)| (token.into(), price))
