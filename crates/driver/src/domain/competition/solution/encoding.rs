@@ -633,8 +633,8 @@ mod test {
         super::*,
         crate::{
             domain::{
-                competition::{self, order},
-                eth,
+                competition::{self, order::{self, FeePolicy}},
+                eth::{self, TokenAmount}, quote::Quote,
             },
             infra::config::file::FeeHandler,
         },
@@ -746,6 +746,22 @@ mod test {
                 };
                 let (sell, buy, side) = fulfillment_assets(dto, &trade);
 
+                let quote = crate::domain::competition::order::Quote { 
+                    sell: eth::Asset {
+                        token: sell.token,
+                        amount: TokenAmount::from(1000000000000),
+                    },
+                    buy: eth::Asset {
+                        token: buy.token,
+                        amount: TokenAmount::from(1000000000000),
+                    },
+                    fee: eth::Asset {
+                        token: buy.token,
+                        amount: TokenAmount::from(505064),
+                    },
+                    solver: address!("0xa7842153fde380a864726d0e91f14f6ffab7d46c"),
+                };
+
                 super::super::Trade::Fulfillment(
                     super::super::trade::Fulfillment::new(
                         competition::Order {
@@ -768,7 +784,10 @@ mod test {
                                 data: Default::default(),
                                 signer: owner,
                             },
-                            protocol_fees: vec![],
+                            protocol_fees: vec![
+                                FeePolicy::PriceImprovement { factor: 0.5, max_volume_factor: 0.0098, quote },
+                                FeePolicy::Volume { factor: 0.00003 }
+                            ],
                             quote: None,
                         },
                         trade.executed_amount.into(),
