@@ -633,7 +633,7 @@ mod test {
         super::*,
         crate::{
             domain::{
-                competition::{self, order::{self, FeePolicy}},
+                competition::{self, order::{self, FeePolicy, TargetAmount}},
                 eth::{self, TokenAmount}, quote::Quote,
             },
             infra::config::file::FeeHandler,
@@ -774,7 +774,7 @@ mod test {
                             side,
                             kind,
                             app_data: Default::default(),
-                            partial: order::Partial::No,
+                            partial: order::Partial::Yes { available: TargetAmount(U256::from(1000000000000u64)) },
                             pre_interactions: vec![],
                             post_interactions: vec![],
                             sell_token_balance: order::SellTokenBalance::Erc20,
