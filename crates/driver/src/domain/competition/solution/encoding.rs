@@ -537,6 +537,7 @@ pub fn tx2(solution: &super::Solution) -> Result<(), Error> {
                 if trade.order().buy.token == eth::ETH_TOKEN {
                     native_unwrap += trade.buy_amount(&uniform_prices)?;
                 }
+                dbg!(&trade);
 
                 let custom_prices = trade.custom_prices(&uniform_prices)?;
                 (
@@ -636,15 +637,15 @@ mod test {
         super::*,
         crate::{
             domain::{
-                competition::{self, order::{self, TargetAmount}},
-                eth::{self, TokenAmount},
+                competition::{self, order::{self, FeePolicy, TargetAmount}, solution::trade::{Fee, Fulfillment}},
+                eth::{self, TokenAddress, TokenAmount}, quote::Quote,
             },
             infra::config::file::FeeHandler,
         },
         alloy::primitives::address,
         hex_literal::hex,
         solvers_dto::solution::{Fulfillment as DtoFulfillment, Interaction, Solution as DtoSolution, Trade as DtoTrade},
-        std::collections::HashSet,
+        std::collections::{HashMap, HashSet},
     };
 
     fn convert_call(call: solvers_dto::solution::Call) -> eth::Interaction {
@@ -741,7 +742,7 @@ mod test {
             DtoTrade::Fulfillment(mut trade) => {
                 let uid = competition::order::Uid::from(&trade.order);
                 let owner = uid.owner();
-                trade.fee = None;
+
                 // let fee = trade.fee.unwrap_or_default();
                 let kind = if trade.fee.is_some() {
                     order::Kind::Limit
@@ -752,13 +753,25 @@ mod test {
                 sell.amount = TokenAmount::from(1000000000000);
                 buy.amount = TokenAmount::from(1000000000000);
 
+                let quote = crate::domain::competition::order::Quote {
+                    sell: eth::Asset {
+                        token: sell.token,
+                        amount: TokenAmount::from(1000000000000),
+                    },
+                    buy: eth::Asset {
+                        token: buy.token,
+                        amount: TokenAmount::from(1000016249548),
+                    },
+                    fee: eth::Asset {
+                        token: buy.token,
+                        amount: TokenAmount::from(505064),
+                    },
+                    solver: address!("0xa7842153fde380a864726d0e91f14f6ffab7d46c"),
+                };
                 let fee = match trade.fee {
                     Some(fee) => {
-                        if fee == U256::ZERO {
-                            super::super::trade::Fee::Static
-                        } else {
-                            super::super::trade::Fee::Dynamic(order::SellAmount(fee))
-                        }
+
+                        super::super::trade::Fee::Dynamic(order::SellAmount(fee))
                     }
                     None => super::super::trade::Fee::Static,
                 };
@@ -785,7 +798,10 @@ mod test {
                                 data: Default::default(),
                                 signer: owner,
                             },
-                            protocol_fees: vec![],
+                            protocol_fees: vec![
+                                FeePolicy::PriceImprovement { factor: 0.5, max_volume_factor: 0.0098, quote },
+                                FeePolicy::Volume { factor: 0.00003 }
+                            ],
                             quote: None,
                         },
                         trade.executed_amount.into(),
@@ -801,20 +817,75 @@ mod test {
 
     fn convert_solution(dto: DtoSolution) -> super::super::Solution {
         let surplus_capturing_jit_order_owners = HashSet::new();
+        let mut trades:Vec<competition::solution::Trade> = dto.trades
+                .clone()
+                .into_iter()
+                .filter_map(|mut trade| {
+                    let trade = convert_trade(&dto, trade);
+                    match trade {
+                        super::super::Trade::Fulfillment(trade) => {
+                            let uniform_prices = ClearingPrices {
+                                sell: dto
+                                .prices.get(&trade.order().sell.token.0.0)
+                                .cloned()
+                                .unwrap(),
+                                buy: dto
+                                .prices.get(&trade.order().buy.token.0.0)
+                                .cloned()
+                                .unwrap(),
+                            };
+                            let trade = trade.with_protocol_fees(uniform_prices).unwrap();
+                            Some(super::super::Trade::Fulfillment(trade))
+                        },
+                        _ => None,
+                    }
+
+                })
+                .collect();
+
+        let mut prices:HashMap<TokenAddress, U256> = HashMap::new();
+
+        for trade in &mut trades {
+            match trade {
+                super::super::Trade::Fulfillment(trade) => {
+                    let uniform_prices = ClearingPrices {
+                        sell: dto
+                        .prices.get(&trade.order().sell.token.0.0)
+                        .cloned()
+                        .unwrap(),
+                        buy: dto
+                        .prices.get(&trade.order().buy.token.0.0)
+                        .cloned()
+                        .unwrap(),
+                    };
+
+                    dbg!(&trade);
+                    let custom_prices = trade.custom_prices(&uniform_prices).unwrap();
+                    let order = trade.order().clone();
+                    *trade = Fulfillment::new(order, TargetAmount(trade.executed().0.checked_add(trade.fee().0).unwrap()), Fee::Dynamic(U256::ZERO.into()), U256::ZERO).unwrap();
+
+                    prices.insert(trade.order().sell.token.0.0.into(), custom_prices.sell.into());
+                    prices.insert(trade.order().buy.token.0.0.into(), custom_prices.buy.into());
+                }
+                super::super::Trade::Jit(_) => continue,
+            }
+        }
         super::super::Solution::new(
             super::super::Id::new(dto.id),
-            dto.trades.clone().into_iter().map(|trade| convert_trade(&dto, trade)).collect(),
-            dto.prices
-                .into_iter()
-                .map(|(token, price)| (token.into(), price))
-                .collect(),
+            trades,
+            // dto.trades.clone().into_iter().map(|trade| convert_trade(&dto, trade)).collect(),
+            prices,
+            // dto.prices
+            //     .into_iter()
+            //     .map(|(token, price)| (token.into(), price))
+            //     .collect(),
             dto.pre_interactions.into_iter().map(convert_call).collect(),
             dto.interactions.into_iter().map(convert_interaction).collect(),
             dto.post_interactions.into_iter().map(convert_call).collect(),
             super::super::SolverInfo::for_tests(address!("0000000000000000000000000000000000000007")),
             eth::WethAddress(address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2").into()),
             dto.gas.map(eth::Gas::from),
-            FeeHandler::Driver,
+            FeeHandler::Solver,
             &surplus_capturing_jit_order_owners,
             dto.flashloans
                 .unwrap_or_default()
