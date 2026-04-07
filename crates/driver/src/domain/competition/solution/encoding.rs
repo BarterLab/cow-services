@@ -637,15 +637,15 @@ mod test {
         super::*,
         crate::{
             domain::{
-                competition::{self, order::{self, FeePolicy, TargetAmount}, solution::trade::{Fee, Fulfillment}},
-                eth::{self, TokenAddress, TokenAmount}, quote::Quote,
+                competition::{self, order::{self, FeePolicy, TargetAmount}},
+                eth::{self, TokenAmount},
             },
             infra::config::file::FeeHandler,
         },
         alloy::primitives::address,
         hex_literal::hex,
         solvers_dto::solution::{Fulfillment as DtoFulfillment, Interaction, Solution as DtoSolution, Trade as DtoTrade},
-        std::collections::{HashMap, HashSet},
+        std::collections::HashSet,
     };
 
     fn convert_call(call: solvers_dto::solution::Call) -> eth::Interaction {
@@ -817,68 +817,13 @@ mod test {
 
     fn convert_solution(dto: DtoSolution) -> super::super::Solution {
         let surplus_capturing_jit_order_owners = HashSet::new();
-        let mut trades:Vec<competition::solution::Trade> = dto.trades
-                .clone()
-                .into_iter()
-                .filter_map(|mut trade| {
-                    let trade = convert_trade(&dto, trade);
-                    match trade {
-                        super::super::Trade::Fulfillment(trade) => {
-                            let uniform_prices = ClearingPrices {
-                                sell: dto
-                                .prices.get(&trade.order().sell.token.0.0)
-                                .cloned()
-                                .unwrap(),
-                                buy: dto
-                                .prices.get(&trade.order().buy.token.0.0)
-                                .cloned()
-                                .unwrap(),
-                            };
-                            let trade = trade.with_protocol_fees(uniform_prices).unwrap();
-                            Some(super::super::Trade::Fulfillment(trade))
-                        },
-                        _ => None,
-                    }
-
-                })
-                .collect();
-
-        let mut prices:HashMap<TokenAddress, U256> = HashMap::new();
-
-        for trade in &mut trades {
-            match trade {
-                super::super::Trade::Fulfillment(trade) => {
-                    let uniform_prices = ClearingPrices {
-                        sell: dto
-                        .prices.get(&trade.order().sell.token.0.0)
-                        .cloned()
-                        .unwrap(),
-                        buy: dto
-                        .prices.get(&trade.order().buy.token.0.0)
-                        .cloned()
-                        .unwrap(),
-                    };
-
-                    dbg!(&trade);
-                    let custom_prices = trade.custom_prices(&uniform_prices).unwrap();
-                    let order = trade.order().clone();
-                    *trade = Fulfillment::new(order, TargetAmount(trade.executed().0.checked_add(trade.fee().0).unwrap()), Fee::Dynamic(U256::ZERO.into()), U256::ZERO).unwrap();
-
-                    prices.insert(trade.order().sell.token.0.0.into(), custom_prices.sell.into());
-                    prices.insert(trade.order().buy.token.0.0.into(), custom_prices.buy.into());
-                }
-                super::super::Trade::Jit(_) => continue,
-            }
-        }
         super::super::Solution::new(
             super::super::Id::new(dto.id),
-            trades,
-            // dto.trades.clone().into_iter().map(|trade| convert_trade(&dto, trade)).collect(),
-            prices,
-            // dto.prices
-            //     .into_iter()
-            //     .map(|(token, price)| (token.into(), price))
-            //     .collect(),
+            dto.trades.clone().into_iter().map(|trade| convert_trade(&dto, trade)).collect(),
+            dto.prices
+                .into_iter()
+                .map(|(token, price)| (token.into(), price))
+                .collect(),
             dto.pre_interactions.into_iter().map(convert_call).collect(),
             dto.interactions.into_iter().map(convert_interaction).collect(),
             dto.post_interactions.into_iter().map(convert_call).collect(),
