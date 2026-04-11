@@ -249,6 +249,7 @@ impl Ethereum {
             .to(tx.to)
             .value(tx.value.0)
             .input(tx.input.clone().into())
+            .gas_limit(8_000_000)
             .access_list(tx.access_list.clone().into());
 
         let tx_req = match self.simulation_gas_price().await {
