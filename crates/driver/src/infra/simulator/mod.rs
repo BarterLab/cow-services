@@ -125,8 +125,6 @@ impl Simulator {
             return Ok(gas);
         }
 
-        tracing::info!(?tx.gas, "simulating gas for transaction");
-
         let block = self.eth.current_block().borrow().number.into();
         Ok(match &self.inner {
             Inner::Tenderly(tenderly) => {

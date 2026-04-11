@@ -175,7 +175,9 @@ impl Settlement {
         let price = eth.gas_price().await?;
         // Hardcode 8kk gas here. It was eth.block_gas_limit()
         let gas_limit = 8_000_000.into();
+
         let gas = Gas::new(gas, gas_limit)?;
+        tracing::info!("Creating new settlement with gas {} with limit {}", gas.estimate, gas.limit);
 
         // Ensure that the solver has sufficient balance for the settlement to be mined
         // even if the gas price keeps climbing during the tx submission.
