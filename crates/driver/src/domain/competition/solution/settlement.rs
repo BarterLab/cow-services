@@ -401,8 +401,9 @@ impl Gas {
         // Also, some solutions can have significant gas refunds that are refunded at
         // the end of execution, so we want to increase gas limit enough so
         // those solutions don't revert with out of gas error.
-        const GAS_LIMIT_FACTOR: f64 = 2.0;
-        let estimate_with_buffer = eth::U256::from(f64::from(estimate.0) * GAS_LIMIT_FACTOR).into();
+
+        // const GAS_LIMIT_FACTOR: f64 = 2.0;
+        // let estimate_with_buffer = eth::U256::from(f64::from(estimate.0) * GAS_LIMIT_FACTOR).into();
 
         Ok(Self {
             estimate,
