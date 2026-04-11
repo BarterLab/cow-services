@@ -257,7 +257,7 @@ impl Ethereum {
             _ => tx_req,
         };
 
-        tracing::info!("simulating transaction. Gas {}", tx_req.gas);
+        tracing::info!("simulating transaction. Gas {:?}", tx_req.gas);
 
         let trace = self
             .web3
