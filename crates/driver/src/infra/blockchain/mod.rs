@@ -244,46 +244,40 @@ impl Ethereum {
     }
 
     pub async fn trace(&self, tx: &eth::Tx) -> Result<eth::Gas, Error> {
-        let tx = TransactionRequest::default()
+        let tx_req = TransactionRequest::default()
             .from(tx.from)
             .to(tx.to)
             .value(tx.value.0)
             .input(tx.input.clone().into())
             .access_list(tx.access_list.clone().into());
 
+        let tx_req = match self.simulation_gas_price().await {
+            Some(gas_price) => tx_req.with_gas_price(gas_price),
+            _ => tx_req,
+        };
+
         let trace = self
             .web3
             .provider
-            .trace_call(
-                &tx
-            )
+            .trace_call(&tx_req)
             .latest()
             .await?;
 
-        let traces = trace.trace;
+        let root = trace.trace.into_iter().next().ok_or(Error::Trace)?;
 
-        let trace = traces.get(0).ok_or(Error::Trace)?;
-
-        if let Some(err) = &trace.error {
+        if let Some(err) = &root.error {
             tracing::error!("trace error: {:?}", err);
-            Err(Error::Trace)
-        } else {
-            let max_gas_used = traces.iter().filter_map(|x| match &x.result {
-                Some(TraceOutput::Call(result)) => Some(result.gas_used),
-                _ => None,
-            }).max();
-
-            match (&trace.result, max_gas_used) {
-                (Some(TraceOutput::Call(result)), Some(max_gas)) => {
-                    if result.gas_used != max_gas {
-                        tracing::warn!("trace gas used {}, max gas used {}", result.gas_used, max_gas);
-                    }
-
-                    Ok(max_gas.into())
-                },
-                (_, _) => Err(Error::Trace),
-            }
+            return Err(Error::Trace);
         }
+
+        let execution_gas = match root.result {
+            Some(TraceOutput::Call(result)) => result.gas_used,
+            _ => return Err(Error::Trace),
+        };
+
+        // trace_call only reports EVM execution gas; the actual transaction also
+        // charges intrinsic costs (base fee, calldata, access list precharge).
+        Ok((execution_gas + intrinsic_gas(tx)).into())
     }
 
     /// The gas price is determined based on the deadline by which the
@@ -369,6 +363,29 @@ impl fmt::Debug for Ethereum {
             .field("gas", &"Arc<NativeGasEstimator>")
             .finish()
     }
+}
+
+fn intrinsic_gas(tx: &eth::Tx) -> u64 {
+    const BASE_TX_GAS: u64 = 21_000;
+    const ACCESS_LIST_ADDRESS_GAS: u64 = 2_400;
+    const ACCESS_LIST_STORAGE_KEY_GAS: u64 = 1_900;
+
+    let calldata_gas: u64 = tx
+        .input
+        .iter()
+        .map(|&b| if b == 0 { 4 } else { 16 })
+        .sum();
+
+    let access_list: alloy::eips::eip2930::AccessList = tx.access_list.clone().into();
+    let access_list_gas: u64 = access_list
+        .iter()
+        .map(|item| {
+            ACCESS_LIST_ADDRESS_GAS
+                + item.storage_keys.len() as u64 * ACCESS_LIST_STORAGE_KEY_GAS
+        })
+        .sum();
+
+    BASE_TX_GAS + calldata_gas + access_list_gas
 }
 
 #[derive(Debug, Error)]
