@@ -406,7 +406,7 @@ impl Gas {
 
         Ok(Self {
             estimate,
-            limit: std::cmp::min(max_gas, estimate_with_buffer),
+            limit: 8_000_000.into()
         })
     }
 
