@@ -173,10 +173,8 @@ impl Settlement {
         )
         .await?;
         let price = eth.gas_price().await?;
-        // Hardcode 8kk gas here. It was eth.block_gas_limit()
-        let gas_limit = 8_000_000.into();
 
-        let gas = Gas::new(gas, gas_limit)?;
+        let gas = Gas::new(gas, eth.block_gas_limit())?;
         tracing::info!("Creating new settlement with gas {} with limit {}", gas.estimate, gas.limit);
 
         // Ensure that the solver has sufficient balance for the settlement to be mined
@@ -402,12 +400,12 @@ impl Gas {
         // the end of execution, so we want to increase gas limit enough so
         // those solutions don't revert with out of gas error.
 
-        // const GAS_LIMIT_FACTOR: f64 = 2.0;
-        // let estimate_with_buffer = eth::U256::from(f64::from(estimate.0) * GAS_LIMIT_FACTOR).into();
+        const GAS_LIMIT_FACTOR: f64 = 2.5;
+        let estimate_with_buffer = eth::U256::from(f64::from(estimate.0) * GAS_LIMIT_FACTOR).into();
 
         Ok(Self {
             estimate,
-            limit: 8_000_000.into()
+            limit: std::cmp::min(estimate_with_buffer, max_gas),
         })
     }
 
