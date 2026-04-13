@@ -278,9 +278,7 @@ impl Ethereum {
             _ => return Err(Error::Trace),
         };
 
-        // trace_call only reports EVM execution gas; the actual transaction also
-        // charges intrinsic costs (base fee, calldata, access list precharge).
-        Ok((execution_gas + intrinsic_gas(tx)).into())
+        Ok(execution_gas.into())
     }
 
     /// The gas price is determined based on the deadline by which the
@@ -368,6 +366,7 @@ impl fmt::Debug for Ethereum {
     }
 }
 
+#[allow(unused)]
 fn intrinsic_gas(tx: &eth::Tx) -> u64 {
     const BASE_TX_GAS: u64 = 21_000;
     const ACCESS_LIST_ADDRESS_GAS: u64 = 2_400;
