@@ -208,7 +208,7 @@ impl Ethereum {
             _ => tx,
         };
 
-        let access_list = self.web3.provider.create_access_list(&tx).pending().await?;
+        let access_list = self.web3.provider.create_access_list(&tx).latest().await?;
 
         Ok(access_list
             .ensure_ok()
