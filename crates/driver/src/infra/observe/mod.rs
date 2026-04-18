@@ -467,7 +467,7 @@ pub fn sending_solve_request(solver: &str, remaining_time: Duration, is_quote_re
         .observe(remaining_time.as_secs_f64());
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OrderExcludedFromAuctionReason {
     CouldNotFetchBalance,
     InsufficientBalance,
