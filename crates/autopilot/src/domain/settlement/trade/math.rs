@@ -437,7 +437,7 @@ pub struct PriceLimits {
 /// - test_adjust_quote_to_out_market_buy_order_limits
 /// - test_adjust_quote_to_in_market_sell_order_limits
 /// - test_adjust_quote_to_in_market_buy_order_limits
-fn adjust_quote_to_order_limits(order: Order, quote: Quote) -> Result<PriceLimits, error::Math> {
+pub fn adjust_quote_to_order_limits(order: Order, quote: Quote) -> Result<PriceLimits, error::Math> {
     match order.side {
         order::Side::Sell => {
             let quote_buy_amount = quote
