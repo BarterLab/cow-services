@@ -10,6 +10,13 @@ use {
 
 impl SolveResponse {
     pub fn new(solved: Option<competition::Solved>, solver: &Solver) -> Self {
+        Self::new_many(solved.into_iter(), solver)
+    }
+
+    pub fn new_many(
+        solved: impl IntoIterator<Item = competition::Solved>,
+        solver: &Solver,
+    ) -> Self {
         let solutions = solved
             .into_iter()
             .map(|solved| Solution::new(solved.id.get(), solved, solver))
