@@ -322,6 +322,7 @@ http-timeout = "10s"
         )],
         post_interactions: vec![],
         gas: None,
+        state_overrides: None,
         flashloans: None,
         wrappers: vec![],
     }));

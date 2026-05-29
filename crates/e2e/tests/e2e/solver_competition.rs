@@ -485,6 +485,7 @@ async fn store_filtered_solutions(web3: Web3) {
         interactions: vec![],
         post_interactions: vec![],
         gas: None,
+        state_overrides: None,
         flashloans: None,
         wrappers: vec![],
     }));
@@ -515,6 +516,7 @@ async fn store_filtered_solutions(web3: Web3) {
         interactions: vec![],
         post_interactions: vec![],
         gas: None,
+        state_overrides: None,
         flashloans: None,
         wrappers: vec![],
     }));

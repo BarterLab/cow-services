@@ -45,6 +45,7 @@ impl Solutions {
                     .take(Self::PRICE_KEY_SAMPLE_SIZE)
                     .cloned()
                     .collect_vec();
+                let state_overrides = solution.state_overrides.clone();
 
                 competition::Solution::new(
                     competition::solution::Id::new(solution_id),
@@ -243,6 +244,7 @@ impl Solutions {
                     solver.clone(),
                     weth,
                     solution.gas.map(eth::Gas::from),
+                    state_overrides,
                     solver.config().fee_handler,
                     auction.surplus_capturing_jit_order_owners(),
                     solution.flashloans

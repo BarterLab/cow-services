@@ -15,7 +15,7 @@ use {
             solver::{ManageNativeToken, Solver},
         },
     },
-    alloy::network::TxSigner,
+    alloy::{network::TxSigner, rpc::types::state::StateOverride},
     chrono::Utc,
     futures::future::try_join_all,
     itertools::Itertools,
@@ -39,6 +39,20 @@ pub mod trade;
 pub use {error::Error, interaction::Interaction, settlement::Settlement, trade::Trade};
 
 type Prices = HashMap<eth::TokenAddress, eth::U256>;
+
+fn merge_state_overrides(
+    lhs: Option<&StateOverride>,
+    rhs: Option<&StateOverride>,
+) -> Result<Option<StateOverride>, error::Merge> {
+    match (lhs, rhs) {
+        (None, None) => Ok(None),
+        (Some(state_overrides), None) | (None, Some(state_overrides)) => {
+            Ok(Some(state_overrides.clone()))
+        }
+        (Some(lhs), Some(rhs)) if lhs == rhs => Ok(Some(lhs.clone())),
+        (Some(_), Some(_)) => Err(error::Merge::Incompatible("state overrides")),
+    }
+}
 
 fn canonicalize_prices(
     prices: Prices,
@@ -92,6 +106,8 @@ pub struct Solution {
     #[debug(ignore)]
     pub weth: eth::WethAddress,
     pub gas: Option<eth::Gas>,
+    #[debug(ignore)]
+    pub state_overrides: Option<StateOverride>,
     pub flashloans: HashMap<order::Uid, Flashloan>,
     #[debug(ignore)]
     pub wrappers: Vec<WrapperCall>,
@@ -109,6 +125,7 @@ impl Solution {
         solver: Solver,
         weth: eth::WethAddress,
         gas: Option<eth::Gas>,
+        state_overrides: Option<StateOverride>,
         fee_handler: FeeHandler,
         surplus_capturing_jit_order_owners: &HashSet<eth::Address>,
         flashloans: HashMap<order::Uid, Flashloan>,
@@ -173,6 +190,7 @@ impl Solution {
             solver,
             weth,
             gas,
+            state_overrides,
             flashloans,
             wrappers,
         };
@@ -410,6 +428,8 @@ impl Solution {
             merged.extend(other.flashloans.clone());
             merged
         };
+        let state_overrides =
+            merge_state_overrides(self.state_overrides.as_ref(), other.state_overrides.as_ref())?;
 
         // Merge remaining fields
         Ok(Solution {
@@ -436,6 +456,7 @@ impl Solution {
                 (None, Some(gas)) => Some(gas),
                 (None, None) => None,
             },
+            state_overrides,
             flashloans,
             wrappers: self.wrappers.clone(),
         })
@@ -762,6 +783,7 @@ pub mod error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::rpc::types::state::AccountOverride;
 
     #[test]
     fn canonicalize_prices_normalizes_eth_to_weth() {
@@ -837,5 +859,42 @@ mod tests {
         let fourth = Id::new_merged(&second, &first);
         assert_eq!(fourth.get(), 3);
         assert_eq!(fourth.solutions(), &[222, 111]);
+    }
+
+    #[test]
+    fn merge_state_overrides_keeps_single_or_equal_snapshot() {
+        let state_overrides = state_overrides(1);
+
+        assert_eq!(
+            merge_state_overrides(Some(&state_overrides), None).unwrap(),
+            Some(state_overrides.clone()),
+        );
+        assert_eq!(
+            merge_state_overrides(Some(&state_overrides), Some(&state_overrides)).unwrap(),
+            Some(state_overrides),
+        );
+    }
+
+    #[test]
+    fn merge_state_overrides_rejects_different_snapshots() {
+        let err = merge_state_overrides(
+            Some(&state_overrides(1)),
+            Some(&state_overrides(2)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, error::Merge::Incompatible("state overrides")));
+    }
+
+    fn state_overrides(balance: u64) -> StateOverride {
+        let mut state_overrides = StateOverride::default();
+        state_overrides.insert(
+            eth::Address::repeat_byte(0x11),
+            AccountOverride {
+                balance: Some(eth::U256::from(balance)),
+                ..Default::default()
+            },
+        );
+        state_overrides
     }
 }

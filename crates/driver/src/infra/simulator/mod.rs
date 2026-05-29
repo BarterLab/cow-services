@@ -3,6 +3,7 @@ use {
         domain::eth,
         infra::blockchain::{self, Ethereum},
     },
+    alloy::rpc::types::state::StateOverride,
     observe::future::Measure,
 };
 
@@ -92,40 +93,63 @@ impl Simulator {
     /// Simulate the access list needed by a transaction. If the transaction
     /// already has an access list, the returned access list will be a
     /// superset of the existing one.
-    pub async fn access_list(&self, tx: &eth::Tx) -> Result<eth::AccessList, Error> {
+    pub async fn access_list(
+        &self,
+        tx: &eth::Tx,
+        state_overrides: Option<&StateOverride>,
+    ) -> Result<eth::AccessList, Error> {
         if self.disable_access_lists {
             return Ok(tx.access_list.clone());
         }
         let block = self.eth.current_block().borrow().number.into();
-        let access_list = match &self.inner {
-            Inner::Tenderly(tenderly) => {
-                tenderly
-                    .simulate(tx, tenderly::GenerateAccessList::Yes)
+        let access_list = if let Some(state_overrides) = state_overrides {
+            self.eth
+                .create_access_list_with_state_overrides(tx.clone(), Some(state_overrides))
+                .await
+                .map_err(with(tx.clone(), block))?
+        } else {
+            match &self.inner {
+                Inner::Tenderly(tenderly) => {
+                    tenderly
+                        .simulate(tx, tenderly::GenerateAccessList::Yes)
+                        .await
+                        .map_err(with(tx.clone(), block))?
+                        .access_list
+                }
+                Inner::Ethereum | Inner::EthereumTrace => self
+                    .eth
+                    .create_access_list(tx.clone())
                     .await
-                    .map_err(with(tx.clone(), block))?
-                    .access_list
+                    .map_err(with(tx.clone(), block))?,
+                Inner::Enso(_) => self
+                    .eth
+                    .create_access_list(tx.clone())
+                    .await
+                    .map_err(with(tx.clone(), block))?,
             }
-            Inner::Ethereum | Inner::EthereumTrace => self
-                .eth
-                .create_access_list(tx.clone())
-                .await
-                .map_err(with(tx.clone(), block))?,
-            Inner::Enso(_) => self
-                .eth
-                .create_access_list(tx.clone())
-                .await
-                .map_err(with(tx.clone(), block))?,
         };
         Ok(tx.access_list.clone().merge(access_list))
     }
 
     /// Simulate the gas needed by a transaction.
-    pub async fn gas(&self, tx: &eth::Tx) -> Result<eth::Gas, Error> {
+    pub async fn gas(
+        &self,
+        tx: &eth::Tx,
+        state_overrides: Option<&StateOverride>,
+    ) -> Result<eth::Gas, Error> {
         if let Some(gas) = self.disable_gas {
             return Ok(gas);
         }
 
         let block = self.eth.current_block().borrow().number.into();
+        if let Some(state_overrides) = state_overrides {
+            return self
+                .eth
+                .estimate_gas_with_state_overrides(tx.clone(), Some(state_overrides))
+                .await
+                .map_err(with(tx.clone(), block));
+        }
+
         Ok(match &self.inner {
             Inner::Tenderly(tenderly) => {
                 tenderly

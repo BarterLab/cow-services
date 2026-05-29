@@ -9,7 +9,7 @@ use {
         eips::eip1559::Eip1559Estimation,
         network::TransactionBuilder,
         providers::Provider,
-        rpc::types::{TransactionReceipt, TransactionRequest},
+        rpc::types::{TransactionReceipt, TransactionRequest, state::StateOverride},
         transports::TransportErrorKind,
     },
     anyhow::anyhow,
@@ -194,6 +194,17 @@ impl Ethereum {
     where
         T: Into<TransactionRequest>,
     {
+        self.create_access_list_with_state_overrides(tx, None).await
+    }
+
+    pub async fn create_access_list_with_state_overrides<T>(
+        &self,
+        tx: T,
+        state_overrides: Option<&StateOverride>,
+    ) -> Result<eth::AccessList, Error>
+    where
+        T: Into<TransactionRequest>,
+    {
         let tx = tx.into();
 
         let gas_limit = match self.chain() {
@@ -208,17 +219,34 @@ impl Ethereum {
             _ => tx,
         };
 
-        let access_list = self.web3.provider.create_access_list(&tx).latest().await?;
+        let access_list = match state_overrides {
+            Some(state_overrides) => {
+                let params = serde_json::json!([tx, "latest", state_overrides]);
+                self.web3
+                    .provider
+                    .raw_request("eth_createAccessList".into(), params)
+                    .await?
+            }
+            None => self.web3.provider.create_access_list(&tx).latest().await?,
+        };
 
-        Ok(access_list
+        let access_list = access_list
             .ensure_ok()
-            .map_err(Error::AccessList)?
-            .access_list
-            .into())
+            .map_err(Error::AccessList)?;
+
+        Ok(access_list.access_list.into())
     }
 
     /// Estimate gas used by a transaction.
     pub async fn estimate_gas(&self, tx: eth::Tx) -> Result<eth::Gas, Error> {
+        self.estimate_gas_with_state_overrides(tx, None).await
+    }
+
+    pub async fn estimate_gas_with_state_overrides(
+        &self,
+        tx: eth::Tx,
+        state_overrides: Option<&StateOverride>,
+    ) -> Result<eth::Gas, Error> {
         let tx = TransactionRequest::default()
             .from(tx.from)
             .to(tx.to)
@@ -235,6 +263,7 @@ impl Ethereum {
             .web3
             .provider
             .estimate_gas(tx)
+            .overrides_opt(state_overrides.cloned())
             .latest()
             .await
             .map_err(Error::Rpc)?

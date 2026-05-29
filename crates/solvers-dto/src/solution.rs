@@ -1,5 +1,8 @@
 use {
-    alloy::primitives::{Address, U256},
+    alloy::{
+        primitives::{Address, U256},
+        rpc::types::state::StateOverride,
+    },
     number::serialization::HexOrDecimalU256,
     serde::{Deserialize, Serialize},
     serde_with::serde_as,
@@ -27,6 +30,8 @@ pub struct Solution {
     pub post_interactions: Vec<Call>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub state_overrides: Option<StateOverride>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flashloans: Option<HashMap<OrderUid, Flashloan>>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
