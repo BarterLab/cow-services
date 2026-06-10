@@ -15,7 +15,11 @@ use {
             solver::{ManageNativeToken, Solver},
         },
     },
-    alloy::{network::TxSigner, rpc::types::state::StateOverride},
+    alloy::{
+        network::TxSigner,
+        primitives::{map::B256HashMap, B256},
+        rpc::types::state::{AccountOverride, StateOverride},
+    },
     chrono::Utc,
     futures::future::try_join_all,
     itertools::Itertools,
@@ -49,9 +53,94 @@ fn merge_state_overrides(
         (Some(state_overrides), None) | (None, Some(state_overrides)) => {
             Ok(Some(state_overrides.clone()))
         }
-        (Some(lhs), Some(rhs)) if lhs == rhs => Ok(Some(lhs.clone())),
-        (Some(_), Some(_)) => Err(error::Merge::Incompatible("state overrides")),
+        (Some(lhs), Some(rhs)) => {
+            let mut merged = lhs.clone();
+            for (address, override_) in rhs {
+                match merged.get_mut(address) {
+                    Some(existing) => merge_account_override(existing, override_)?,
+                    None => {
+                        merged.insert(*address, override_.clone());
+                    }
+                }
+            }
+
+            Ok(Some(merged))
+        }
     }
+}
+
+fn merge_account_override(
+    lhs: &mut AccountOverride,
+    rhs: &AccountOverride,
+) -> Result<(), error::Merge> {
+    merge_override_field(&mut lhs.balance, &rhs.balance)?;
+    merge_override_field(&mut lhs.nonce, &rhs.nonce)?;
+    merge_override_field(&mut lhs.code, &rhs.code)?;
+    merge_override_field(&mut lhs.move_precompile_to, &rhs.move_precompile_to)?;
+
+    merge_storage_override(&mut lhs.state, &rhs.state)?;
+    merge_storage_override(&mut lhs.state_diff, &rhs.state_diff)?;
+    if let Some(state) = &mut lhs.state {
+        if let Some(state_diff) = lhs.state_diff.take() {
+            merge_storage_map(state, &state_diff)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_override_field<T: Clone + Eq>(
+    lhs: &mut Option<T>,
+    rhs: &Option<T>,
+) -> Result<(), error::Merge> {
+    let Some(rhs) = rhs else {
+        return Ok(());
+    };
+
+    match lhs {
+        Some(lhs) if lhs == rhs => Ok(()),
+        Some(_) => Err(error::Merge::Incompatible("state overrides")),
+        None => {
+            *lhs = Some(rhs.clone());
+            Ok(())
+        }
+    }
+}
+
+fn merge_storage_override(
+    lhs: &mut Option<B256HashMap<B256>>,
+    rhs: &Option<B256HashMap<B256>>,
+) -> Result<(), error::Merge> {
+    let Some(rhs) = rhs else {
+        return Ok(());
+    };
+
+    match lhs {
+        Some(lhs) => merge_storage_map(lhs, rhs),
+        None => {
+            *lhs = Some(rhs.clone());
+            Ok(())
+        }
+    }
+}
+
+fn merge_storage_map(
+    lhs: &mut B256HashMap<B256>,
+    rhs: &B256HashMap<B256>,
+) -> Result<(), error::Merge> {
+    for (slot, value) in rhs {
+        match lhs.get(slot) {
+            Some(existing) if existing != value => {
+                return Err(error::Merge::Incompatible("state overrides"));
+            }
+            Some(_) => {}
+            None => {
+                lhs.insert(*slot, *value);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn canonicalize_prices(
@@ -783,7 +872,6 @@ pub mod error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::rpc::types::state::AccountOverride;
 
     #[test]
     fn canonicalize_prices_normalizes_eth_to_weth() {
@@ -876,7 +964,49 @@ mod tests {
     }
 
     #[test]
-    fn merge_state_overrides_rejects_different_snapshots() {
+    fn merge_state_overrides_merges_different_accounts_and_slots() {
+        let account = eth::Address::repeat_byte(0x11);
+        let other_account = eth::Address::repeat_byte(0x22);
+
+        let merged = merge_state_overrides(
+            Some(&state_diff_overrides(account, [(1, 2)])),
+            Some(&state_diff_overrides(account, [(3, 4)])),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            merged
+                .get(&account)
+                .unwrap()
+                .state_diff
+                .as_ref()
+                .unwrap()
+                .len(),
+            2,
+        );
+
+        let merged = merge_state_overrides(
+            Some(&state_diff_overrides(account, [(1, 2)])),
+            Some(&state_diff_overrides(other_account, [(1, 2)])),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_state_overrides_rejects_conflicting_slots() {
+        let err = merge_state_overrides(
+            Some(&state_diff_overrides(eth::Address::repeat_byte(0x11), [(1, 2)])),
+            Some(&state_diff_overrides(eth::Address::repeat_byte(0x11), [(1, 3)])),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, error::Merge::Incompatible("state overrides")));
+    }
+
+    #[test]
+    fn merge_state_overrides_rejects_conflicting_account_fields() {
         let err = merge_state_overrides(
             Some(&state_overrides(1)),
             Some(&state_overrides(2)),
@@ -892,6 +1022,26 @@ mod tests {
             eth::Address::repeat_byte(0x11),
             AccountOverride {
                 balance: Some(eth::U256::from(balance)),
+                ..Default::default()
+            },
+        );
+        state_overrides
+    }
+
+    fn state_diff_overrides(
+        address: eth::Address,
+        values: impl IntoIterator<Item = (u8, u8)>,
+    ) -> StateOverride {
+        let mut state_overrides = StateOverride::default();
+        state_overrides.insert(
+            address,
+            AccountOverride {
+                state_diff: Some(
+                    values
+                        .into_iter()
+                        .map(|(slot, value)| (B256::repeat_byte(slot), B256::repeat_byte(value)))
+                        .collect(),
+                ),
                 ..Default::default()
             },
         );
