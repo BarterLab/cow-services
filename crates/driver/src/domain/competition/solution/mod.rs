@@ -15,7 +15,11 @@ use {
             solver::{ManageNativeToken, Solver},
         },
     },
-    alloy::network::TxSigner,
+    alloy::{
+        network::TxSigner,
+        primitives::{map::B256HashMap, B256},
+        rpc::types::state::{AccountOverride, StateOverride},
+    },
     chrono::Utc,
     futures::future::try_join_all,
     itertools::Itertools,
@@ -39,6 +43,105 @@ pub mod trade;
 pub use {error::Error, interaction::Interaction, settlement::Settlement, trade::Trade};
 
 type Prices = HashMap<eth::TokenAddress, eth::U256>;
+
+fn merge_state_overrides(
+    lhs: Option<&StateOverride>,
+    rhs: Option<&StateOverride>,
+) -> Result<Option<StateOverride>, error::Merge> {
+    match (lhs, rhs) {
+        (None, None) => Ok(None),
+        (Some(state_overrides), None) | (None, Some(state_overrides)) => {
+            Ok(Some(state_overrides.clone()))
+        }
+        (Some(lhs), Some(rhs)) => {
+            let mut merged = lhs.clone();
+            for (address, override_) in rhs {
+                match merged.get_mut(address) {
+                    Some(existing) => merge_account_override(existing, override_)?,
+                    None => {
+                        merged.insert(*address, override_.clone());
+                    }
+                }
+            }
+
+            Ok(Some(merged))
+        }
+    }
+}
+
+fn merge_account_override(
+    lhs: &mut AccountOverride,
+    rhs: &AccountOverride,
+) -> Result<(), error::Merge> {
+    merge_override_field(&mut lhs.balance, &rhs.balance)?;
+    merge_override_field(&mut lhs.nonce, &rhs.nonce)?;
+    merge_override_field(&mut lhs.code, &rhs.code)?;
+    merge_override_field(&mut lhs.move_precompile_to, &rhs.move_precompile_to)?;
+
+    merge_storage_override(&mut lhs.state, &rhs.state)?;
+    merge_storage_override(&mut lhs.state_diff, &rhs.state_diff)?;
+    if let Some(state) = &mut lhs.state {
+        if let Some(state_diff) = lhs.state_diff.take() {
+            merge_storage_map(state, &state_diff)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_override_field<T: Clone + Eq>(
+    lhs: &mut Option<T>,
+    rhs: &Option<T>,
+) -> Result<(), error::Merge> {
+    let Some(rhs) = rhs else {
+        return Ok(());
+    };
+
+    match lhs {
+        Some(lhs) if lhs == rhs => Ok(()),
+        Some(_) => Err(error::Merge::Incompatible("state overrides")),
+        None => {
+            *lhs = Some(rhs.clone());
+            Ok(())
+        }
+    }
+}
+
+fn merge_storage_override(
+    lhs: &mut Option<B256HashMap<B256>>,
+    rhs: &Option<B256HashMap<B256>>,
+) -> Result<(), error::Merge> {
+    let Some(rhs) = rhs else {
+        return Ok(());
+    };
+
+    match lhs {
+        Some(lhs) => merge_storage_map(lhs, rhs),
+        None => {
+            *lhs = Some(rhs.clone());
+            Ok(())
+        }
+    }
+}
+
+fn merge_storage_map(
+    lhs: &mut B256HashMap<B256>,
+    rhs: &B256HashMap<B256>,
+) -> Result<(), error::Merge> {
+    for (slot, value) in rhs {
+        match lhs.get(slot) {
+            Some(existing) if existing != value => {
+                return Err(error::Merge::Incompatible("state overrides"));
+            }
+            Some(_) => {}
+            None => {
+                lhs.insert(*slot, *value);
+            }
+        }
+    }
+
+    Ok(())
+}
 
 fn canonicalize_prices(
     prices: Prices,
@@ -92,6 +195,8 @@ pub struct Solution {
     #[debug(ignore)]
     pub weth: eth::WethAddress,
     pub gas: Option<eth::Gas>,
+    #[debug(ignore)]
+    pub state_overrides: Option<StateOverride>,
     pub flashloans: HashMap<order::Uid, Flashloan>,
     #[debug(ignore)]
     pub wrappers: Vec<WrapperCall>,
@@ -109,6 +214,7 @@ impl Solution {
         solver: Solver,
         weth: eth::WethAddress,
         gas: Option<eth::Gas>,
+        state_overrides: Option<StateOverride>,
         fee_handler: FeeHandler,
         surplus_capturing_jit_order_owners: &HashSet<eth::Address>,
         flashloans: HashMap<order::Uid, Flashloan>,
@@ -173,6 +279,7 @@ impl Solution {
             solver,
             weth,
             gas,
+            state_overrides,
             flashloans,
             wrappers,
         };
@@ -410,6 +517,8 @@ impl Solution {
             merged.extend(other.flashloans.clone());
             merged
         };
+        let state_overrides =
+            merge_state_overrides(self.state_overrides.as_ref(), other.state_overrides.as_ref())?;
 
         // Merge remaining fields
         Ok(Solution {
@@ -436,6 +545,7 @@ impl Solution {
                 (None, Some(gas)) => Some(gas),
                 (None, None) => None,
             },
+            state_overrides,
             flashloans,
             wrappers: self.wrappers.clone(),
         })
@@ -837,5 +947,104 @@ mod tests {
         let fourth = Id::new_merged(&second, &first);
         assert_eq!(fourth.get(), 3);
         assert_eq!(fourth.solutions(), &[222, 111]);
+    }
+
+    #[test]
+    fn merge_state_overrides_keeps_single_or_equal_snapshot() {
+        let state_overrides = state_overrides(1);
+
+        assert_eq!(
+            merge_state_overrides(Some(&state_overrides), None).unwrap(),
+            Some(state_overrides.clone()),
+        );
+        assert_eq!(
+            merge_state_overrides(Some(&state_overrides), Some(&state_overrides)).unwrap(),
+            Some(state_overrides),
+        );
+    }
+
+    #[test]
+    fn merge_state_overrides_merges_different_accounts_and_slots() {
+        let account = eth::Address::repeat_byte(0x11);
+        let other_account = eth::Address::repeat_byte(0x22);
+
+        let merged = merge_state_overrides(
+            Some(&state_diff_overrides(account, [(1, 2)])),
+            Some(&state_diff_overrides(account, [(3, 4)])),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            merged
+                .get(&account)
+                .unwrap()
+                .state_diff
+                .as_ref()
+                .unwrap()
+                .len(),
+            2,
+        );
+
+        let merged = merge_state_overrides(
+            Some(&state_diff_overrides(account, [(1, 2)])),
+            Some(&state_diff_overrides(other_account, [(1, 2)])),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_state_overrides_rejects_conflicting_slots() {
+        let err = merge_state_overrides(
+            Some(&state_diff_overrides(eth::Address::repeat_byte(0x11), [(1, 2)])),
+            Some(&state_diff_overrides(eth::Address::repeat_byte(0x11), [(1, 3)])),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, error::Merge::Incompatible("state overrides")));
+    }
+
+    #[test]
+    fn merge_state_overrides_rejects_conflicting_account_fields() {
+        let err = merge_state_overrides(
+            Some(&state_overrides(1)),
+            Some(&state_overrides(2)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, error::Merge::Incompatible("state overrides")));
+    }
+
+    fn state_overrides(balance: u64) -> StateOverride {
+        let mut state_overrides = StateOverride::default();
+        state_overrides.insert(
+            eth::Address::repeat_byte(0x11),
+            AccountOverride {
+                balance: Some(eth::U256::from(balance)),
+                ..Default::default()
+            },
+        );
+        state_overrides
+    }
+
+    fn state_diff_overrides(
+        address: eth::Address,
+        values: impl IntoIterator<Item = (u8, u8)>,
+    ) -> StateOverride {
+        let mut state_overrides = StateOverride::default();
+        state_overrides.insert(
+            address,
+            AccountOverride {
+                state_diff: Some(
+                    values
+                        .into_iter()
+                        .map(|(slot, value)| (B256::repeat_byte(slot), B256::repeat_byte(value)))
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        );
+        state_overrides
     }
 }

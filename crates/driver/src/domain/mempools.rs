@@ -158,6 +158,7 @@ impl Mempools {
         }
 
         let tx = settlement.transaction(settlement::Internalization::Enable);
+        let state_overrides = settlement.state_overrides();
 
         // Instantiate block stream and skip the current block before we submit the
         // settlement. This way we only run iterations in blocks that can potentially
@@ -170,7 +171,11 @@ impl Mempools {
         // delay between that and the actual execution can cause the simulation to be
         // invalid which doesn't make sense to submit to the mempool anymore.
         if mempool.reverts_can_get_mined() {
-            if let Err(err) = self.ethereum.estimate_gas(tx.clone()).await {
+            if let Err(err) = self
+                .ethereum
+                .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                .await
+            {
                 if err.is_revert() {
                     tracing::info!(
                         ?err,
@@ -280,7 +285,11 @@ impl Mempools {
                             });
                         }
                         // Check if transaction still simulates
-                        if let Err(err) = self.ethereum.estimate_gas(tx.clone()).await {
+                        if let Err(err) = self
+                            .ethereum
+                            .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                            .await
+                        {
                             if err.is_revert() {
                                 tracing::info!(
                                     settle_tx_hash = ?hash,
@@ -346,6 +355,7 @@ impl Mempools {
         }
 
         let tx = settlement.transaction(settlement::Internalization::Enable);
+        let state_overrides = settlement.state_overrides();
 
         // Instantiate block stream and skip the current block before we submit the
         // settlement. This way we only run iterations in blocks that can potentially
@@ -358,7 +368,11 @@ impl Mempools {
         // delay between that and the actual execution can cause the simulation to be
         // invalid which doesn't make sense to submit to the mempool anymore.
         if mempool.reverts_can_get_mined() {
-            if let Err(err) = self.ethereum.estimate_gas(tx.clone()).await {
+            if let Err(err) = self
+                .ethereum
+                .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                .await
+            {
                 if err.is_revert() {
                     tracing::info!(
                         ?err,
@@ -468,7 +482,11 @@ impl Mempools {
                             });
                         }
                         // Check if transaction still simulates
-                        if let Err(err) = self.ethereum.estimate_gas(tx.clone()).await {
+                        if let Err(err) = self
+                            .ethereum
+                            .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                            .await
+                        {
                             if err.is_revert() {
                                 tracing::info!(
                                     settle_tx_hash = ?hash,

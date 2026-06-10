@@ -748,7 +748,7 @@ impl Competition {
         settlement: &Settlement,
     ) -> Result<(), infra::simulator::Error> {
         let tx = settlement.transaction(settlement::Internalization::Enable);
-        let gas_needed_for_tx = self.simulator.gas(tx).await?;
+        let gas_needed_for_tx = self.simulator.gas(tx, settlement.state_overrides()).await?;
         if gas_needed_for_tx > settlement.gas.limit {
             return Err(infra::simulator::Error::Revert(RevertError {
                 err: SimulatorError::GasExceeded(gas_needed_for_tx, settlement.gas.limit),
