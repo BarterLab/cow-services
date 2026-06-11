@@ -1,5 +1,5 @@
 use {
-    super::{Auction, Order, order},
+    super::{Auction, order},
     crate::{
         domain::{
             competition::order::{SellTokenBalance, app_data::AppData},
@@ -8,19 +8,16 @@ use {
         },
         infra::{self, api::routes::solve::dto::SolveRequest, observe::metrics, tokens},
     },
-    alloy::primitives::{Bytes, FixedBytes},
     anyhow::{Context, Result},
     axum::{
         body::{self, Body},
         http::Request,
     },
-    chrono::Utc,
     futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered},
     itertools::Itertools,
     model::{
         interaction::InteractionData,
-        order::{OrderKind, SellTokenSource},
-        signature::Signature,
+        order::SellTokenSource,
     },
     shared::{
         account_balances::{BalanceFetching, Query},

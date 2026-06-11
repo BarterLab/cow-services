@@ -127,7 +127,7 @@ impl Competition {
                 tracing::error!(?err, "pre-processing auction failed");
                 Error::MalformedRequest
             })?;
-        let mut auction = Arc::unwrap_or_clone(tasks.auction.await);
+        let auction = Arc::unwrap_or_clone(tasks.auction.await);
 
         let settlement_contract = *self.eth.contracts().settlement().address();
         let solver_address = self.solver.address();
@@ -748,7 +748,10 @@ impl Competition {
         settlement: &Settlement,
     ) -> Result<(), infra::simulator::Error> {
         let tx = settlement.transaction(settlement::Internalization::Enable);
-        let gas_needed_for_tx = self.simulator.gas(tx, settlement.state_overrides()).await?;
+        let gas_needed_for_tx = self
+            .simulator
+            .gas(tx, settlement.state_overrides(), settlement.state_overrides_block())
+            .await?;
         if gas_needed_for_tx > settlement.gas.limit {
             return Err(infra::simulator::Error::Revert(RevertError {
                 err: SimulatorError::GasExceeded(gas_needed_for_tx, settlement.gas.limit),

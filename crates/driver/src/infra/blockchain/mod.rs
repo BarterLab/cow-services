@@ -15,6 +15,7 @@ use {
     anyhow::anyhow,
     chain::Chain,
     ethrpc::{Web3, alloy::ProviderLabelingExt, block_stream::CurrentBlockWatcher},
+    solvers_dto::solution::StateOverrideBlock,
     shared::{
         account_balances::{BalanceSimulator, SimulationError},
         gas_price_estimation::Eip1559EstimationExt,
@@ -83,6 +84,14 @@ pub enum RpcError {
     Alloy(#[from] alloy::transports::TransportError),
     #[error("unsupported chain")]
     UnsupportedChain(#[from] chain::ChainIdNotSupported),
+}
+
+fn state_override_block_param(block: Option<StateOverrideBlock>) -> serde_json::Value {
+    match block {
+        Some(StateOverrideBlock::Number(number)) => format!("0x{number:x}").into(),
+        Some(StateOverrideBlock::Pending) => "pending".into(),
+        None => "latest".into(),
+    }
 }
 
 /// The Ethereum blockchain.
@@ -194,13 +203,14 @@ impl Ethereum {
     where
         T: Into<TransactionRequest>,
     {
-        self.create_access_list_with_state_overrides(tx, None).await
+        self.create_access_list_with_state_overrides(tx, None, None).await
     }
 
     pub async fn create_access_list_with_state_overrides<T>(
         &self,
         tx: T,
         state_overrides: Option<&StateOverride>,
+        state_overrides_block: Option<StateOverrideBlock>,
     ) -> Result<eth::AccessList, Error>
     where
         T: Into<TransactionRequest>,
@@ -221,7 +231,11 @@ impl Ethereum {
 
         let access_list = match state_overrides {
             Some(state_overrides) => {
-                let params = serde_json::json!([tx, "latest", state_overrides]);
+                let params = serde_json::json!([
+                    tx,
+                    state_override_block_param(state_overrides_block),
+                    state_overrides,
+                ]);
                 self.web3
                     .provider
                     .raw_request("eth_createAccessList".into(), params)
@@ -239,13 +253,14 @@ impl Ethereum {
 
     /// Estimate gas used by a transaction.
     pub async fn estimate_gas(&self, tx: eth::Tx) -> Result<eth::Gas, Error> {
-        self.estimate_gas_with_state_overrides(tx, None).await
+        self.estimate_gas_with_state_overrides(tx, None, None).await
     }
 
     pub async fn estimate_gas_with_state_overrides(
         &self,
         tx: eth::Tx,
         state_overrides: Option<&StateOverride>,
+        state_overrides_block: Option<StateOverrideBlock>,
     ) -> Result<eth::Gas, Error> {
         let tx = TransactionRequest::default()
             .from(tx.from)
@@ -259,13 +274,17 @@ impl Ethereum {
             _ => tx,
         };
 
-        let estimated_gas = self
+        let estimate = self
             .web3
             .provider
             .estimate_gas(tx)
-            .overrides_opt(state_overrides.cloned())
-            .latest()
-            .await
+            .overrides_opt(state_overrides.cloned());
+
+        let estimated_gas = match state_overrides_block {
+            Some(StateOverrideBlock::Number(number)) => estimate.number(number).await,
+            Some(StateOverrideBlock::Pending) => estimate.pending().await,
+            None => estimate.latest().await,
+        }
             .map_err(Error::Rpc)?
             .into();
 

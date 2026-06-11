@@ -159,6 +159,7 @@ impl Mempools {
 
         let tx = settlement.transaction(settlement::Internalization::Enable);
         let state_overrides = settlement.state_overrides();
+        let state_overrides_block = settlement.state_overrides_block();
 
         // Instantiate block stream and skip the current block before we submit the
         // settlement. This way we only run iterations in blocks that can potentially
@@ -173,7 +174,11 @@ impl Mempools {
         if mempool.reverts_can_get_mined() {
             if let Err(err) = self
                 .ethereum
-                .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                .estimate_gas_with_state_overrides(
+                    tx.clone(),
+                    state_overrides,
+                    state_overrides_block,
+                )
                 .await
             {
                 if err.is_revert() {
@@ -287,7 +292,11 @@ impl Mempools {
                         // Check if transaction still simulates
                         if let Err(err) = self
                             .ethereum
-                            .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                            .estimate_gas_with_state_overrides(
+                                tx.clone(),
+                                state_overrides,
+                                state_overrides_block,
+                            )
                             .await
                         {
                             if err.is_revert() {
@@ -356,6 +365,7 @@ impl Mempools {
 
         let tx = settlement.transaction(settlement::Internalization::Enable);
         let state_overrides = settlement.state_overrides();
+        let state_overrides_block = settlement.state_overrides_block();
 
         // Instantiate block stream and skip the current block before we submit the
         // settlement. This way we only run iterations in blocks that can potentially
@@ -370,7 +380,11 @@ impl Mempools {
         if mempool.reverts_can_get_mined() {
             if let Err(err) = self
                 .ethereum
-                .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                .estimate_gas_with_state_overrides(
+                    tx.clone(),
+                    state_overrides,
+                    state_overrides_block,
+                )
                 .await
             {
                 if err.is_revert() {
@@ -484,7 +498,11 @@ impl Mempools {
                         // Check if transaction still simulates
                         if let Err(err) = self
                             .ethereum
-                            .estimate_gas_with_state_overrides(tx.clone(), state_overrides)
+                            .estimate_gas_with_state_overrides(
+                                tx.clone(),
+                                state_overrides,
+                                state_overrides_block,
+                            )
                             .await
                         {
                             if err.is_revert() {

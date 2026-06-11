@@ -25,6 +25,7 @@ use {
     itertools::Itertools,
     num::{BigRational, One},
     number::conversions::{big_rational_to_u256, u256_to_big_int, u256_to_big_rational},
+    solvers_dto::solution::StateOverrideBlock,
     std::{
         collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
         sync::atomic::{AtomicU64, Ordering},
@@ -66,6 +67,18 @@ fn merge_state_overrides(
 
             Ok(Some(merged))
         }
+    }
+}
+
+fn merge_state_override_blocks(
+    lhs: Option<StateOverrideBlock>,
+    rhs: Option<StateOverrideBlock>,
+) -> Result<Option<StateOverrideBlock>, error::Merge> {
+    match (lhs, rhs) {
+        (None, None) => Ok(None),
+        (Some(block), None) | (None, Some(block)) => Ok(Some(block)),
+        (Some(lhs), Some(rhs)) if lhs == rhs => Ok(Some(lhs)),
+        (Some(_), Some(_)) => Err(error::Merge::Incompatible("state override blocks")),
     }
 }
 
@@ -197,6 +210,7 @@ pub struct Solution {
     pub gas: Option<eth::Gas>,
     #[debug(ignore)]
     pub state_overrides: Option<StateOverride>,
+    pub state_overrides_block: Option<StateOverrideBlock>,
     pub flashloans: HashMap<order::Uid, Flashloan>,
     #[debug(ignore)]
     pub wrappers: Vec<WrapperCall>,
@@ -215,6 +229,7 @@ impl Solution {
         weth: eth::WethAddress,
         gas: Option<eth::Gas>,
         state_overrides: Option<StateOverride>,
+        state_overrides_block: Option<StateOverrideBlock>,
         fee_handler: FeeHandler,
         surplus_capturing_jit_order_owners: &HashSet<eth::Address>,
         flashloans: HashMap<order::Uid, Flashloan>,
@@ -280,6 +295,7 @@ impl Solution {
             weth,
             gas,
             state_overrides,
+            state_overrides_block,
             flashloans,
             wrappers,
         };
@@ -519,6 +535,8 @@ impl Solution {
         };
         let state_overrides =
             merge_state_overrides(self.state_overrides.as_ref(), other.state_overrides.as_ref())?;
+        let state_overrides_block =
+            merge_state_override_blocks(self.state_overrides_block, other.state_overrides_block)?;
 
         // Merge remaining fields
         Ok(Solution {
@@ -546,6 +564,7 @@ impl Solution {
                 (None, None) => None,
             },
             state_overrides,
+            state_overrides_block,
             flashloans,
             wrappers: self.wrappers.clone(),
         })
@@ -1014,6 +1033,30 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, error::Merge::Incompatible("state overrides")));
+    }
+
+    #[test]
+    fn merge_state_override_blocks_rejects_different_blocks() {
+        assert_eq!(
+            merge_state_override_blocks(Some(StateOverrideBlock::Pending), None).unwrap(),
+            Some(StateOverrideBlock::Pending),
+        );
+        assert_eq!(
+            merge_state_override_blocks(
+                Some(StateOverrideBlock::Number(1)),
+                Some(StateOverrideBlock::Number(1)),
+            )
+            .unwrap(),
+            Some(StateOverrideBlock::Number(1)),
+        );
+
+        let err = merge_state_override_blocks(
+            Some(StateOverrideBlock::Number(1)),
+            Some(StateOverrideBlock::Number(2)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, error::Merge::Incompatible("state override blocks")));
     }
 
     fn state_overrides(balance: u64) -> StateOverride {

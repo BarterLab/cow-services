@@ -46,6 +46,7 @@ impl Solutions {
                     .cloned()
                     .collect_vec();
                 let state_overrides = solution.state_overrides.clone();
+                let state_overrides_block = solution.state_overrides_block;
 
                 competition::Solution::new(
                     competition::solution::Id::new(solution_id),
@@ -245,6 +246,7 @@ impl Solutions {
                     weth,
                     solution.gas.map(eth::Gas::from),
                     state_overrides,
+                    state_overrides_block,
                     solver.config().fee_handler,
                     auction.surplus_capturing_jit_order_owners(),
                     solution.flashloans
