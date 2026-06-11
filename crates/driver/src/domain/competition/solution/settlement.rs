@@ -14,6 +14,7 @@ use {
     },
     alloy::{primitives::U256, rpc::types::state::StateOverride},
     futures::future::try_join_all,
+    solvers_dto::solution::StateOverrideBlock,
     std::collections::{BTreeSet, HashMap, HashSet},
     tracing::instrument,
 };
@@ -147,6 +148,7 @@ impl Settlement {
         // moving 1 wei into every smart contract to get a partial access list, and then
         // use that partial access list to calculate the final access list.
         let state_overrides = solution.state_overrides.as_ref();
+        let state_overrides_block = solution.state_overrides_block;
         let partial_access_lists = try_join_all(solution.user_trades().map(|trade| async {
             if !trade.order().buys_eth() || !trade.order().pays_to_contract(eth).await? {
                 return Ok(Default::default());
@@ -158,7 +160,7 @@ impl Settlement {
                 input: Default::default(),
                 access_list: Default::default(),
             };
-            Result::<_, Error>::Ok(simulator.access_list(&tx, state_overrides).await?)
+            Result::<_, Error>::Ok(simulator.access_list(&tx, state_overrides, state_overrides_block).await?)
         }))
         .await?;
         let partial_access_list = partial_access_lists
@@ -170,6 +172,7 @@ impl Settlement {
             transaction.internalized.clone(),
             &partial_access_list,
             state_overrides,
+            state_overrides_block,
             eth,
             simulator,
         )
@@ -206,6 +209,7 @@ impl Settlement {
                 transaction.uninternalized.clone(),
                 &partial_access_list,
                 state_overrides,
+                state_overrides_block,
                 eth,
                 simulator,
             )
@@ -228,6 +232,7 @@ impl Settlement {
         tx: eth::Tx,
         partial_access_list: &eth::AccessList,
         state_overrides: Option<&StateOverride>,
+        state_overrides_block: Option<StateOverrideBlock>,
         eth: &Ethereum,
         simulator: &Simulator,
     ) -> Result<(eth::AccessList, eth::Gas), Error> {
@@ -236,11 +241,11 @@ impl Settlement {
 
         // Simulate the full access list, passing the partial access
         // list into the simulation.
-        let access_list = simulator.access_list(&tx, state_overrides).await?;
+        let access_list = simulator.access_list(&tx, state_overrides, state_overrides_block).await?;
         let tx = tx.set_access_list(access_list.clone());
 
         // Simulate the settlement using the full access list and get the gas used.
-        let gas = simulator.gas(&tx, state_overrides).await;
+        let gas = simulator.gas(&tx, state_overrides, state_overrides_block).await;
 
         observe::simulated(eth, &tx, &gas);
         Ok((access_list, gas?))
@@ -277,6 +282,10 @@ impl Settlement {
 
     pub fn state_overrides(&self) -> Option<&StateOverride> {
         self.solution.state_overrides.as_ref()
+    }
+
+    pub fn state_overrides_block(&self) -> Option<StateOverrideBlock> {
+        self.solution.state_overrides_block
     }
 
     /// Solution's pre interactions

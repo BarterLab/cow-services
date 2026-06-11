@@ -1,7 +1,7 @@
 use {
     std::time::Duration,
     tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        io::{AsyncBufReadExt, BufReader},
         net::{UnixListener, UnixStream},
     },
 };

@@ -5,6 +5,7 @@ use {
     },
     alloy::rpc::types::state::StateOverride,
     observe::future::Measure,
+    solvers_dto::solution::StateOverrideBlock,
 };
 
 pub mod enso;
@@ -97,6 +98,7 @@ impl Simulator {
         &self,
         tx: &eth::Tx,
         state_overrides: Option<&StateOverride>,
+        state_overrides_block: Option<StateOverrideBlock>,
     ) -> Result<eth::AccessList, Error> {
         if self.disable_access_lists {
             return Ok(tx.access_list.clone());
@@ -104,7 +106,11 @@ impl Simulator {
         let block = self.eth.current_block().borrow().number.into();
         let access_list = if let Some(state_overrides) = state_overrides {
             self.eth
-                .create_access_list_with_state_overrides(tx.clone(), Some(state_overrides))
+                .create_access_list_with_state_overrides(
+                    tx.clone(),
+                    Some(state_overrides),
+                    state_overrides_block,
+                )
                 .await
                 .map_err(with(tx.clone(), block))?
         } else {
@@ -136,6 +142,7 @@ impl Simulator {
         &self,
         tx: &eth::Tx,
         state_overrides: Option<&StateOverride>,
+        state_overrides_block: Option<StateOverrideBlock>,
     ) -> Result<eth::Gas, Error> {
         if let Some(gas) = self.disable_gas {
             return Ok(gas);
@@ -145,7 +152,11 @@ impl Simulator {
         if let Some(state_overrides) = state_overrides {
             return self
                 .eth
-                .estimate_gas_with_state_overrides(tx.clone(), Some(state_overrides))
+                .estimate_gas_with_state_overrides(
+                    tx.clone(),
+                    Some(state_overrides),
+                    state_overrides_block,
+                )
                 .await
                 .map_err(with(tx.clone(), block));
         }

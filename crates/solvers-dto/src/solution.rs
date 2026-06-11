@@ -33,9 +33,18 @@ pub struct Solution {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub state_overrides: Option<StateOverride>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub state_overrides_block: Option<StateOverrideBlock>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flashloans: Option<HashMap<OrderUid, Flashloan>>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub wrappers: Vec<WrapperCall>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "number")]
+pub enum StateOverrideBlock {
+    Number(u64),
+    Pending,
 }
 
 #[serde_as]
