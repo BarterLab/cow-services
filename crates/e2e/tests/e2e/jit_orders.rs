@@ -178,6 +178,7 @@ async fn single_limit_order_test(web3: Web3) {
         post_interactions: vec![],
         gas: None,
         state_overrides: None,
+        state_overrides_block: None,
         flashloans: None,
         wrappers: vec![],
     }));

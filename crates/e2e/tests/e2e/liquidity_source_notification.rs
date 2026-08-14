@@ -323,6 +323,7 @@ http-timeout = "10s"
         post_interactions: vec![],
         gas: None,
         state_overrides: None,
+        state_overrides_block: None,
         flashloans: None,
         wrappers: vec![],
     }));
