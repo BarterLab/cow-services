@@ -1,5 +1,5 @@
 use {
-    super::{Error, Solution, encoding, trade::ClearingPrices},
+    super::{Error, SimulationContext, Solution, encoding, trade::ClearingPrices},
     crate::{
         domain::{
             competition::{
@@ -147,8 +147,14 @@ impl Settlement {
         // The solution is to do access list estimation in two steps: first, simulate
         // moving 1 wei into every smart contract to get a partial access list, and then
         // use that partial access list to calculate the final access list.
-        let state_overrides = solution.state_overrides.as_ref();
-        let state_overrides_block = solution.state_overrides_block;
+        let simulation_context = solution.simulation_context();
+        let (state_overrides, state_overrides_block) = match simulation_context {
+            Some(_) => (None, None),
+            None => (
+                solution.state_overrides.as_ref(),
+                solution.state_overrides_block,
+            ),
+        };
         let partial_access_lists = try_join_all(solution.user_trades().map(|trade| async {
             if !trade.order().buys_eth() || !trade.order().pays_to_contract(eth).await? {
                 return Ok(Default::default());
@@ -160,7 +166,11 @@ impl Settlement {
                 input: Default::default(),
                 access_list: Default::default(),
             };
-            Result::<_, Error>::Ok(simulator.access_list(&tx, state_overrides, state_overrides_block).await?)
+            Result::<_, Error>::Ok(
+                simulator
+                    .access_list(&tx, state_overrides, state_overrides_block)
+                    .await?,
+            )
         }))
         .await?;
         let partial_access_list = partial_access_lists
@@ -171,6 +181,7 @@ impl Settlement {
         let (access_list, gas) = Self::simulate(
             transaction.internalized.clone(),
             &partial_access_list,
+            simulation_context,
             state_overrides,
             state_overrides_block,
             eth,
@@ -208,6 +219,7 @@ impl Settlement {
             Self::simulate(
                 transaction.uninternalized.clone(),
                 &partial_access_list,
+                simulation_context,
                 state_overrides,
                 state_overrides_block,
                 eth,
@@ -231,6 +243,7 @@ impl Settlement {
     async fn simulate(
         tx: eth::Tx,
         partial_access_list: &eth::AccessList,
+        simulation_context: Option<&SimulationContext>,
         state_overrides: Option<&StateOverride>,
         state_overrides_block: Option<StateOverrideBlock>,
         eth: &Ethereum,
@@ -239,13 +252,23 @@ impl Settlement {
         // Add the partial access list to the settlement tx.
         let tx = tx.set_access_list(partial_access_list.to_owned());
 
-        // Simulate the full access list, passing the partial access
-        // list into the simulation.
-        let access_list = simulator.access_list(&tx, state_overrides, state_overrides_block).await?;
+        // `eth_createAccessList` has no standard state + block override form. For an
+        // exact external-state context, retain the partial access list and let the
+        // full gas simulation account for cold accesses. Ordinary settlements keep
+        // the existing access-list behavior.
+        let access_list = match simulation_context {
+            Some(_) => tx.access_list.clone(),
+            None => simulator
+                .access_list(&tx, state_overrides, state_overrides_block)
+                .await?,
+        };
         let tx = tx.set_access_list(access_list.clone());
 
         // Simulate the settlement using the full access list and get the gas used.
-        let gas = simulator.gas(&tx, state_overrides, state_overrides_block).await;
+        let gas = match simulation_context {
+            Some(context) => simulator.gas_with_simulation_context(&tx, context).await,
+            None => simulator.gas(&tx, state_overrides, state_overrides_block).await,
+        };
 
         observe::simulated(eth, &tx, &gas);
         Ok((access_list, gas?))
@@ -286,6 +309,10 @@ impl Settlement {
 
     pub fn state_overrides_block(&self) -> Option<StateOverrideBlock> {
         self.solution.state_overrides_block
+    }
+
+    pub fn simulation_context(&self) -> Option<&SimulationContext> {
+        self.solution.simulation_context()
     }
 
     /// Solution's pre interactions

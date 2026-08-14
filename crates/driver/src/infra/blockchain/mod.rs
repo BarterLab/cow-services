@@ -3,10 +3,10 @@ use alloy::{providers::ext::TraceApi, rpc::types::trace::parity::TraceOutput};
 use {
     crate::{
         boundary,
-        domain::{eth, eth::U256},
+        domain::{competition::solution::SimulationContext, eth, eth::U256},
     },
     alloy::{
-        eips::eip1559::Eip1559Estimation,
+        eips::{BlockNumberOrTag, eip1559::Eip1559Estimation},
         network::TransactionBuilder,
         providers::Provider,
         rpc::types::{TransactionReceipt, TransactionRequest, state::StateOverride},
@@ -25,7 +25,11 @@ use {
         },
         web3,
     },
-    std::{fmt, sync::Arc},
+    std::{
+        fmt,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    },
     thiserror::Error,
     tracing::{Level, instrument},
     url::Url,
@@ -291,6 +295,86 @@ impl Ethereum {
         Ok(estimated_gas)
     }
 
+    /// Estimate gas against the canonical base block and virtual target header.
+    pub async fn estimate_gas_with_simulation_context(
+        &self,
+        tx: eth::Tx,
+        context: &SimulationContext,
+    ) -> Result<eth::Gas, Error> {
+        self.ensure_simulation_context_current(context).await?;
+
+        let tx = self.simulation_transaction(tx).await;
+        let gas = self
+            .web3
+            .provider
+            .estimate_gas(tx)
+            .overrides(context.state_overrides().clone())
+            .with_block_overrides(context.block_overrides())
+            .block(context.base_block_id())
+            .await
+            .map_err(Error::Rpc)?
+            .into();
+
+        self.ensure_simulation_context_current(context).await?;
+        Ok(gas)
+    }
+
+    /// Ensure a one-block simulation lease still points at the canonical head.
+    pub async fn ensure_simulation_context_current(
+        &self,
+        context: &SimulationContext,
+    ) -> Result<(), Error> {
+        let latest = self
+            .web3
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(Error::Rpc)?
+            .ok_or(Error::LatestBlockUnavailable)?;
+        if latest.header.number != context.base_number()
+            || latest.header.hash != context.base_hash()
+        {
+            return Err(Error::StaleSimulationContext {
+                expected_number: context.base_number(),
+                expected_hash: context.base_hash(),
+                actual_number: latest.header.number,
+                actual_hash: latest.header.hash,
+            });
+        }
+        if context.target_timestamp() <= latest.header.timestamp {
+            return Err(Error::InvalidTargetTimestamp {
+                base_timestamp: latest.header.timestamp,
+                target_timestamp: context.target_timestamp(),
+            });
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| Error::SystemClock(error.to_string()))?
+            .as_secs();
+        if context.target_timestamp() <= now {
+            return Err(Error::ExpiredTargetTimestamp {
+                current_timestamp: now,
+                target_timestamp: context.target_timestamp(),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn simulation_transaction(&self, tx: eth::Tx) -> TransactionRequest {
+        let tx = TransactionRequest::default()
+            .from(tx.from)
+            .to(tx.to)
+            .value(tx.value.0)
+            .input(tx.input.into())
+            .access_list(tx.access_list.into());
+
+        match self.simulation_gas_price().await {
+            Some(gas_price) => tx.with_gas_price(gas_price),
+            None => tx,
+        }
+    }
+
     pub async fn trace(&self, tx: &eth::Tx) -> Result<eth::Gas, Error> {
         let tx_req = TransactionRequest::default()
             .from(tx.from)
@@ -450,6 +534,36 @@ pub enum Error {
     AccessList(String),
     #[error("trace estimation error")]
     Trace,
+    #[error("latest block is unavailable while validating a simulation context")]
+    LatestBlockUnavailable,
+    #[error(
+        "simulation context expired: expected canonical head {expected_number}/{expected_hash:?}, \
+         got {actual_number}/{actual_hash:?}"
+    )]
+    StaleSimulationContext {
+        expected_number: u64,
+        expected_hash: alloy::primitives::B256,
+        actual_number: u64,
+        actual_hash: alloy::primitives::B256,
+    },
+    #[error(
+        "simulation target timestamp {target_timestamp} is not after base timestamp \
+         {base_timestamp}"
+    )]
+    InvalidTargetTimestamp {
+        base_timestamp: u64,
+        target_timestamp: u64,
+    },
+    #[error("system clock cannot be converted to Unix time: {0}")]
+    SystemClock(String),
+    #[error(
+        "simulation target timestamp {target_timestamp} has expired at current Unix time \
+         {current_timestamp}"
+    )]
+    ExpiredTargetTimestamp {
+        current_timestamp: u64,
+        target_timestamp: u64,
+    },
 }
 
 impl Error {
@@ -462,6 +576,11 @@ impl Error {
             Error::AccessList(_) => true,
             Error::ContractRpc(_) => true,
             Error::Trace => true,
+            Error::LatestBlockUnavailable
+            | Error::StaleSimulationContext { .. }
+            | Error::InvalidTargetTimestamp { .. }
+            | Error::SystemClock(_)
+            | Error::ExpiredTargetTimestamp { .. } => false,
             Error::Rpc(err) => {
                 let is_revert = err.is_error_resp();
                 tracing::trace!(is_revert, ?err, "classified error");

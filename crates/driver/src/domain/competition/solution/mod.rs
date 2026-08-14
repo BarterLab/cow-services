@@ -38,10 +38,17 @@ pub mod fee;
 pub mod interaction;
 pub mod scoring;
 pub mod settlement;
+pub mod simulation;
 pub mod slippage;
 pub mod trade;
 
-pub use {error::Error, interaction::Interaction, settlement::Settlement, trade::Trade};
+pub use {
+    error::Error,
+    interaction::Interaction,
+    settlement::Settlement,
+    simulation::SimulationContext,
+    trade::Trade,
+};
 
 type Prices = HashMap<eth::TokenAddress, eth::U256>;
 
@@ -211,6 +218,8 @@ pub struct Solution {
     #[debug(ignore)]
     pub state_overrides: Option<StateOverride>,
     pub state_overrides_block: Option<StateOverrideBlock>,
+    #[debug(ignore)]
+    simulation_context: Option<SimulationContext>,
     pub flashloans: HashMap<order::Uid, Flashloan>,
     #[debug(ignore)]
     pub wrappers: Vec<WrapperCall>,
@@ -296,6 +305,7 @@ impl Solution {
             gas,
             state_overrides,
             state_overrides_block,
+            simulation_context: None,
             flashloans,
             wrappers,
         };
@@ -486,6 +496,12 @@ impl Solution {
             return Err(error::Merge::Incompatible("Solvers"));
         }
 
+        // External-state solutions are valid for one exact block context. The generic
+        // solution merger has no resource-aware semantics for combining such contexts.
+        if self.simulation_context.is_some() || other.simulation_context.is_some() {
+            return Err(error::Merge::Incompatible("simulation contexts"));
+        }
+
         // Skip merging the solutions if the expected merged solution has more orders
         // than allowed
         if self.trades.len() + other.trades().len() > max_orders_per_merged_solution {
@@ -565,9 +581,32 @@ impl Solution {
             },
             state_overrides,
             state_overrides_block,
+            simulation_context: None,
             flashloans,
             wrappers: self.wrappers.clone(),
         })
+    }
+
+    /// Attach trusted external state after converting and validating a solver DTO.
+    ///
+    /// Raw solver-provided overrides must not be promoted into this context.
+    pub fn set_simulation_context(
+        &mut self,
+        context: SimulationContext,
+    ) -> Result<(), simulation::Error> {
+        if self.state_overrides.is_some() || self.state_overrides_block.is_some() {
+            return Err(simulation::Error::LegacyOverridesPresent);
+        }
+        if self.simulation_context.is_some() {
+            return Err(simulation::Error::AlreadySet);
+        }
+
+        self.simulation_context = Some(context);
+        Ok(())
+    }
+
+    pub fn simulation_context(&self) -> Option<&SimulationContext> {
+        self.simulation_context.as_ref()
     }
 
     /// Return the trades which fulfill non-liquidity auction orders. These are

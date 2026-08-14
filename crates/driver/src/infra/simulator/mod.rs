@@ -1,6 +1,6 @@
 use {
     crate::{
-        domain::eth,
+        domain::{competition::solution::SimulationContext, eth},
         infra::blockchain::{self, Ethereum},
     },
     alloy::rpc::types::state::StateOverride,
@@ -187,6 +187,25 @@ impl Simulator {
                 .map_err(with(tx.clone(), block))?,
         })
     }
+
+    /// Simulate a transaction in an exact, trusted external-state context.
+    ///
+    /// External simulators cannot represent the canonical base hash and target
+    /// block overrides together, so context-bound transactions deliberately use
+    /// the configured Ethereum RPC. Unsupported RPC capabilities are surfaced to
+    /// the caller and never fall back to an inexact simulation.
+    pub async fn gas_with_simulation_context(
+        &self,
+        tx: &eth::Tx,
+        context: &SimulationContext,
+    ) -> Result<eth::Gas, Error> {
+        let block = context.base_number().into();
+        let result = self
+            .eth
+            .estimate_gas_with_simulation_context(tx.clone(), context)
+            .await;
+        result.map_err(with_simulation_context(tx.clone(), block))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +257,7 @@ where
         let tx = match &err {
             SimulatorError::Tenderly(tenderly::Error::Http(_)) => None,
             SimulatorError::Tenderly(tenderly::Error::Revert(_)) => Some(tx),
+            // Preserve the fork's existing classification for the legacy path.
             SimulatorError::Blockchain(_) => Some(tx),
             SimulatorError::Enso(enso::Error::Http(_)) => None,
             SimulatorError::Enso(enso::Error::Revert(_)) => Some(tx),
@@ -246,6 +266,82 @@ where
         match tx {
             Some(tx) => Error::Revert(RevertError { err, tx, block }),
             None => Error::Other(err),
+        }
+    }
+}
+
+/// Typed context-lifecycle failures are infrastructure errors, while the
+/// existing generic simulator classifier remains unchanged for legacy calls.
+fn with_simulation_context(
+    tx: eth::Tx,
+    block: eth::BlockNo,
+) -> impl FnOnce(blockchain::Error) -> Error {
+    move |error| {
+        if error.is_revert() {
+            Error::Revert(RevertError {
+                err: SimulatorError::Blockchain(error),
+                tx,
+                block,
+            })
+        } else {
+            Error::Other(SimulatorError::Blockchain(error))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{Error, RevertError, SimulatorError, blockchain, eth, with_simulation_context},
+        alloy::{
+            primitives::B256,
+            rpc::json_rpc::ErrorPayload,
+            transports::RpcError,
+        },
+    };
+
+    #[test]
+    fn stale_context_error_is_not_a_revert() {
+        let error = blockchain::Error::StaleSimulationContext {
+            expected_number: 1,
+            expected_hash: B256::repeat_byte(0x11),
+            actual_number: 2,
+            actual_hash: B256::repeat_byte(0x22),
+        };
+        let classified = with_simulation_context(transaction(), 1.into())(error);
+
+        assert!(matches!(
+            classified,
+            Error::Other(SimulatorError::Blockchain(_))
+        ));
+    }
+
+    #[test]
+    fn rpc_execution_revert_keeps_transaction_context() {
+        let error = blockchain::Error::Rpc(RpcError::ErrorResp(ErrorPayload {
+            code: -32000,
+            message: "execution reverted".into(),
+            data: None,
+        }));
+
+        let classified = with_simulation_context(transaction(), 1.into())(error);
+
+        assert!(matches!(
+            classified,
+            Error::Revert(RevertError {
+                err: SimulatorError::Blockchain(blockchain::Error::Rpc(_)),
+                ..
+            })
+        ));
+    }
+
+    fn transaction() -> eth::Tx {
+        eth::Tx {
+            from: eth::Address::repeat_byte(0x11),
+            to: eth::Address::repeat_byte(0x22),
+            value: 0.into(),
+            input: Default::default(),
+            access_list: Default::default(),
         }
     }
 }
