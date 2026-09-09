@@ -307,12 +307,26 @@ impl Ethereum {
         let gas = self
             .web3
             .provider
-            .estimate_gas(tx)
+            .estimate_gas(tx.clone())
             .overrides(context.state_overrides().clone())
             .with_block_overrides(context.block_overrides())
             .block(context.base_block_id())
             .await
-            .map_err(Error::Rpc)?
+            .map_err(|error| {
+                tracing::error!(
+                    rpc_method = "eth_estimateGas",
+                    base_block_number = context.base_number(),
+                    rpc_params = %serde_json::json!([
+                        tx,
+                        context.base_block_id(),
+                        context.state_overrides(),
+                        context.block_overrides(),
+                    ]),
+                    rpc_error = ?error.as_error_resp(),
+                    "Simulation context RPC failed",
+                );
+                Error::Rpc(error)
+            })?
             .into();
 
         self.ensure_simulation_context_current(context).await?;
