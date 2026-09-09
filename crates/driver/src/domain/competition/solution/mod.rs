@@ -462,7 +462,8 @@ impl Solution {
         eth: &Ethereum,
         internalization: settlement::Internalization,
     ) -> Result<impl Iterator<Item = eth::allowance::Approval> + use<>, Error> {
-        let settlement_contract = &eth.contracts().settlement();
+        // Allowances belong to the contract executing interactions, not the submission proxy.
+        let settlement_contract = &eth.contracts().orig_settlement();
         let allowances =
             try_join_all(self.allowances(internalization).map(|required| async move {
                 eth.erc20(required.0.token)
