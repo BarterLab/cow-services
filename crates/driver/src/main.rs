@@ -2,7 +2,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "jemalloc-allocator")]
+#[cfg(all(feature = "jemalloc-allocator", not(feature = "mimalloc-allocator")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

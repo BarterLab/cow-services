@@ -8,7 +8,7 @@ use {
         error::BoxDynError,
         postgres::{PgArgumentBuffer, PgHasArrayType, PgTypeInfo, PgValueFormat, PgValueRef},
     },
-    std::fmt::{self, Debug, Formatter},
+    std::fmt::{self, Debug, Display, Formatter},
 };
 
 /// Wrapper type for fixed size byte arrays compatible with sqlx's Postgres
@@ -17,6 +17,12 @@ use {
 pub struct ByteArray<const N: usize>(pub [u8; N]);
 
 impl<const N: usize> Debug for ByteArray<N> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", const_hex::encode_prefixed(self.0))
+    }
+}
+
+impl<const N: usize> Display for ByteArray<N> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}", const_hex::encode_prefixed(self.0))
     }
@@ -62,8 +68,8 @@ impl<const N: usize> Decode<'_, Postgres> for ByteArray<N> {
 }
 
 impl<const N: usize> Encode<'_, Postgres> for ByteArray<N> {
-    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> IsNull {
-        self.0.encode(buf)
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        self.0.encode_by_ref(buf)
     }
 }
 

@@ -2,7 +2,13 @@
 //! responses are preserved.
 
 use {
+    configs::{
+        order_quoting::{ExternalSolver, OrderQuoting},
+        shared::SharedConfig,
+        test_util::TestDefault,
+    },
     e2e::setup::{API_HOST, OnchainComponents, Services, run_test},
+    model::order::{ORDER_UID_LIMIT, OrderUid},
     orderbook::api::Error,
     reqwest::StatusCode,
     serde_json::json,
@@ -26,10 +32,17 @@ async fn http_validation(web3: Web3) {
     // since we're testing malformed paths, etc;
     // we don't really need the rest of the protocol
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-            "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            shared: SharedConfig {
+                gas_estimators: vec![TestDefault::test_default()],
+                ..Default::default()
+            },
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
     let client = services.client();
 
@@ -115,29 +128,6 @@ async fn http_validation(web3: Web3) {
             response.status(),
             StatusCode::BAD_REQUEST,
             "Expected 400 for invalid tx hash ({description}): {hash}"
-        );
-    }
-
-    // Test malformed auction IDs
-    for (id, description, expected_status) in [
-        ("not-a-number", "non-numeric", StatusCode::BAD_REQUEST),
-        ("-1", "negative number", StatusCode::BAD_REQUEST),
-        (
-            "99999999999999999999999",
-            "u64 overflow",
-            StatusCode::BAD_REQUEST,
-        ),
-    ] {
-        let response = client
-            .get(format!("{API_HOST}/api/v1/solver_competition/{id}"))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            expected_status,
-            "Expected {expected_status} for invalid AuctionId ({description}): {id}"
         );
     }
 
@@ -302,5 +292,208 @@ async fn http_validation(web3: Web3) {
     assert!(
         !error.description.is_empty(),
         "Error response should have non-empty 'description' field"
+    );
+
+    // /api/v1/orders/by_uids requires Json body
+    let response = client
+        .post(format!("{API_HOST}/api/v1/orders/by_uids"))
+        .header("Content-Type", "application/json")
+        .body("Not json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Querying for more than ORDER_UID_LIMIT orders should fail
+    let response = client
+        .post(format!("{API_HOST}/api/v1/orders/by_uids"))
+        .header("Content-Type", "application/json")
+        .json(&json!(
+            (0..ORDER_UID_LIMIT + 1)
+                .map(|_| OrderUid::default())
+                .collect::<Vec<_>>()
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // GET /restricted/api/v1/debug/simulation/{uid} error cases
+
+    // Malformed UID → 400
+    let response = client
+        .get(format!(
+            "{API_HOST}/restricted/api/v1/debug/simulation/bad_uid"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "malformed UID should return 400"
+    );
+
+    // Valid UID but order not found → 404
+    let response = client
+        .get(format!(
+            "{API_HOST}/restricted/api/v1/debug/simulation/{VALID_ORDER_UID}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "unknown order UID should return 404"
+    );
+    let body: Error = response.json().await.unwrap();
+    assert!(!body.error_type.is_empty());
+    assert!(!body.description.is_empty());
+
+    // Invalid block_number query param → 400
+    let response = client
+        .get(format!(
+            "{API_HOST}/restricted/api/v1/debug/simulation/{VALID_ORDER_UID}?\
+             block_number=notanumber"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "non-numeric block_number should return 400"
+    );
+
+    // POST /restricted/api/v1/debug/simulation error cases
+
+    // Invalid JSON body → 400
+    let response = client
+        .post(format!("{API_HOST}/restricted/api/v1/debug/simulation"))
+        .header("Content-Type", "application/json")
+        .body("{invalid json}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "invalid JSON should return 400"
+    );
+
+    // Missing required fields → 422
+    let response = client
+        .post(format!("{API_HOST}/restricted/api/v1/debug/simulation"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "missing required fields should return 422"
+    );
+
+    // Invalid field type (bad address) → 422
+    let response = client
+        .post(format!("{API_HOST}/restricted/api/v1/debug/simulation"))
+        .json(&json!({
+            "sellToken": "not-an-address",
+            "buyToken": VALID_ADDRESS,
+            "sellAmount": "1000000000000000000",
+            "buyAmount": "1000000000000000000",
+            "kind": "sell",
+            "owner": VALID_ADDRESS,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid address field should return 422"
+    );
+
+    // Zero sellAmount (NonZeroU256 rejects zero at deserialization) → 422
+    let response = client
+        .post(format!("{API_HOST}/restricted/api/v1/debug/simulation"))
+        .json(&json!({
+            "sellToken": VALID_ADDRESS,
+            "buyToken": VALID_ADDRESS,
+            "sellAmount": "0",
+            "buyAmount": "1000000000000000000",
+            "kind": "sell",
+            "owner": VALID_ADDRESS,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "zero sellAmount should return 422"
+    );
+
+    // some fields missing → 422
+    let response = client
+        .post(format!("{API_HOST}/restricted/api/v1/debug/simulation"))
+        .json(&json!({
+            "sellToken": VALID_ADDRESS,
+            "buyToken": VALID_ADDRESS,
+            "sellAmount": "1000000000000000000",
+            "buyAmount": "1000000000000000000",
+            "kind": "unknownKind",
+            "owner": VALID_ADDRESS,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid kind enum should return 422"
+    );
+
+    // Invalid appData (non-JSON string triggers MalformedInput) → 400
+    let bad_app_data = "not valid json";
+    let response = client
+        .post(format!("{API_HOST}/restricted/api/v1/debug/simulation"))
+        .json(&json!({
+            "sellToken": VALID_ADDRESS,
+            "buyToken": VALID_ADDRESS,
+            "sellAmount": "1000000000000000000",
+            "buyAmount": "1000000000000000000",
+            "kind": "sell",
+            "owner": VALID_ADDRESS,
+            "appData": bad_app_data,
+            "sellTokenBalance": "erc20",
+            "buyTokenBalance": "erc20",
+            "signingScheme": "eip1271",
+            "signature": "0x000000",
+            "feeAmount": "0",
+            "validTo": 12341234,
+            "partiallyFillable": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "malformed appData should return 400"
+    );
+    let body: Error = response.json().await.unwrap();
+    assert!(
+        body.description.contains("app data"),
+        "error description should name the failing field. Got: {}",
+        body.description
+    );
+    assert!(
+        body.description.contains(bad_app_data),
+        "error description should include the bad value. Got: {}",
+        body.description
     );
 }

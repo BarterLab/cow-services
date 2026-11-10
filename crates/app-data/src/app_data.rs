@@ -1,7 +1,7 @@
 use {
     crate::{AppDataHash, Hooks, app_data_hash::hash_full_app_data},
-    alloy::primitives::{Address, U256},
-    anyhow::{Context, Result, anyhow},
+    alloy_primitives::{Address, U256},
+    anyhow::{Result, anyhow},
     bytes_hex::BytesHex,
     moka::sync::Cache,
     number::serialization::HexOrDecimalU256,
@@ -24,18 +24,33 @@ pub struct ValidatedAppData {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "test_helpers"), derive(Serialize))]
-#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    any(test, feature = "test_helpers"),
+    derive(Serialize),
+    serde(into = "RawProtocolAppData")
+)]
+#[serde(try_from = "RawProtocolAppData")]
 pub struct ProtocolAppData {
-    #[serde(default)]
     pub hooks: Hooks,
     pub signer: Option<Address>,
     pub replaced_order: Option<ReplacedOrder>,
-    #[serde(default)]
     pub partner_fee: PartnerFees,
     pub flashloan: Option<Flashloan>,
-    #[serde(default)]
     pub wrappers: Vec<WrapperCall>,
+    pub execution_mode: ExecutionMode,
+}
+
+/// How an order becomes solvable. The variants are mutually exclusive by
+/// construction, so `enableFastPath` and `validFrom` can never both be set.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ExecutionMode {
+    /// Join the regular batch auction, solvable immediately.
+    #[default]
+    RegularAuction,
+    /// Only become solvable at this UNIX timestamp.
+    ValidFrom(u32),
+    /// Out-of-competition ("fast path") execution.
+    FastPath,
 }
 
 /// Contains information to hint at how a solver could make
@@ -138,45 +153,59 @@ impl<'de> Deserialize<'de> for FeePolicy {
     where
         D: Deserializer<'de>,
     {
+        // The untagged enum does not provide enough information when
+        // deserialization fails since it thinks that any unknown or
+        // mismatched fields are just an issue with the enum variant
+        // which the error will reflect — something among the lines of
+        // "did not match any variant of the untagged enum" This is an
+        // hacky way of ensuring we get proper behavior when failing to
+        // deserialize numbers, for example, when users send bps as floats
         #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Helper {
-            #[serde(rename_all = "camelCase")]
-            Surplus {
-                surplus_bps: u64,
-                max_volume_bps: u64,
-            },
-            #[serde(rename_all = "camelCase")]
-            PriceImprovement {
-                price_improvement_bps: u64,
-                max_volume_bps: u64,
-            },
-            #[serde(rename_all = "camelCase")]
-            Volume { volume_bps: u64 },
-            // Originally only volume fees were allowed and they used the field `bps`.
-            // To stay backwards compatible with old appdata we still support this old
-            // format.
-            #[serde(rename_all = "camelCase")]
-            VolumeOld { bps: u64 },
+        #[serde(rename_all = "camelCase")]
+        struct FeePolicyDeserializer {
+            surplus_bps: Option<u64>,
+            max_volume_bps: Option<u64>,
+            price_improvement_bps: Option<u64>,
+            volume_bps: Option<u64>,
+            bps: Option<u64>,
         }
 
-        match Helper::deserialize(deserializer)? {
-            Helper::Surplus {
-                surplus_bps,
-                max_volume_bps,
+        match FeePolicyDeserializer::deserialize(deserializer)? {
+            FeePolicyDeserializer {
+                surplus_bps: Some(surplus_bps),
+                max_volume_bps: Some(max_volume_bps),
+                price_improvement_bps: None,
+                volume_bps: None,
+                bps: None,
             } => Ok(FeePolicy::Surplus {
                 bps: surplus_bps,
                 max_volume_bps,
             }),
-            Helper::PriceImprovement {
-                price_improvement_bps,
-                max_volume_bps,
+            FeePolicyDeserializer {
+                surplus_bps: None,
+                max_volume_bps: Some(max_volume_bps),
+                price_improvement_bps: Some(price_improvement_bps),
+                volume_bps: None,
+                bps: None,
             } => Ok(FeePolicy::PriceImprovement {
                 bps: price_improvement_bps,
                 max_volume_bps,
             }),
-            Helper::Volume { volume_bps } => Ok(FeePolicy::Volume { bps: volume_bps }),
-            Helper::VolumeOld { bps } => Ok(FeePolicy::Volume { bps }),
+            FeePolicyDeserializer {
+                surplus_bps: None,
+                max_volume_bps: None,
+                price_improvement_bps: None,
+                volume_bps: Some(volume_bps),
+                bps: None,
+            } => Ok(FeePolicy::Volume { bps: volume_bps }),
+            FeePolicyDeserializer {
+                surplus_bps: None,
+                max_volume_bps: None,
+                price_improvement_bps: None,
+                volume_bps: None,
+                bps: Some(bps),
+            } => Ok(FeePolicy::Volume { bps }),
+            _ => Err(serde::de::Error::custom("unknown fee policy format")),
         }
     }
 }
@@ -275,15 +304,100 @@ impl Validator {
     }
 }
 
-pub fn parse(full_app_data: &[u8]) -> Result<ProtocolAppData> {
-    let root = serde_json::from_slice::<Root>(full_app_data).context("invalid app data json")?;
-    let parsed = root
+pub fn parse(full_app_data: &[u8]) -> Result<ProtocolAppData, serde_json::Error> {
+    let root = serde_json::from_slice::<Root>(full_app_data)?;
+    Ok(root
         .metadata
         .or_else(|| root.backend.map(ProtocolAppData::from))
         // If the key doesn't exist, default. Makes life easier for API
         // consumers, who don't care about protocol app data.
-        .unwrap_or_default();
-    Ok(parsed)
+        .unwrap_or_default())
+}
+
+/// The wire form of [`ProtocolAppData`], mirroring the flat JSON `metadata`
+/// object one-to-one. It exists because `enableFastPath` and `validFrom` arrive
+/// as two independent JSON fields but are modelled as one [`ExecutionMode`]:
+/// serde deserializes into this struct, then [`ProtocolAppData::try_from`]
+/// collapses the two fields into the enum and rejects any orders try to set
+/// both fields simultaneously.
+#[derive(Default, Deserialize)]
+#[cfg_attr(any(test, feature = "test_helpers"), derive(Clone, Serialize))]
+#[serde(rename_all = "camelCase")]
+struct RawProtocolAppData {
+    #[serde(default)]
+    hooks: Hooks,
+    signer: Option<Address>,
+    replaced_order: Option<ReplacedOrder>,
+    #[serde(default)]
+    partner_fee: PartnerFees,
+    flashloan: Option<Flashloan>,
+    #[serde(default)]
+    wrappers: Vec<WrapperCall>,
+    #[serde(default)]
+    enable_fast_path: bool,
+    valid_from: Option<u32>,
+}
+
+impl TryFrom<RawProtocolAppData> for ProtocolAppData {
+    type Error = &'static str;
+
+    fn try_from(raw: RawProtocolAppData) -> Result<Self, Self::Error> {
+        let execution_mode = match (raw.enable_fast_path, raw.valid_from) {
+            (true, Some(_)) => {
+                return Err("`enableFastPath` and `validFrom` are mutually exclusive");
+            }
+            (true, None) => ExecutionMode::FastPath,
+            (false, Some(valid_from)) => ExecutionMode::ValidFrom(valid_from),
+            (false, None) => ExecutionMode::RegularAuction,
+        };
+        Ok(Self {
+            hooks: raw.hooks,
+            signer: raw.signer,
+            replaced_order: raw.replaced_order,
+            partner_fee: raw.partner_fee,
+            flashloan: raw.flashloan,
+            wrappers: raw.wrappers,
+            execution_mode,
+        })
+    }
+}
+
+impl From<ProtocolAppData> for RawProtocolAppData {
+    fn from(protocol: ProtocolAppData) -> Self {
+        let (enable_fast_path, valid_from) = match protocol.execution_mode {
+            ExecutionMode::RegularAuction => (false, None),
+            ExecutionMode::FastPath => (true, None),
+            ExecutionMode::ValidFrom(valid_from) => (false, Some(valid_from)),
+        };
+        Self {
+            hooks: protocol.hooks,
+            signer: protocol.signer,
+            replaced_order: protocol.replaced_order,
+            partner_fee: protocol.partner_fee,
+            flashloan: protocol.flashloan,
+            wrappers: protocol.wrappers,
+            enable_fast_path,
+            valid_from,
+        }
+    }
+}
+
+/// Extracts the `appCode` from a full app-data document, if present.
+///
+/// `appCode` sits at the document root, next to (not inside) the protocol
+/// `metadata`, so it is not part of [`ProtocolAppData`] and callers that want
+/// it — e.g. for analytics — parse it separately with this helper. Returns
+/// `None` for absent or malformed app data.
+pub fn app_code(full_app_data: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct AppCode {
+        #[serde(rename = "appCode")]
+        app_code: Option<String>,
+    }
+
+    serde_json::from_slice::<AppCode>(full_app_data)
+        .ok()?
+        .app_code
 }
 
 /// The root app data JSON object.
@@ -341,6 +455,13 @@ impl Root {
             metadata,
             backend: None,
         }
+    }
+
+    pub fn wrappers(&self) -> &[WrapperCall] {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.wrappers.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -405,7 +526,8 @@ impl Serialize for OrderUid {
     where
         S: Serializer,
     {
-        serializer.serialize_str(self.to_string().as_str())
+        let mut buffer = const_hex::Buffer::<56, true>::new();
+        serializer.serialize_str(buffer.format(&self.0))
     }
 }
 
@@ -463,17 +585,34 @@ impl<'de> Deserialize<'de> for PartnerFees {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Helper {
-            Single(PartnerFee),
-            Multiple(Vec<PartnerFee>),
+        struct PartnerFeesVisitor;
+
+        impl<'de> de::Visitor<'de> for PartnerFeesVisitor {
+            type Value = PartnerFees;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a single partner fee object or an array of partner fees")
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let fee = PartnerFee::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(PartnerFees(vec![fee]))
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let fees =
+                    Vec::<PartnerFee>::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(PartnerFees(fees))
+            }
         }
 
-        match Helper::deserialize(deserializer)? {
-            Helper::Single(fee) => Ok(PartnerFees(vec![fee])),
-            Helper::Multiple(fees) => Ok(PartnerFees(fees)),
-        }
+        deserializer.deserialize_any(PartnerFeesVisitor)
     }
 }
 
@@ -489,11 +628,7 @@ impl From<BackendAppData> for ProtocolAppData {
     fn from(value: BackendAppData) -> Self {
         Self {
             hooks: value.hooks,
-            wrappers: Vec::new(),
-            signer: None,
-            replaced_order: None,
-            partner_fee: PartnerFees::default(),
-            flashloan: None,
+            ..Default::default()
         }
     }
 }
@@ -513,6 +648,39 @@ mod tests {
     #[test]
     fn empty_is_valid() {
         assert_app_data!(EMPTY, ProtocolAppData::default());
+    }
+
+    #[test]
+    fn fast_path() {
+        assert_app_data!(
+            r#"{ "metadata": { "enableFastPath": true } }"#,
+            ProtocolAppData {
+                execution_mode: ExecutionMode::FastPath,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn valid_from() {
+        assert_app_data!(
+            r#"{ "metadata": { "validFrom": 1700000000 } }"#,
+            ProtocolAppData {
+                execution_mode: ExecutionMode::ValidFrom(1_700_000_000),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn extracts_app_code() {
+        assert_eq!(
+            app_code(br#"{"appCode": "CoW Swap", "version": "0.9.0"}"#),
+            Some("CoW Swap".to_string()),
+        );
+        assert_eq!(app_code(EMPTY.as_bytes()), None);
+        assert_eq!(app_code(br#"{"version": "0.9.0"}"#), None);
+        assert_eq!(app_code(b"not json"), None);
     }
 
     #[test]
@@ -847,5 +1015,24 @@ mod tests {
         let size_limit = r#"{"hello":"world"}"#.as_bytes();
         let err = validator.validate(size_limit).unwrap_err();
         dbg!(err);
+    }
+
+    #[test]
+    fn validate_rejects_fast_path_with_valid_from() {
+        let validator = Validator::default();
+
+        validator
+            .validate(r#"{ "metadata": { "enableFastPath": true } }"#.as_bytes())
+            .unwrap();
+        validator
+            .validate(r#"{ "metadata": { "validFrom": 1700000000 } }"#.as_bytes())
+            .unwrap();
+
+        let err = validator
+            .validate(
+                r#"{ "metadata": { "enableFastPath": true, "validFrom": 1700000000 } }"#.as_bytes(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"));
     }
 }

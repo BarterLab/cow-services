@@ -1,10 +1,14 @@
 use {
     ::alloy::primitives::U256,
-    autopilot::config::Configuration,
+    configs::{
+        autopilot::Configuration,
+        order_quoting::{ExternalSolver, OrderQuoting},
+        test_util::TestDefault,
+    },
     e2e::setup::{colocation::SolverEngine, mock::Mock, solution::JitOrder, *},
     ethrpc::alloy::CallBuilderExt,
     model::{
-        order::{OrderClass, OrderCreation, OrderKind},
+        order::{OrderCreation, OrderKind},
         signature::EcdsaSigningScheme,
     },
     number::units::EthUnit,
@@ -79,33 +83,32 @@ async fn single_limit_order_test(web3: Web3) {
                 endpoint: mock_solver.url.clone(),
                 base_tokens: vec![*token.address()],
                 merge_solutions: true,
-                haircut_bps: 0,
+                solver_fee_bps: 0,
+                submission_keys: vec![],
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
-        false,
     );
 
-    // We start the quoter as the baseline solver, and the mock solver as the one
-    // returning the solution
-
-    let (_config_file, config_arg) =
-        Configuration::test("mock_solver", solver.address()).to_cli_args();
-
+    // We start the quoter as the baseline solver, and the mock solver as the
+    // one returning the solution
     services
-        .start_autopilot(
-            None,
-            vec![
-                config_arg,
-                "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
-                    .to_string(),
-            ],
-        )
+        .start_autopilot(Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_solver",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..Configuration::test("mock_solver", solver.address())
+        })
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_solver",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
 
     // Place order
@@ -127,9 +130,8 @@ async fn single_limit_order_test(web3: Web3) {
     let trader_balance_before = token.balanceOf(trader.address()).call().await.unwrap();
     let solver_balance_before = token.balanceOf(solver.address()).call().await.unwrap();
     let order_id = services.create_order(&order).await.unwrap();
-    let limit_order = services.get_order(&order_id).await.unwrap();
+    services.get_order(&order_id).await.unwrap();
     onchain.mint_block().await;
-    assert_eq!(limit_order.metadata.class, OrderClass::Limit);
 
     let (jit_order, jit_order_uid) = JitOrder {
         owner: trader.address(),
@@ -145,7 +147,7 @@ async fn single_limit_order_test(web3: Web3) {
         partially_fillable: false,
         valid_to: model::time::now_in_epoch_seconds() + 300,
         app_data: Default::default(),
-        receiver: solver.address(),
+        receiver: solver.address().into(),
     }
     .sign(
         EcdsaSigningScheme::Eip712,
@@ -162,8 +164,8 @@ async fn single_limit_order_test(web3: Web3) {
         trades: vec![
             solvers_dto::solution::Trade::Jit(solvers_dto::solution::JitTrade {
                 order: jit_order,
-                // Making it 9 + 1 so we cover the edge case of fill-or-kill solution mismatches
-                // when observing settlements https://github.com/cowprotocol/services/pull/3440
+                // Making it 9 + 1 so we cover the edge case of fill-or-kill
+                // solution mismatches when observing settlements https://github.com/cowprotocol/services/pull/3440
                 executed_amount: 9u64.eth(),
                 fee: Some(1u64.eth()),
             }),
@@ -181,6 +183,7 @@ async fn single_limit_order_test(web3: Web3) {
         state_overrides_block: None,
         flashloans: None,
         wrappers: vec![],
+        gas_fee_override: None,
     }));
 
     // Drive solution
@@ -192,8 +195,8 @@ async fn single_limit_order_test(web3: Web3) {
 
         let trader_balance_increased =
             trader_balance_after.saturating_sub(trader_balance_before) >= 5u64.eth();
-        // Since the fee is 0 in the custom solution, the balance difference has to be
-        // exactly 10 wei
+        // Since the fee is 0 in the custom solution, the balance difference has
+        // to be exactly 10 wei
         let solver_balance_decreased =
             solver_balance_before.saturating_sub(solver_balance_after) == 10u64.eth();
         trader_balance_increased && solver_balance_decreased
@@ -206,7 +209,7 @@ async fn single_limit_order_test(web3: Web3) {
         // jit order can be found on /api/v1/orders
         services.get_order(&jit_order_uid).await.ok()?;
 
-        // jit order can be found on /api/v1/trades
+        // jit order can be found on /api/v2/trades
         let tx_hash = services
             .get_trades(&jit_order_uid)
             .await

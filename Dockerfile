@@ -18,17 +18,29 @@ RUN rustup install stable && rustup default stable
 # Copy and Build Code
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
-    CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="${RUSTFLAGS}" cargo build --release ${CARGO_BUILD_FEATURES} && \
+    CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="${RUSTFLAGS}" cargo build --release \
+    -p autopilot -p driver -p orderbook -p refunder -p solvers -p pool-indexer \
+    -p solana-indexer -p solana-orderbook -p solana-driver -p solana-solvers \
+    -p autopilot-svm \
+    ${CARGO_BUILD_FEATURES} && \
     cp target/release/autopilot / && \
     cp target/release/driver / && \
     cp target/release/orderbook / && \
     cp target/release/refunder / && \
-    cp target/release/solvers /
+    cp target/release/solvers / && \
+    cp target/release/pool-indexer / && \
+    cp target/release/solana-indexer / && \
+    cp target/release/solana-orderbook / && \
+    cp target/release/solana-driver / && \
+    cp target/release/solana-solvers / && \
+    cp target/release/autopilot-svm /
 
 # Create an intermediate image to extract the binaries
 FROM docker.io/debian:bookworm-slim AS intermediate
+# curl is used by the playground compose healthchecks (this image is not the
+# production one; prod builds from Dockerfile.deploy-ci).
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update && \
-    apt-get install -y ca-certificates tini gettext-base && \
+    apt-get install -y ca-certificates tini gettext-base curl && \
     apt-get clean
 
 FROM intermediate AS autopilot
@@ -51,6 +63,30 @@ FROM intermediate AS solvers
 COPY --from=cargo-build /solvers /usr/local/bin/solvers
 ENTRYPOINT [ "solvers" ]
 
+FROM intermediate AS pool-indexer
+COPY --from=cargo-build /pool-indexer /usr/local/bin/pool-indexer
+ENTRYPOINT [ "pool-indexer" ]
+
+FROM intermediate AS solana-indexer
+COPY --from=cargo-build /solana-indexer /usr/local/bin/solana-indexer
+ENTRYPOINT [ "solana-indexer" ]
+
+FROM intermediate AS solana-orderbook
+COPY --from=cargo-build /solana-orderbook /usr/local/bin/solana-orderbook
+ENTRYPOINT [ "solana-orderbook" ]
+
+FROM intermediate AS solana-driver
+COPY --from=cargo-build /solana-driver /usr/local/bin/solana-driver
+ENTRYPOINT [ "solana-driver" ]
+
+FROM intermediate AS solana-solvers
+COPY --from=cargo-build /solana-solvers /usr/local/bin/solana-solvers
+ENTRYPOINT [ "solana-solvers" ]
+
+FROM intermediate AS solana-autopilot
+COPY --from=cargo-build /autopilot-svm /usr/local/bin/autopilot-svm
+ENTRYPOINT [ "autopilot-svm" ]
+
 # Extract Binary
 FROM intermediate
 
@@ -60,5 +96,11 @@ COPY --from=cargo-build /driver /usr/local/bin/driver
 COPY --from=cargo-build /orderbook /usr/local/bin/orderbook
 COPY --from=cargo-build /refunder /usr/local/bin/refunder
 COPY --from=cargo-build /solvers /usr/local/bin/solvers
+COPY --from=cargo-build /pool-indexer /usr/local/bin/pool-indexer
+COPY --from=cargo-build /solana-indexer /usr/local/bin/solana-indexer
+COPY --from=cargo-build /solana-orderbook /usr/local/bin/solana-orderbook
+COPY --from=cargo-build /solana-driver /usr/local/bin/solana-driver
+COPY --from=cargo-build /solana-solvers /usr/local/bin/solana-solvers
+COPY --from=cargo-build /autopilot-svm /usr/local/bin/autopilot-svm
 
 ENTRYPOINT ["/usr/bin/tini", "-s", "--"]

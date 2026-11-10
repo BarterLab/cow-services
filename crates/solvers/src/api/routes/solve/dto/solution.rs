@@ -4,8 +4,8 @@ use {
 };
 
 /// Creates a new solution DTO from its domain object.
-pub fn from_domain(solutions: &[solution::Solution]) -> super::Solutions {
-    super::Solutions {
+pub fn from_domain(solutions: &[solution::Solution]) -> super::SolverResponse {
+    SolverResponse::Solutions {
         solutions: solutions
             .iter()
             .map(|solution| Solution {
@@ -23,7 +23,7 @@ pub fn from_domain(solutions: &[solution::Solution]) -> super::Solutions {
                         solution::Trade::Fulfillment(trade) => Trade::Fulfillment(Fulfillment {
                             order: OrderUid(trade.order().uid.0),
                             executed_amount: trade.executed().amount,
-                            fee: trade.surplus_fee().map(|fee| fee.amount),
+                            fee: Some(trade.fee().amount),
                         }),
                         solution::Trade::Jit(trade) => {
                             let (signing_scheme, signature) = match &trade.order.signature {
@@ -120,6 +120,7 @@ pub fn from_domain(solutions: &[solution::Solution]) -> super::Solutions {
                     .map(|gas| u64::try_from(gas.0).unwrap_or(u64::MAX)),
                 state_overrides: None,
                 state_overrides_block: None,
+                gas_fee_override: None,
                 // rely on driver to fill in the blanks
                 flashloans: None,
                 wrappers: solution

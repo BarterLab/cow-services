@@ -1,9 +1,8 @@
 use {
     crate::{DomainSeparator, quote::QuoteSigningScheme},
-    alloy::{
-        primitives::{Address, B256},
-        signers::{SignerSync, local::PrivateKeySigner},
-    },
+    alloy_primitives::{Address, B256, keccak256},
+    alloy_signer::SignerSync,
+    alloy_signer_local::PrivateKeySigner,
     anyhow::{Context as _, Result, ensure},
     serde::{Deserialize, Serialize, de},
     std::{
@@ -262,7 +261,8 @@ impl Default for EcdsaSignature {
         Self {
             r: B256::ZERO,
             s: B256::ZERO,
-            // Use normalized v value (equivalent to 0) for Solidity ecrecover compatibility
+            // Use normalized v value (equivalent to 0) for Solidity ecrecover
+            // compatibility
             v: 27,
         }
     }
@@ -275,14 +275,14 @@ pub fn hashed_eip712_message(domain_separator: &DomainSeparator, struct_hash: &[
     message[0..2].copy_from_slice(&[0x19, 0x01]);
     message[2..34].copy_from_slice(&domain_separator.0);
     message[34..66].copy_from_slice(struct_hash);
-    alloy::primitives::keccak256(message)
+    keccak256(message)
 }
 
 fn hashed_ethsign_message(domain_separator: &DomainSeparator, struct_hash: &[u8; 32]) -> B256 {
     let mut message = [0u8; 60];
     message[..28].copy_from_slice(b"\x19Ethereum Signed Message:\n32");
     message[28..].copy_from_slice(hashed_eip712_message(domain_separator, struct_hash).as_slice());
-    alloy::primitives::keccak256(message)
+    keccak256(message)
 }
 
 /// Orders are always hashed into 32 bytes according to EIP-712.
@@ -316,9 +316,10 @@ impl EcdsaSignature {
 
     pub fn from_bytes(bytes: &[u8; 65]) -> Result<Self> {
         let v = bytes[64];
-        // Normalize v to legacy format (27/28) for Solidity ecrecover compatibility.
-        // Modern EIP-2 signatures use v = 0 or 1, but Solidity's ecrecover expects
-        // v = 27 or 28. Alloy normalizes internally for off-chain recovery, but
+        // Normalize v to legacy format (27/28) for Solidity ecrecover
+        // compatibility. Modern EIP-2 signatures use v = 0 or 1, but
+        // Solidity's ecrecover expects v = 27 or 28. Alloy normalizes
+        // internally for off-chain recovery, but
         // on-chain ecrecover(hash, v=0, r, s) returns address(0) and fails.
         // Only valid v values are 0, 1, 27, 28.
         let normalized_v = match v {
@@ -340,7 +341,7 @@ impl EcdsaSignature {
         struct_hash: &[u8; 32],
     ) -> Result<Recovered> {
         let message = hashed_signing_message(signing_scheme, domain_separator, struct_hash);
-        let signature = alloy::primitives::Signature::from_raw(&self.to_bytes())?;
+        let signature = alloy_primitives::Signature::from_raw(&self.to_bytes())?;
         let signer = signature.recover_address_from_prehash(&message)?;
 
         Ok(Recovered { message, signer })
@@ -353,7 +354,8 @@ impl EcdsaSignature {
         key: &PrivateKeySigner,
     ) -> Self {
         let message = hashed_signing_message(signing_scheme, domain_separator, struct_hash);
-        // Unwrap because the only error is for invalid messages which we don't create.
+        // Unwrap because the only error is for invalid messages which we don't
+        // create.
         let signature = key.sign_hash_sync(&message).unwrap();
         Self::from_bytes(&signature.as_bytes()).expect("signing produces valid v values")
     }
@@ -374,13 +376,8 @@ impl Serialize for EcdsaSignature {
     where
         S: serde::Serializer,
     {
-        let mut bytes = [0u8; 2 + 65 * 2];
-        bytes[..2].copy_from_slice(b"0x");
-        // Can only fail if the buffer size does not match but we know it is correct.
-        const_hex::encode_to_slice(self.to_bytes(), &mut bytes[2..]).unwrap();
-        // Hex encoding is always valid utf8.
-        let str = std::str::from_utf8(&bytes).unwrap();
-        serializer.serialize_str(str)
+        let mut buffer = const_hex::Buffer::<65, true>::new();
+        serializer.serialize_str(buffer.format(&self.to_bytes()))
     }
 }
 
@@ -427,7 +424,7 @@ impl<'de> Deserialize<'de> for EcdsaSignature {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, serde_json::json, testlib::assert_json_matches};
+    use {super::*, alloy_primitives::U256, serde_json::json, testlib::assert_json_matches};
 
     #[test]
     fn onchain_signatures_cannot_recover_owners() {
@@ -454,7 +451,8 @@ mod tests {
         assert!(Signature::from_bytes(SigningScheme::EthSign, &[0u8; 20]).is_err());
         assert!(Signature::from_bytes(SigningScheme::PreSign, &[0u8; 32]).is_err());
 
-        // Note: v=0 in input bytes gets normalized to v=27 for ecrecover compatibility
+        // Note: v=0 in input bytes gets normalized to v=27 for ecrecover
+        // compatibility
         assert_eq!(
             Signature::from_bytes(SigningScheme::Eip712, &[0u8; 65]).unwrap(),
             Signature::default_with(SigningScheme::Eip712)
@@ -634,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_ecdsa_signature_recovery() {
-        let private_key = alloy::primitives::U256::from(1u64);
+        let private_key = U256::from(1u64);
         let signer = PrivateKeySigner::from_bytes(&private_key.to_be_bytes().into()).unwrap();
         let signer_address = signer.address();
 
@@ -681,8 +679,9 @@ mod tests {
 
     #[test]
     fn ecdsa_signature_v_normalization() {
-        // Modern EIP-2 signatures use v = 0 or 1, but Solidity's ecrecover expects
-        // v = 27 or 28. This test verifies that v values are normalized correctly.
+        // Modern EIP-2 signatures use v = 0 or 1, but Solidity's ecrecover
+        // expects v = 27 or 28. This test verifies that v values are
+        // normalized correctly.
 
         // v = 0 should be normalized to 27
         let mut bytes_v0 = [0u8; 65];

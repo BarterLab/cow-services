@@ -1,9 +1,10 @@
 //! The domain object representing a CoW Protocol order.
 
 use {
-    crate::{domain::eth, util},
+    crate::domain::eth,
     alloy::primitives::B256,
     eth::Address,
+    eth_domain_types::Receiver,
     std::fmt::{self, Debug, Display, Formatter},
 };
 
@@ -14,16 +15,17 @@ pub struct Order {
     pub sell: eth::Asset,
     pub buy: eth::Asset,
     pub side: Side,
-    pub class: Class,
     pub partially_fillable: bool,
     pub flashloan_hint: Option<FlashloanHint>,
     pub wrappers: Vec<WrapperCall>,
 }
 
 impl Order {
-    /// Returns `true` if the order expects a solver-computed fee.
-    pub fn solver_determines_fee(&self) -> bool {
-        self.class == Class::Limit
+    /// Returns the owner address of the order extracted from the UID.
+    pub fn owner(&self) -> eth::Address {
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(&self.uid.0[32..52]);
+        eth::Address::from(bytes)
     }
 }
 
@@ -34,31 +36,24 @@ pub struct Uid(pub [u8; 56]);
 impl Debug for Uid {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_tuple("Uid")
-            .field(&util::fmt::Hex(&self.0))
+            .field(&format_args!("{}", const_hex::encode_prefixed(self.0)))
             .finish()
     }
 }
 
 impl Display for Uid {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        Display::fmt(&util::fmt::Hex(&self.0), f)
+        f.write_str(&const_hex::encode_prefixed(self.0))
     }
 }
 
 /// The trading side of an order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum Side {
     /// An order with a fixed buy amount and maximum sell amount.
     Buy,
     /// An order with a fixed sell amount and a minimum buy amount.
     Sell,
-}
-
-/// The order classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Class {
-    Market,
-    Limit,
 }
 
 /// An order that can be used to provide just-in-time liquidity in form of a CoW
@@ -71,11 +66,10 @@ pub struct JitOrder {
     pub sell: eth::Asset,
     pub buy: eth::Asset,
     pub side: Side,
-    pub class: Class,
     pub partially_fillable: bool,
     pub valid_to: u32,
     pub app_data: AppData,
-    pub receiver: Address,
+    pub receiver: Receiver,
 }
 
 /// Signature over the order data.
@@ -132,7 +126,7 @@ pub struct AppData(pub [u8; 32]);
 impl Debug for AppData {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("AppData")
-            .field(&util::fmt::Hex(&self.0))
+            .field(&format_args!("{}", const_hex::encode_prefixed(self.0)))
             .finish()
     }
 }

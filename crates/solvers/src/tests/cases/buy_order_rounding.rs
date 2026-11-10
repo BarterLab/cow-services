@@ -41,7 +41,6 @@ async fn uniswap() {
                     "fullSellAmount": "2000000000",
                     "buyAmount": "1000000000000000000",
                     "fullBuyAmount": "1000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "buy",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -50,7 +49,7 @@ async fn uniswap() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -99,7 +98,8 @@ async fn uniswap() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "1000000000000000000"
+                        "executedAmount": "1000000000000000000",
+                        "fee": "4594554"
                     }
                 ],
                 "preInteractions": [],
@@ -175,7 +175,6 @@ async fn balancer_weighted() {
                     "fullSellAmount": "22300745198530623141535718272648361505980416",
                     "buyAmount": "1000000000000000000",
                     "fullBuyAmount": "1000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "buy",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -184,7 +183,7 @@ async fn balancer_weighted() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -270,7 +269,8 @@ async fn balancer_weighted() {
                         "order": "0x0000000000000000000000000000000000000000000000000000000000000000\
                                     0000000000000000000000000000000000000000\
                                     00000000",
-                        "executedAmount": "1000000000000000000"
+                        "executedAmount": "1000000000000000000",
+                        "fee": "4129931694751025"
                     }
                 ],
                 "preInteractions": [],
@@ -348,7 +348,6 @@ async fn balancer_weighted_v3plus() {
                     "fullSellAmount": "100000000000000000000000",
                     "buyAmount": "1000000000000000000000",
                     "fullBuyAmount": "1000000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "buy",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -357,7 +356,7 @@ async fn balancer_weighted_v3plus() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -423,7 +422,8 @@ async fn balancer_weighted_v3plus() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "1000000000000000000000"
+                        "executedAmount": "1000000000000000000000",
+                        "fee": "207115386062754"
                     }
                 ],
                 "preInteractions": [],
@@ -492,7 +492,6 @@ async fn distant_convergence() {
                     "fullSellAmount": "100000000000000000000000",
                     "buyAmount": "999999999999999843119",
                     "fullBuyAmount": "999999999999999843119",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "buy",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -501,7 +500,7 @@ async fn distant_convergence() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -567,7 +566,8 @@ async fn distant_convergence() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "999999999999999843119"
+                        "executedAmount": "999999999999999843119",
+                        "fee": "207115386062754"
                     }
                 ],
                 "preInteractions": [],
@@ -636,7 +636,6 @@ async fn same_path() {
                     "fullSellAmount": "16000000000000000000",
                     "buyAmount": "9056454904357528",
                     "fullBuyAmount": "9056454904357528",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "buy",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -645,7 +644,7 @@ async fn same_path() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -720,11 +719,11 @@ async fn same_path() {
     // meaning that we actually need to sell a bit more than computed in order
     // to cover the buy order. Specifically, in this example:
     // - the computed input amount is `15503270361045187239 xCOW`
-    // - the corresponding output amount is `9056454904357125 xGNO` (`403` less than
-    //   what is actually needed)
+    // - the corresponding output amount is `9056454904357125 xGNO` (`403` less
+    //   than what is actually needed)
     // - the optimal input amount is `15503270361046529181 xCOW`, such that this
-    //   amount -1 would result in an output amount that is not enough to cover the
-    //   order
+    //   amount -1 would result in an output amount that is not enough to cover
+    //   the order
     //
     // Interestingly, in the same path, we have an constant product pool (i.e.
     // Uniswap-like pool) L1 which if used for a solution would result in
@@ -747,7 +746,8 @@ async fn same_path() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "9056454904357528"
+                        "executedAmount": "9056454904357528",
+                        "fee": "166974995045170"
                     }
                 ],
                 "preInteractions": [],
@@ -830,7 +830,6 @@ async fn balancer_stable() {
                     "fullSellAmount": "10500000000000000000",
                     "buyAmount": "10000000000000000000",
                     "fullBuyAmount": "10000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "buy",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -839,7 +838,7 @@ async fn balancer_stable() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -899,7 +898,8 @@ async fn balancer_stable() {
                             "order": "0x0101010101010101010101010101010101010101010101010101010101010101\
                                         0101010101010101010101010101010101010101\
                                         01010101",
-                            "executedAmount": "10000000000000000000"
+                            "executedAmount": "10000000000000000000",
+                            "fee": "265944403395415"
                         }
                     ],
                     "preInteractions": [],

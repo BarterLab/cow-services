@@ -1,7 +1,7 @@
 use {
     super::Postgres,
     crate::dto::TokenMetadata,
-    alloy::primitives::{Address, B256},
+    alloy::primitives::{Address, B256, map::HashSet},
     anyhow::{Context as _, Result},
     app_data::AppDataHash,
     async_trait::async_trait,
@@ -12,19 +12,19 @@ use {
         order_events::{OrderEvent, OrderEventLabel, insert_order_event},
         orders::{self, FullOrder, OrderKind as DbOrderKind},
     },
-    futures::{FutureExt, StreamExt, stream::TryStreamExt},
+    futures::{FutureExt, StreamExt, stream::TryStreamExt, try_join},
     model::{
         order::{
             EthflowData,
             Interactions,
             OnchainOrderData,
             Order,
-            OrderClass,
             OrderData,
             OrderMetadata,
             OrderStatus,
             OrderUid,
         },
+        quote::QuoteId,
         signature::Signature,
         time::now_in_epoch_seconds,
     },
@@ -36,8 +36,6 @@ use {
             buy_token_destination_into,
             extract_interactions,
             onchain_order_placement_error_from,
-            order_class_from,
-            order_class_into,
             order_kind_from,
             order_kind_into,
             order_quote_into_model,
@@ -56,13 +54,18 @@ use {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait OrderStoring: Send + Sync {
-    async fn insert_order(&self, order: &Order) -> Result<(), InsertionError>;
+    async fn insert_order(
+        &self,
+        order: &Order,
+        quote_id: Option<QuoteId>,
+    ) -> Result<(), InsertionError>;
     async fn cancel_orders(&self, order_uids: Vec<OrderUid>, now: DateTime<Utc>) -> Result<()>;
     async fn cancel_order(&self, order_uid: &OrderUid, now: DateTime<Utc>) -> Result<()>;
     async fn replace_order(
         &self,
         old_order: &OrderUid,
         new_order: &Order,
+        quote_id: Option<QuoteId>,
     ) -> Result<(), InsertionError>;
     async fn orders_for_tx(&self, tx_hash: &B256) -> Result<Vec<Order>>;
     /// All orders of a single user ordered by creation date descending (newest
@@ -75,6 +78,7 @@ pub trait OrderStoring: Send + Sync {
     ) -> Result<Vec<Order>>;
     async fn latest_order_event(&self, order_uid: &OrderUid) -> Result<Option<OrderEvent>>;
     async fn single_order(&self, uid: &OrderUid) -> Result<Option<Order>>;
+    async fn many_orders(&self, uids: &[OrderUid]) -> Result<Vec<(OrderUid, Result<Order>)>>;
 }
 
 #[derive(Debug)]
@@ -105,6 +109,7 @@ async fn cancel_order(
             order_uid: uid,
             timestamp: now,
             label: OrderEventLabel::Cancelled,
+            reason: None,
         },
     )
     .await?;
@@ -112,7 +117,11 @@ async fn cancel_order(
     Ok(())
 }
 
-async fn insert_order(order: &Order, ex: &mut PgConnection) -> Result<(), InsertionError> {
+async fn insert_order(
+    order: &Order,
+    quote_id: Option<QuoteId>,
+    ex: &mut PgConnection,
+) -> Result<(), InsertionError> {
     let order_uid = ByteArray(order.metadata.uid.0);
     insert_order_event(
         ex,
@@ -120,6 +129,7 @@ async fn insert_order(order: &Order, ex: &mut PgConnection) -> Result<(), Insert
             order_uid,
             timestamp: Utc::now(),
             label: OrderEventLabel::Created,
+            reason: None,
         },
     )
     .await?;
@@ -158,14 +168,13 @@ async fn insert_order(order: &Order, ex: &mut PgConnection) -> Result<(), Insert
         creation_timestamp: order.metadata.creation_date,
         sell_token: ByteArray(order.data.sell_token.0.0),
         buy_token: ByteArray(order.data.buy_token.0.0),
-        receiver: order.data.receiver.map(|addr| ByteArray(addr.0.0)),
+        receiver: ByteArray(*order.data.receiver.raw_bytes()),
         sell_amount: u256_to_big_decimal(&order.data.sell_amount),
         buy_amount: u256_to_big_decimal(&order.data.buy_amount),
         valid_to: order.data.valid_to as i64,
         app_data: ByteArray(order.data.app_data.0),
         fee_amount: u256_to_big_decimal(&order.data.fee_amount),
         kind: order_kind_into(order.data.kind),
-        class: order_class_into(&order.metadata.class),
         partially_fillable: order.data.partially_fillable,
         signature: order.signature.to_bytes(),
         signing_scheme: signing_scheme_into(order.signature.scheme()),
@@ -173,6 +182,8 @@ async fn insert_order(order: &Order, ex: &mut PgConnection) -> Result<(), Insert
         sell_token_balance: sell_token_source_into(order.data.sell_token_balance),
         buy_token_balance: buy_token_destination_into(order.data.buy_token_balance),
         cancellation_timestamp: None,
+        valid_from: order.metadata.valid_from.map(i64::from),
+        fast_path: order.metadata.fast_path,
     };
 
     database::orders::insert_order(ex, &db_order)
@@ -200,6 +211,7 @@ async fn insert_order(order: &Order, ex: &mut PgConnection) -> Result<(), Insert
             solver: ByteArray(quote.solver.0.0),
             verified: quote.verified,
             metadata: quote.metadata.clone(),
+            quote_id,
         };
         database::orders::insert_quote(ex, &db_quote)
             .await
@@ -211,18 +223,21 @@ async fn insert_order(order: &Order, ex: &mut PgConnection) -> Result<(), Insert
 
 #[async_trait::async_trait]
 impl OrderStoring for Postgres {
-    async fn insert_order(&self, order: &Order) -> Result<(), InsertionError> {
+    async fn insert_order(
+        &self,
+        order: &Order,
+        quote_id: Option<QuoteId>,
+    ) -> Result<(), InsertionError> {
         let _timer = super::Metrics::get()
             .database_queries
             .with_label_values(&["insert_order"])
             .start_timer();
 
-        let order = order.clone();
         let mut connection = self.pool.acquire().await?;
         let mut ex = connection.begin().await?;
 
-        insert_order(&order, &mut ex).await?;
-        Self::insert_order_app_data(&order, &mut ex).await?;
+        insert_order(order, quote_id, &mut ex).await?;
+        Self::insert_order_app_data(order, &mut ex).await?;
 
         ex.commit().await?;
         Ok(())
@@ -259,6 +274,7 @@ impl OrderStoring for Postgres {
         &self,
         old_order: &model::order::OrderUid,
         new_order: &model::order::Order,
+        quote_id: Option<QuoteId>,
     ) -> anyhow::Result<(), super::orders::InsertionError> {
         let _timer = super::Metrics::get()
             .database_queries
@@ -277,7 +293,7 @@ impl OrderStoring for Postgres {
                         new_order.metadata.creation_date,
                     )
                     .await?;
-                    insert_order(&new_order, ex).await?;
+                    insert_order(&new_order, quote_id, ex).await?;
                     Self::insert_order_app_data(&new_order, ex).await?;
 
                     Ok(())
@@ -311,6 +327,57 @@ impl OrderStoring for Postgres {
             }
         }
         .transpose()
+    }
+
+    async fn many_orders(&self, uids: &[OrderUid]) -> Result<Vec<(OrderUid, Result<Order>)>> {
+        let _timer = super::Metrics::get()
+            .database_queries
+            .with_label_values(&["many_orders"])
+            .start_timer();
+        // Deduplicate order UIDs
+        let uids = uids
+            .iter()
+            .map(|uid| ByteArray(uid.0))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        // Each query acquires its own connection and releases it once done.
+        // Acquiring both connections upfront would hold one while waiting for
+        // the other, which deadlocks the pool when enough of these requests
+        // run concurrently.
+        let (orders, jit_orders) = try_join!(
+            async {
+                let mut ex = self.pool.acquire().await?;
+                database::orders::many_full_orders_with_quotes(&mut ex, &uids).await
+            },
+            // JIT orders are fetched without quotes as they are created by
+            // solvers at settlement time
+            async {
+                let mut ex = self.pool.acquire().await?;
+                database::jit_orders::get_many_by_uid(&mut ex, &uids).await
+            }
+        )?;
+        Ok(orders
+            .into_iter()
+            .map(|order| {
+                let (order, quote) = order.into_order_and_quote();
+                let uid = OrderUid(order.uid.0);
+                let result =
+                    full_order_with_quote_into_model_order(order, quote.as_ref()).map_err(|err| {
+                        tracing::warn!(?err, "Error converting into model order");
+                        err.context("Error converting into model order")
+                    });
+                (uid, result)
+            })
+            .chain(jit_orders.into_iter().map(|order| {
+                let uid = OrderUid(order.uid.0);
+                let result = full_order_into_model_order(order).map_err(|err| {
+                    tracing::warn!(?err, "Error converting Jit order into model order");
+                    err.context("Error converting Jit order into model order")
+                });
+                (uid, result)
+            }))
+            .collect())
     }
 
     async fn orders_for_tx(&self, tx_hash: &B256) -> Result<Vec<Order>> {
@@ -409,13 +476,12 @@ impl Postgres {
             }),
             self.execute_instrumented("fetch_latest_token_price", async {
                 let mut ex = self.pool.acquire().await?;
-                Ok(database::auction_prices::fetch_latest_token_price(
-                    &mut ex,
-                    ByteArray(token.0.0),
+                Ok(
+                    database::auction::fetch_latest_token_price(&mut ex, ByteArray(token.0.0))
+                        .await
+                        .map_err(anyhow::Error::from)?
+                        .and_then(|price| big_decimal_to_u256(&price)),
                 )
-                .await
-                .map_err(anyhow::Error::from)?
-                .and_then(|price| big_decimal_to_u256(&price)))
             })
         )?;
 
@@ -535,7 +601,6 @@ fn full_order_with_quote_into_model_order(
     let onchain_user = order
         .onchain_user
         .map(|onchain_user| Address::new(onchain_user.0));
-    let class = order_class_from(&order);
     let onchain_placement_error = onchain_order_placement_error_from(&order);
     let onchain_order_data = onchain_user.map(|onchain_user| OnchainOrderData {
         sender: onchain_user,
@@ -563,10 +628,15 @@ fn full_order_with_quote_into_model_order(
         executed_fee: big_decimal_to_u256(&order.executed_fee)
             .context("executed fee is not a valid u256")?,
         executed_fee_token: Address::new(order.executed_fee_token.0),
+        gas_cost: order
+            .gas_cost
+            .as_ref()
+            .map(|cost| big_decimal_to_u256(cost).context("gas cost is not a valid u256"))
+            .transpose()?,
         invalidated: order.invalidated,
         status,
-        is_liquidity_order: class == OrderClass::Liquidity,
-        class,
+        is_liquidity_order: order.is_liquidity_order,
+        class: (),
         settlement_contract: Address::new(order.settlement_contract.0),
         ethflow_data,
         onchain_user,
@@ -576,14 +646,18 @@ fn full_order_with_quote_into_model_order(
             .map(String::from_utf8)
             .transpose()
             .context("full app data isn't utf-8")?,
-        quote: quote
-            .map(|q| order_quote_into_model(q, status))
-            .transpose()?,
+        valid_from: order
+            .valid_from
+            .map(u32::try_from)
+            .transpose()
+            .context("valid_from is not u32")?,
+        fast_path: order.fast_path,
+        quote: quote.map(order_quote_into_model).transpose()?,
     };
     let data = OrderData {
         sell_token: Address::new(order.sell_token.0),
         buy_token: Address::new(order.buy_token.0),
-        receiver: order.receiver.map(|address| Address::new(address.0)),
+        receiver: eth_domain_types::Receiver::new(Address::new(order.receiver.0)),
         sell_amount: big_decimal_to_u256(&order.sell_amount).context("sell_amount is not U256")?,
         buy_amount: big_decimal_to_u256(&order.buy_amount).context("buy_amount is not U256")?,
         valid_to: order.valid_to.try_into().context("valid_to is not u32")?,
@@ -634,7 +708,6 @@ mod tests {
             orders::{
                 BuyTokenDestination as DbBuyTokenDestination,
                 FullOrder,
-                OrderClass as DbOrderClass,
                 OrderKind as DbOrderKind,
                 SellTokenSource as DbSellTokenSource,
                 SigningScheme as DbSigningScheme,
@@ -662,13 +735,15 @@ mod tests {
             sell_amount: BigDecimal::from(1),
             buy_amount: BigDecimal::from(1),
             valid_to: valid_to_timestamp.timestamp(),
+            valid_from: None,
+            fast_path: false,
             app_data: ByteArray([0; 32]),
             fee_amount: BigDecimal::default(),
             kind: DbOrderKind::Sell,
-            class: DbOrderClass::Liquidity,
+            is_liquidity_order: true,
             partially_fillable: true,
             signature: vec![0; 65],
-            receiver: None,
+            receiver: ByteArray([0; 20]),
             sum_sell: BigDecimal::default(),
             sum_buy: BigDecimal::default(),
             sum_fee: BigDecimal::default(),
@@ -686,6 +761,7 @@ mod tests {
             executed_fee: Default::default(),
             executed_fee_token: ByteArray([1; 20]), // TODO surplus token
             full_app_data: Default::default(),
+            gas_cost: None,
         };
 
         // Open - sell (filled - 0%)
@@ -882,7 +958,7 @@ mod tests {
             },
             ..Default::default()
         };
-        db.insert_order(&old_order).await.unwrap();
+        db.insert_order(&old_order, None).await.unwrap();
 
         let new_order = Order {
             data: OrderData {
@@ -897,7 +973,7 @@ mod tests {
             },
             ..Default::default()
         };
-        db.replace_order(&old_order.metadata.uid, &new_order)
+        db.replace_order(&old_order.metadata.uid, &new_order, None)
             .await
             .unwrap();
 
@@ -944,7 +1020,7 @@ mod tests {
             },
             ..Default::default()
         };
-        db.insert_order(&old_order).await.unwrap();
+        db.insert_order(&old_order, None).await.unwrap();
 
         let new_order = Order {
             metadata: OrderMetadata {
@@ -955,11 +1031,12 @@ mod tests {
             },
             ..Default::default()
         };
-        db.insert_order(&new_order).await.unwrap();
+        db.insert_order(&new_order, None).await.unwrap();
 
-        // Attempt to replace an old order with one that already exists should fail.
+        // Attempt to replace an old order with one that already exists should
+        // fail.
         let err = db
-            .replace_order(&old_order.metadata.uid, &new_order)
+            .replace_order(&old_order.metadata.uid, &new_order, None)
             .await
             .unwrap_err();
         assert!(matches!(err, InsertionError::DuplicatedRecord));
@@ -992,7 +1069,7 @@ mod tests {
             signature: Signature::default_with(SigningScheme::PreSign),
             ..Default::default()
         };
-        db.insert_order(&order).await.unwrap();
+        db.insert_order(&order, None).await.unwrap();
 
         let order_status = || async {
             db.single_order(&order.metadata.uid)
@@ -1079,9 +1156,9 @@ mod tests {
             }
         };
 
-        db.insert_order(&order(1)).await.unwrap();
-        db.insert_order(&order(2)).await.unwrap();
-        db.insert_order(&order(3)).await.unwrap();
+        db.insert_order(&order(1), None).await.unwrap();
+        db.insert_order(&order(2), None).await.unwrap();
+        db.insert_order(&order(3), None).await.unwrap();
 
         assert_eq!(order_status(1).await, OrderStatus::Open);
         assert_eq!(order_status(2).await, OrderStatus::Open);
@@ -1094,6 +1171,51 @@ mod tests {
         assert_eq!(order_status(1).await, OrderStatus::Cancelled);
         assert_eq!(order_status(2).await, OrderStatus::Cancelled);
         assert_eq!(order_status(3).await, OrderStatus::Open);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_many_orders_single_connection_pool() {
+        // `many_orders` must never hold a connection while waiting for another
+        // one from the same pool. Otherwise concurrent requests can exhaust
+        // the pool by each holding one connection and waiting for a second.
+        let db = Postgres::try_new(
+            "postgresql://",
+            crate::database::Config {
+                max_pool_size: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        database::clear_DANGER(&db.pool).await.unwrap();
+
+        let order = Order {
+            data: OrderData {
+                valid_to: u32::MAX,
+                ..Default::default()
+            },
+            metadata: OrderMetadata {
+                uid: OrderUid([1; 56]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        db.insert_order(&order, None).await.unwrap();
+
+        let orders = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            db.many_orders(&[order.metadata.uid, OrderUid([2; 56])]),
+        )
+        .await
+        .expect("many_orders must complete with a single connection")
+        .unwrap();
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].0, order.metadata.uid);
+        assert_eq!(
+            orders[0].1.as_ref().unwrap().metadata.uid,
+            order.metadata.uid
+        );
     }
 
     #[tokio::test]
@@ -1143,7 +1265,7 @@ mod tests {
             ..Default::default()
         };
 
-        db.insert_order(&order).await.unwrap();
+        db.insert_order(&order, None).await.unwrap();
 
         let single_order = db.single_order(&uid).await.unwrap().unwrap();
         assert_eq!(
@@ -1206,7 +1328,7 @@ mod tests {
             ..Default::default()
         };
 
-        db.insert_order(&order).await.unwrap();
+        db.insert_order(&order, None).await.unwrap();
 
         let single_order = db.single_order(&uid).await.unwrap().unwrap();
 

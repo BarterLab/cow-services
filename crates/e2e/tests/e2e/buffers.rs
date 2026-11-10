@@ -1,6 +1,10 @@
 use {
     ::alloy::primitives::U256,
-    autopilot::config::Configuration,
+    configs::{
+        autopilot::trusted_tokens::TrustedTokensConfig,
+        order_quoting::{ExternalSolver, OrderQuoting},
+        test_util::TestDefault,
+    },
     e2e::setup::*,
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -58,32 +62,33 @@ async fn onchain_settlement_without_liquidity(web3: Web3) {
             .await,
         ],
         colocation::LiquidityProvider::UniswapV2,
-        false,
     );
     let services = Services::new(&onchain).await;
-    let (_config_file, config_arg) =
-        Configuration::test("test_solver", solver.address()).to_cli_args();
-
     services
-        .start_autopilot(
-            None,
-            vec![
-                format!(
-                    "--trusted-tokens={weth:#x},{token_a:#x},{token_b:#x}",
-                    weth = onchain.contracts().weth.address(),
-                    token_a = token_a.address(),
-                    token_b = token_b.address()
-                ),
-                config_arg,
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-            ],
-        )
+        .start_autopilot(configs::autopilot::Configuration {
+            trusted_tokens: TrustedTokensConfig {
+                tokens: vec![
+                    *onchain.contracts().weth.address(),
+                    *token_a.address(),
+                    *token_b.address(),
+                ],
+                ..Default::default()
+            },
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..configs::autopilot::Configuration::test("test_solver", solver.address())
+        })
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
 
     // Place Order

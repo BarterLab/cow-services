@@ -56,14 +56,6 @@ impl IntoResponse for PartialValidationErrorWrapper {
                 error("UnsupportedSellTokenSource", format!("Type {src:?}")),
             )
                 .into_response(),
-            PartialValidationError::UnsupportedOrderType => (
-                StatusCode::BAD_REQUEST,
-                error(
-                    "UnsupportedOrderType",
-                    "This order type is currently not supported",
-                ),
-            )
-                .into_response(),
             PartialValidationError::Forbidden => (
                 StatusCode::FORBIDDEN,
                 error("Forbidden", "Forbidden, your account is deny-listed"),
@@ -222,14 +214,21 @@ impl IntoResponse for ValidationErrorWrapper {
                 ),
             )
                 .into_response(),
-            ValidationError::TransferSimulationFailed => (
-                StatusCode::BAD_REQUEST,
-                error(
-                    "TransferSimulationFailed",
-                    "sell token cannot be transferred",
-                ),
-            )
-                .into_response(),
+            ValidationError::TransferSimulationFailed(revert_data) => {
+                let description = if revert_data.is_empty() {
+                    "sell token cannot be transferred".to_string()
+                } else {
+                    format!(
+                        "sell token cannot be transferred, token reverted with: 0x{}",
+                        const_hex::encode(&revert_data),
+                    )
+                };
+                (
+                    StatusCode::BAD_REQUEST,
+                    error("TransferSimulationFailed", description),
+                )
+            }
+            .into_response(),
             ValidationError::QuoteNotVerified => (
                 StatusCode::BAD_REQUEST,
                 error(
@@ -242,6 +241,24 @@ impl IntoResponse for ValidationErrorWrapper {
             ValidationError::ZeroAmount => (
                 StatusCode::BAD_REQUEST,
                 error("ZeroAmount", "Buy or sell amount is zero."),
+            )
+                .into_response(),
+            ValidationError::InvalidValidFrom => (
+                StatusCode::BAD_REQUEST,
+                error(
+                    "InvalidValidFrom",
+                    "appData validFrom must be earlier than the order's validTo.",
+                ),
+            )
+                .into_response(),
+            ValidationError::FastPathLimitTooTight => (
+                StatusCode::BAD_REQUEST,
+                error(
+                    "FastPathLimitTooTight",
+                    "signed limit price doesn't leave room for the configured protocol and \
+                     partner volume fees; sign a lower buy amount (or higher sell amount for buy \
+                     orders) or drop the fast-path opt-in.",
+                ),
             )
                 .into_response(),
             ValidationError::IncompatibleSigningScheme => (
@@ -260,6 +277,16 @@ impl IntoResponse for ValidationErrorWrapper {
             ValidationError::TooMuchGas => (
                 StatusCode::BAD_REQUEST,
                 error("TooMuchGas", "Executing order requires too many gas units"),
+            )
+                .into_response(),
+            ValidationError::InvalidWrapper(wrapper) => (
+                StatusCode::BAD_REQUEST,
+                error(
+                    "InvalidAppData",
+                    format!(
+                        "wrapper {wrapper:?} is not a wrapper contract authorized to settle orders"
+                    ),
+                ),
             )
                 .into_response(),
 

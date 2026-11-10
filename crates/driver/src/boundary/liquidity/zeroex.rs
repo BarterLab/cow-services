@@ -8,11 +8,9 @@ use {
     },
     anyhow::anyhow,
     ethrpc::block_stream::CurrentBlockWatcher,
-    shared::{
-        http_client::HttpClientFactory,
-        price_estimation::gas::GAS_PER_ZEROEX_ORDER,
-        zeroex_api::DefaultZeroExApi,
-    },
+    http_client::HttpClientFactory,
+    liquidity_sources::zeroex::DefaultZeroExApi,
+    price_estimation::gas::GAS_PER_ZEROEX_ORDER,
     solver::{
         liquidity::{LimitOrder, zeroex::ZeroExLiquidity},
         liquidity_collector::LiquidityCollecting,
@@ -24,11 +22,11 @@ pub fn to_domain(
     id: liquidity::Id,
     limit_order: LimitOrder,
 ) -> anyhow::Result<liquidity::Liquidity> {
-    // `order` and `contract` should be provided somehow through the `LimitOrder`
-    // struct. Currently, it's not possible to add 0x-specific fields right to
-    // the `solver::LimitOrder` since it's used with different settlement
-    // handlers. One of the options to address it: to use a separate
-    // `solver::Liquidity` enum value for 0x liquidity.
+    // `order` and `contract` should be provided somehow through the
+    // `LimitOrder` struct. Currently, it's not possible to add 0x-specific
+    // fields right to the `solver::LimitOrder` since it's used with
+    // different settlement handlers. One of the options to address it: to
+    // use a separate `solver::Liquidity` enum value for 0x liquidity.
     let handler = limit_order
         .settlement_handling
         .as_any()
@@ -87,9 +85,9 @@ pub async fn collector(
     let eth = eth.with_metric_label("zeroex".into());
     let settlement = *eth.contracts().settlement().address();
     let web3 = eth.web3().clone();
-    let contract = contracts::alloy::IZeroex::Instance::deployed(&web3.provider).await?;
-    let http_client_factory = &HttpClientFactory::new(&shared::http_client::Arguments {
-        http_timeout: config.http_timeout,
+    let contract = contracts::IZeroex::Instance::deployed(&web3.provider).await?;
+    let http_client_factory = &HttpClientFactory::new(&configs::http_client::HttpClient {
+        timeout: config.http_timeout,
     });
     let api = Arc::new(DefaultZeroExApi::new(
         http_client_factory.builder(),
@@ -98,6 +96,6 @@ pub async fn collector(
         blocks.clone(),
     )?);
     Ok(Box::new(
-        ZeroExLiquidity::new(web3, api, contract, settlement, blocks).await,
+        ZeroExLiquidity::new(api, contract, settlement, blocks).await,
     ))
 }

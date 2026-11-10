@@ -1,10 +1,9 @@
 pub mod app_data;
 pub mod auction;
-pub mod auction_prices;
 pub mod byte_array;
-pub mod cow_amms;
 pub mod ethflow_orders;
 pub mod events;
+pub mod fast_path;
 pub mod fee_policies;
 pub mod jit_orders;
 pub mod last_indexed_blocks;
@@ -19,15 +18,11 @@ pub mod quotes;
 pub mod reference_scores;
 pub mod settlement_executions;
 pub mod settlements;
-pub mod solver_competition;
+pub mod solana;
 pub mod solver_competition_v2;
-pub mod surplus_capturing_jit_order_owners;
 pub mod trades;
 
-use {
-    byte_array::ByteArray,
-    sqlx::{Executor, PgPool},
-};
+use {byte_array::ByteArray, sqlx::Executor};
 
 // Design:
 //
@@ -48,12 +43,12 @@ use {
 // test obsolete.
 
 pub type PgTransaction<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
+pub type PgPool = sqlx::PgPool;
 
 /// The names of tables we use in the db.
 pub const TABLES: &[&str] = &[
     "app_data",
     "auctions",
-    "cow_amms",
     "ethflow_orders",
     "ethflow_refunds",
     "interactions",
@@ -64,18 +59,16 @@ pub const TABLES: &[&str] = &[
     "onchain_placed_orders",
     "presignature_events",
     "proposed_jit_orders",
+    "quote_competitions",
     "quotes",
     "reference_scores",
     "settlement_executions",
     "settlements",
-    "solver_competitions",
-    "surplus_capturing_jit_order_owners",
     "trades",
 ];
 
 /// The names of potentially big volume tables we use in the db.
 pub const LARGE_TABLES: &[&str] = &[
-    "auction_prices",
     "competition_auctions",
     "fee_policies",
     "orders",
@@ -91,11 +84,14 @@ pub fn all_tables() -> impl Iterator<Item = &'static str> {
 }
 
 /// Delete all data in the database. Only used by tests.
+///
+/// Truncates all tables in a single statement so Postgres accepts foreign-key
+/// cycles between listed tables. Individual per-table `TRUNCATE`s error out
+/// when any other listed table references the one being truncated.
 #[expect(non_snake_case)]
 pub async fn clear_DANGER_(ex: &mut PgTransaction<'_>) -> sqlx::Result<()> {
-    for table in all_tables() {
-        ex.execute(format!("TRUNCATE {table};").as_str()).await?;
-    }
+    let tables = all_tables().collect::<Vec<_>>().join(", ");
+    ex.execute(format!("TRUNCATE {tables};").as_str()).await?;
     Ok(())
 }
 

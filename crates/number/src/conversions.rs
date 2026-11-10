@@ -1,13 +1,16 @@
 use {
-    alloy::primitives::{U256, aliases::I512},
+    alloy_primitives::{
+        U256,
+        aliases::{I512, U160},
+    },
     anyhow::{Result, ensure},
     bigdecimal::{BigDecimal, num_bigint::ToBigInt},
     num::{BigInt, BigRational, BigUint, Zero, bigint::Sign, rational::Ratio},
 };
 
 pub fn big_decimal_to_big_uint(big_decimal: &BigDecimal) -> Option<BigUint> {
-    // TODO(vkgnosis): It would be nice to avoid copying the underlying BigInt when
-    // converting BigDecimal to anything else but the simple
+    // TODO(vkgnosis): It would be nice to avoid copying the underlying BigInt
+    // when converting BigDecimal to anything else but the simple
     // big_decimal.to_bigint makes a copy internally.
     big_decimal.to_bigint()?.try_into().ok()
 }
@@ -77,11 +80,29 @@ pub fn u256_to_big_decimal(u256: &U256) -> BigDecimal {
     BigDecimal::from(BigInt::from(big_uint))
 }
 
+pub fn u160_to_big_decimal(u160: &U160) -> BigDecimal {
+    let big_uint = BigUint::from_bytes_be(&u160.to_be_bytes::<20>());
+    BigDecimal::from(BigInt::from(big_uint))
+}
+
+pub fn big_decimal_to_u160(big_decimal: &BigDecimal) -> Option<U160> {
+    let big_uint = big_decimal_to_big_uint(big_decimal)?;
+    big_uint_to_u160(&big_uint).ok()
+}
+
+pub fn big_uint_to_u160(input: &BigUint) -> Result<U160> {
+    let bytes = input.to_bytes_be();
+    ensure!(bytes.len() <= 20, "too large for U160");
+    let mut buf = [0u8; 20];
+    buf[20 - bytes.len()..].copy_from_slice(&bytes);
+    Ok(U160::from_be_bytes(buf))
+}
+
 pub fn i512_to_big_int(i512: &I512) -> BigInt {
     BigInt::from_bytes_be(
         match i512.sign() {
-            alloy::primitives::Sign::Positive => Sign::Plus,
-            alloy::primitives::Sign::Negative => Sign::Minus,
+            alloy_primitives::Sign::Positive => Sign::Plus,
+            alloy_primitives::Sign::Negative => Sign::Minus,
         },
         &i512.abs().to_be_bytes::<64>(),
     )
@@ -95,7 +116,7 @@ pub fn i512_to_big_rational(input: &I512) -> BigRational {
 pub fn i512_to_u256(input: &I512) -> Result<U256> {
     anyhow::ensure!(input >= &I512::ZERO, "Negative input value");
     anyhow::ensure!(input < &I512::from(U256::MAX), "Input exceeds U256::MAX");
-    Ok(alloy::primitives::U256::from_be_slice(
+    Ok(alloy_primitives::U256::from_be_slice(
         &input.to_be_bytes::<64>()[32..],
     ))
 }

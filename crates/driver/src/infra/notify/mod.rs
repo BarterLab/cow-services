@@ -7,10 +7,7 @@ pub mod liquidity_sources;
 mod notification;
 
 pub use notification::{Kind, Notification, ScoreKind, Settlement, SimulationSucceededAtLeastOnce};
-use {
-    super::simulator,
-    crate::domain::{eth, mempools::Error},
-};
+use {crate::domain::mempools::Error, eth_domain_types as eth};
 
 pub fn solver_timeout(solver: &Solver, auction_id: Option<auction::Id>) {
     solver.notify(auction_id, None, notification::Kind::Timeout);
@@ -35,9 +32,9 @@ pub fn scoring_failed(
             notification::Kind::ScoringFailed(ScoreKind::InvalidClearingPrices)
         }
         solution::error::Scoring::Math(_)
-        | solution::error::Scoring::CalculateCustomPrices(
-            solution::error::Trade::Math(_) | solution::error::Trade::ProtocolFeeOnStaticOrder,
-        ) => return,
+        | solution::error::Scoring::CalculateCustomPrices(solution::error::Trade::Math(_)) => {
+            return;
+        }
         solution::error::Scoring::CalculateCustomPrices(
             solution::error::Trade::InvalidExecutedAmount,
         ) => notification::Kind::ScoringFailed(ScoreKind::InvalidExecutedAmount),
@@ -75,6 +72,12 @@ pub fn encoding_failed(
             used.0, limit.0
         )),
         solution::Error::Encoding(_) => return,
+        solution::Error::FastPathTradeCount(_)
+        | solution::Error::FastPathOrderMismatch
+        | solution::Error::FastPathLimitNotMet
+        | solution::Error::FastPathTrade(_)
+        | solution::Error::Math(_)
+        | solution::Error::MissingAuctionId => return,
     };
 
     solver.notify(auction_id, Some(solution_id.clone()), notification);
@@ -98,6 +101,14 @@ pub fn simulation_failed(
     solver.notify(auction_id, Some(solution_id.clone()), kind);
 }
 
+pub fn settlement_started(solver: &Solver, auction_id: auction::Id, solution_id: &solution::Id) {
+    solver.notify(
+        Some(auction_id),
+        Some(solution_id.clone()),
+        notification::Kind::SettlementStarted,
+    );
+}
+
 pub fn executed(
     solver: &Solver,
     auction_id: auction::Id,
@@ -105,11 +116,11 @@ pub fn executed(
     res: &Result<eth::TxId, Error>,
 ) {
     let kind = match res {
-        Ok(hash) => notification::Settlement::Success(hash.clone()),
-        Err(Error::Revert { tx_id: hash, .. }) => notification::Settlement::Revert(hash.clone()),
+        Ok(hash) => notification::Settlement::Success(*hash),
+        Err(Error::Revert { tx_id: hash, .. }) => notification::Settlement::Revert(*hash),
         Err(Error::SimulationRevert { .. }) => notification::Settlement::SimulationRevert,
         Err(Error::Expired { .. }) => notification::Settlement::Expired,
-        Err(Error::Other(_) | Error::Disabled) => notification::Settlement::Fail,
+        Err(Error::Other(_)) => notification::Settlement::Fail,
     };
 
     solver.notify(

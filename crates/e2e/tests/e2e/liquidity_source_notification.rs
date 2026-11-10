@@ -4,9 +4,13 @@ use {
         providers::ext::{AnvilApi, ImpersonateConfig},
         signers::SignerSync,
     },
-    autopilot::config::Configuration,
     chrono::Utc,
-    contracts::alloy::{ERC20, LiquoriceSettlement},
+    configs::{
+        autopilot::Configuration,
+        order_quoting::{ExternalSolver, OrderQuoting},
+        test_util::TestDefault,
+    },
+    contracts::{ERC20, LiquoriceSettlement},
     driver::infra,
     e2e::{
         api,
@@ -31,7 +35,7 @@ use {
 };
 
 /// The block number from which we will fetch state for the forked tests.
-pub const FORK_BLOCK: u64 = 23326100;
+pub const FORK_BLOCK: u64 = 24843565;
 pub const USDT_WHALE: Address = address!("6AC38D1b2f0c0c3b9E816342b1CA14d91D5Ff60B");
 pub const USDC_WHALE: Address = address!("01b8697695eab322a339c4bf75740db75dc9375e");
 
@@ -164,7 +168,8 @@ async fn liquidity_source_notification(web3: Web3) {
 
     // CoW services setup
     let liquorice_solver_api_mock = Mock::new().await;
-    let services = Services::new(&onchain).await;
+    let mut services = Services::new(&onchain).await;
+    services.min_solve_deadline = std::time::Duration::from_secs(2);
 
     colocation::start_driver_with_config_override(
         onchain.contracts(),
@@ -184,11 +189,11 @@ async fn liquidity_source_notification(web3: Web3) {
                 endpoint: liquorice_solver_api_mock.url.clone(),
                 base_tokens: vec![],
                 merge_solutions: true,
-                haircut_bps: 0,
+                solver_fee_bps: 0,
+                submission_keys: vec![],
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
-        false,
         Some(&format!(
             r#"
 [liquidity-sources-notifier]
@@ -200,23 +205,24 @@ http-timeout = "10s"
             liquorice_api.port
         )),
     );
-    let (_config_file, config_arg) =
-        Configuration::test("liquorice_solver", solver.address()).to_cli_args();
 
     services
-        .start_autopilot(
-            None,
-            vec![
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-                config_arg,
-            ],
-        )
+        .start_autopilot(Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..Configuration::test("liquorice_solver", solver.address())
+        })
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
 
     // Create CoW order
@@ -326,6 +332,7 @@ http-timeout = "10s"
         state_overrides_block: None,
         flashloans: None,
         wrappers: vec![],
+        gas_fee_override: None,
     }));
 
     // Wait for trade

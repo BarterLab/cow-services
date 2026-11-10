@@ -1,13 +1,13 @@
 # CoW Protocol Order Debug Skill
 
-Debug why CoW Protocol orders fail to match. Requires DB access + Victoria Logs access (via Grafana).
+Debug why CoW Protocol orders fail to match. Requires DB access + Victoria Logs access (via CoW-Prod MCP).
 
 ## Quick Checklist
 
 Run through these in order:
 
 1. [ ] **Order status** — Check API status first (cancelled/expired/fulfilled/open)
-2. [ ] **User cancellation** — If cancelled, search logs for `order cancelled ORDER_UID` FIRST
+2. [ ] **User cancellation** — If cancelled, search logs for `"order cancelled" AND all:ORDER_UID` FIRST
 3. [ ] **Order in auction** — Was order in autopilot auction? When?
 4. [ ] **Solver bids** — Did any solver bid? What happened to their solution?
 5. [ ] **Settlement outcome** — Did settlement succeed/fail/timeout?
@@ -46,12 +46,12 @@ curl -s "https://barn.api.cow.fi/$NETWORK/api/v1/orders/$ORDER_UID" | jq .
 | `receiver` | Who gets buy tokens | null = order owner |
 
 **Additional API fields:**
-- `class`: "market" vs "limit" — see note below
+- `class`: deprecated, always "limit" — see note below
 - `status`: fulfilled/open/cancelled/expired
 - `surplusFee`: Protocol's fee estimate for limit orders
 - `surplusFeeTimestamp`: Must be <10 min old or order won't enter auction
 
-**Note on order class:** In the DB, almost every order is stored as `class = 'limit'`. The "market" vs "limit" distinction is about **fee policy**, not order type:
+**Note on order class:** Order classes no longer exist (there is no `class` column in the DB anymore and the API always returns `limit`). The "market" vs "limit" distinction that still matters is about **fee policy**, not order type:
 - **Market order**: Had a quote attached, and the order's limit price is within that quote (in-market). Gets market fee policy.
 - **Limit order**: Either no quote, or limit price is outside the quote (out-of-market). Gets limit fee policy with surplus fee.
 
@@ -81,48 +81,54 @@ cast call $SETTLEMENT_CONTRACT "preSignature(bytes)" $ORDER_UID --rpc-url $RPC
 
 ---
 
-## 3. Check Logs (Victoria Logs via Grafana)
+## 3. Check Logs (Victoria Logs via MCP)
 
-Logs are stored in Victoria Logs and accessible via Grafana API.
+Logs are stored in Victoria Logs and accessible via the `CoW-Prod` MCP tools. Use `mcp__CoW-Prod__victorialogs_query` for log searches. Timestamps must be RFC3339 format (compute from current date).
 
-**Query using `scripts/vlogs`:**
-```bash
-# Basic: search by order UID (use full UID with 0x prefix)
-scripts/vlogs "NOT container:controller ORDER_UID"
+**IMPORTANT — Protect context window**: Always append `| fields _time, _msg, all` to queries to strip kubernetes/ec2 metadata (~4KB per entry). Use small `limit` values (10-20). When you only need specific fields, use `| fields _time, _msg, parsed.fields.err, parsed.fields.driver` etc.
 
-# Filter by network
-scripts/vlogs "NOT container:controller network:bnb ORDER_UID"
+**Example queries (use `victorialogs_query` tool):**
+```
+# All order logs (exclude nginx controller, filter by network, strip metadata)
+query: "container:!controller AND network:$NETWORK AND all:ORDER_UID | fields _time, _msg, all"
+start: "<24h-ago-RFC3339>"
+limit: 20
 
-# Search by auction ID
-scripts/vlogs "NOT container:controller 22788649"
+# Search by quote ID
+query: "container:!controller AND network:$NETWORK AND all:22788649 | fields _time, _msg, all"
 
-# Search by solver name + auction
-scripts/vlogs "NOT container:controller baseline 22788649"
-
-# Custom time range and max lines
-scripts/vlogs "NOT container:controller ORDER_UID" --from now-24h --max 200
-
-# Full JSON output (includes labels like network, pod, parsed fields)
-scripts/vlogs "NOT container:controller ORDER_UID" --raw
+# Search specific solver
+query: "container:!controller AND network:$NETWORK AND baseline AND all:22788649 | fields _time, _msg, all"
 ```
 
-**Useful filters (part of the expr):**
-- `NOT container:controller` — excludes nginx access logs (REQUIRED for order UID searches)
-- `network:$NETWORK` — filter by chain (mainnet, bnb, arbitrum-one, base, etc)
+**Useful filters (part of the LogsQL expression):**
+- `container:!controller` — excludes nginx access logs (REQUIRED for order UID searches)
+- `network:$NETWORK` — **always include when debugging an order** to filter by chain (mainnet, bnb, arbitrum-one, base, etc). Reduces noise and speeds up queries.
+- `all:` — prefix for searching structured fields (order UIDs, auction IDs, quote IDs). Without a field prefix, Victoria Logs only searches the log message text, not structured fields. You can also use `parsed.fields.order_uid:0x...` for precise matching, but `all:` works universally.
+- `| fields _time, _msg, all` — **always append** to strip k8s metadata and protect context window
 
-**Note:** Victoria Logs uses simple text matching. Always use the **full order UID with 0x prefix** for reliable matching.
+**Note:** Always use the **full order UID with 0x prefix** and the `all:` field prefix for reliable matching.
 
-**IMPORTANT - Run targeted lifecycle queries in parallel** (use FULL order UID with 0x):
+**IMPORTANT - Run targeted lifecycle queries in parallel** (use FULL order UID with 0x). Call multiple `victorialogs_query` MCP tools simultaneously. Always include `network:$NETWORK` and `| fields` pipe:
 
-```bash
-scripts/vlogs "NOT container:controller order created ORDER_UID"
-scripts/vlogs "NOT container:controller order cancelled ORDER_UID"
-scripts/vlogs "NOT container:controller proposed solution ORDER_UID"
-scripts/vlogs "NOT container:controller settlement failed ORDER_UID"
-scripts/vlogs "NOT container:controller filtered ORDER_UID"
+```
+# Order creation
+query: "container:!controller AND network:$NETWORK AND \"order created\" AND all:ORDER_UID | fields _time, _msg, all"
 
-# Find discarded solutions where order appears in calldata (use order UID bytes without 0x prefix)
-scripts/vlogs "discarded .*ORDER_UID_WITHOUT_0X.*"
+# Order cancellation
+query: "container:!controller AND network:$NETWORK AND \"order cancelled\" AND all:ORDER_UID | fields _time, _msg, all"
+
+# Proposed solutions
+query: "container:!controller AND network:$NETWORK AND \"proposed solution\" AND all:ORDER_UID | fields _time, _msg, all"
+
+# Settlement failures (use specific parsed fields for concise output)
+query: "container:!controller AND network:$NETWORK AND \"settlement failed\" AND all:ORDER_UID | fields _time, _msg, parsed.fields.err, parsed.fields.driver, parsed.spans.auction.auction_id"
+
+# Filtering
+query: "container:!controller AND network:$NETWORK AND filtered AND all:ORDER_UID | fields _time, _msg, all"
+
+# Find discarded solutions (use order UID bytes without 0x prefix)
+query: "container:!controller AND network:$NETWORK AND discarded AND all:ORDER_UID_WITHOUT_0X | fields _time, _msg, all"
 ```
 
 **What to look for:**
@@ -196,10 +202,10 @@ WHERE oq.order_uid = '\x$ORDER_UID_HEX';
 ```
 
 ### Method 3: Logs (fallback)
-Find the quote_id from the "order created" log:
+Find the quote_id from the "order created" log using `victorialogs_query`:
 
-```bash
-"expr": "NOT container:controller order created ORDER_UID | sort by (_time) asc"
+```
+query: "container:!controller AND network:$NETWORK AND \"order created\" AND all:ORDER_UID | fields _time, _msg, all"
 ```
 
 **Example log line:**
@@ -208,8 +214,8 @@ orderbook::api::post_order: order created order_uid=0x... quote_id=Some(2720468)
 ```
 
 Then search for quote details by ID:
-```bash
-"expr": "NOT container:controller $QUOTE_ID | sort by (_time) asc"
+```
+query: "container:!controller AND network:$NETWORK AND all:$QUOTE_ID | fields _time, _msg, all"
 ```
 
 ---
@@ -302,14 +308,13 @@ surplusFeeTimestamp is within last 10 minutes
 ```
 
 **If missing/stale, check surplus fee computation logs:**
-```bash
-# Victoria Logs query
-"expr": "surplus_fee $ORDER_UID | sort by (_time) asc"
+```
+query: "network:$NETWORK AND surplus_fee AND all:ORDER_UID | fields _time, _msg, all"
 ```
 
 **Surplus fee error logs:**
-```bash
-"expr": "surplus_fee error | sort by (_time) asc"
+```
+query: "network:$NETWORK AND surplus_fee AND error | fields _time, _msg, all"
 ```
 
 ### 9.2 Auction Filtering Check
@@ -320,9 +325,8 @@ curl -s "https://api.cow.fi/$NETWORK/api/v1/auction" | jq '.orders[] | select(.u
 ```
 
 If not present, order is filtered. Check filter logs:
-```bash
-# Victoria Logs query
-"expr": "filtered $ORDER_UID | sort by (_time) asc"
+```
+query: "network:$NETWORK AND filtered AND all:ORDER_UID | fields _time, _msg, all"
 ```
 
 **Common filter reasons:**
@@ -410,14 +414,13 @@ settle(
 Order is in auction but still not matching?
 
 **Auction orders log:**
-```bash
-# Victoria Logs query (just the auction ID number)
-"expr": "$AUCTION_ID | sort by (_time) asc"
+```
+query: "network:$NETWORK AND all:$AUCTION_ID | fields _time, _msg, all"
 ```
 
 **Specific auction run:**
-```bash
-"expr": "$RUN_ID | sort by (_time) asc"
+```
+query: "network:$NETWORK AND all:$RUN_ID | fields _time, _msg, all"
 ```
 
 ### JIT Orders & CoW AMMs
@@ -493,11 +496,12 @@ WHERE oq.order_uid = '\x$ORDER_UID_HEX';
 
 ### Check auction inclusion history:
 ```sql
-SELECT 
-  auction_id, order_uid, included, filtered_reason
-FROM auction_orders
-WHERE order_uid = '\x$ORDER_UID_HEX'
-ORDER BY auction_id DESC
+WITH matches AS MATERIALIZED (
+  SELECT * FROM competition_auctions
+  WHERE order_uids @> ARRAY['\x$ORDER_UID_HEX'::bytea]
+  ORDER BY id DESC
+)
+SELECT id FROM matches
 LIMIT 20;
 ```
 
@@ -568,7 +572,7 @@ curl -s "https://api.cow.fi/$NETWORK/api/v1/app_data/$APP_DATA_HASH"
 | Resource | URL |
 |----------|-----|
 | Order Explorer | `https://explorer.cow.fi/orders/$ORDER_UID` |
-| Grafana Logs (Victoria Logs) | `$GRAFANA_URL/explore` (see .env.claude) |
+| Victoria Logs | Via `CoW-Prod` MCP tools (`victorialogs_query`, etc.) |
 | API Docs | `https://api.cow.fi/docs/` |
 | Block-to-Date | `https://etherscan.io/blockdateconverter` |
 | Barn (Staging) | `https://barn.cow.fi` |

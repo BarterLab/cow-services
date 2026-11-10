@@ -1,11 +1,12 @@
 use {
     crate::{
         boundary,
-        domain::{self, auction::order, eth},
+        domain::{self, auction::order},
     },
     alloy::primitives::U256,
     app_data::AppDataHash,
-    contracts::alloy::GPv2Settlement,
+    contracts::GPv2Settlement,
+    eth_domain_types as eth,
 };
 
 /// Recover order uid from order data and signature
@@ -24,7 +25,7 @@ pub fn order_uid(
             [usize::try_from(trade.sellTokenIndex).expect("SC was able to look up this index")],
         buy_token: tokens
             [usize::try_from(trade.buyTokenIndex).expect("SC was able to look up this index")],
-        receiver: Some(trade.receiver),
+        receiver: eth_domain_types::Receiver::new(trade.receiver),
         sell_amount: trade.sellAmount,
         buy_amount: trade.buyAmount,
         valid_to: trade.validTo,

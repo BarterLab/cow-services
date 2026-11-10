@@ -4,8 +4,9 @@ use {
         rpc::types::{Filter, FilterSet},
         sol_types::SolEvent,
     },
-    contracts::alloy::CoWSwapOnchainOrders,
-    shared::{event_handling::AlloyEventRetrieving, web3::Web3},
+    contracts::CoWSwapOnchainOrders,
+    ethrpc::Web3,
+    event_indexing::event_handler::AlloyEventRetrieving,
 };
 
 // Note: we use a custom implementation of `EventRetrieving` rather than using

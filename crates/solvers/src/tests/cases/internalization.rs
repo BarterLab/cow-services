@@ -39,9 +39,8 @@ async fn trusted_token() {
                     "buyToken": "0xDEf1CA1fb7FBcDC777520aa7f396b4E015F497aB",
                     "sellAmount": "133700000000000000",
                     "fullSellAmount": "133700000000000000",
-                    "buyAmount": "6000000000000000000000",
+                    "buyAmount": "5900000000000000000000",
                     "fullBuyAmount": "6000000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "sell",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -50,7 +49,7 @@ async fn trusted_token() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -86,8 +85,8 @@ async fn trusted_token() {
             "solutions": [{
                 "id": 0,
                 "prices": {
-                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "6043910341261930467761",
-                    "0xdef1ca1fb7fbcdc777520aa7f396b4e015f497ab": "133700000000000000"
+                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "5931084729564894506003",
+                    "0xdef1ca1fb7fbcdc777520aa7f396b4e015f497ab": "131204135000000000"
                 },
                 "trades": [
                     {
@@ -95,7 +94,8 @@ async fn trusted_token() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "133700000000000000"
+                        "executedAmount": "131204135000000000",
+                        "fee": "2495865000000000"
                     }
                 ],
                 "preInteractions": [],
@@ -153,9 +153,8 @@ async fn untrusted_sell_token() {
                     "buyToken": "0xDEf1CA1fb7FBcDC777520aa7f396b4E015F497aB",
                     "sellAmount": "133700000000000000",
                     "fullSellAmount": "133700000000000000",
-                    "buyAmount": "6000000000000000000000",
+                    "buyAmount": "5900000000000000000000",
                     "fullBuyAmount": "6000000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "sell",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -164,7 +163,7 @@ async fn untrusted_sell_token() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -200,8 +199,8 @@ async fn untrusted_sell_token() {
             "solutions": [{
                 "id": 0,
                 "prices": {
-                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "6043910341261930467761",
-                    "0xdef1ca1fb7fbcdc777520aa7f396b4e015f497ab": "133700000000000000"
+                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "5931084729564894506003",
+                    "0xdef1ca1fb7fbcdc777520aa7f396b4e015f497ab": "131204135000000000"
                 },
                 "trades": [
                     {
@@ -209,7 +208,8 @@ async fn untrusted_sell_token() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "133700000000000000"
+                        "executedAmount": "131204135000000000",
+                        "fee": "2495865000000000"
                     }
                 ],
                 "preInteractions": [],
@@ -267,9 +267,8 @@ async fn insufficient_balance() {
                     "buyToken": "0xDEf1CA1fb7FBcDC777520aa7f396b4E015F497aB",
                     "sellAmount": "133700000000000000",
                     "fullSellAmount": "133700000000000000",
-                    "buyAmount": "6000000000000000000000",
+                    "buyAmount": "5900000000000000000000",
                     "fullBuyAmount": "6000000000000000000000",
-                    "feePolicies": [],
                     "validTo": 0,
                     "kind": "sell",
                     "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
@@ -278,7 +277,7 @@ async fn insufficient_balance() {
                     "postInteractions": [],
                     "sellTokenSource": "erc20",
                     "buyTokenDestination": "erc20",
-                    "class": "market",
+                    "class": "limit",
                     "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
                     "signingScheme": "presign",
                     "signature": "0x",
@@ -314,8 +313,8 @@ async fn insufficient_balance() {
             "solutions": [{
                 "id": 0,
                 "prices": {
-                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "6043910341261930467761",
-                    "0xdef1ca1fb7fbcdc777520aa7f396b4e015f497ab": "133700000000000000"
+                    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": "5931084729564894506003",
+                    "0xdef1ca1fb7fbcdc777520aa7f396b4e015f497ab": "131204135000000000"
                 },
                 "trades": [
                     {
@@ -323,7 +322,8 @@ async fn insufficient_balance() {
                         "order": "0x2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a\
                                     2a2a2a2a",
-                        "executedAmount": "133700000000000000"
+                        "executedAmount": "131204135000000000",
+                        "fee": "2495865000000000"
                     }
                 ],
                 "preInteractions": [],

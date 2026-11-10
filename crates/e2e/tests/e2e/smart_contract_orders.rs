@@ -1,5 +1,6 @@
 use {
     ::alloy::primitives::{Address, U256},
+    configs::{orderbook::order_validation::OrderValidationConfig, test_util::TestDefault},
     e2e::setup::{safe::Safe, *},
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -155,7 +156,7 @@ async fn erc1271_gas_limit(web3: Web3) {
     let mut onchain = OnchainComponents::deploy(web3.clone()).await;
 
     let [solver] = onchain.make_solvers(1u64.eth()).await;
-    let trader = contracts::alloy::test::GasHog::Instance::deploy(web3.provider.clone())
+    let trader = contracts::test::GasHog::Instance::deploy(web3.provider.clone())
         .await
         .unwrap();
 
@@ -173,12 +174,15 @@ async fn erc1271_gas_limit(web3: Web3) {
         .unwrap();
 
     let services = Services::new(&onchain).await;
-    let (_config_file, config_arg) = autopilot::config::Configuration::default().to_cli_args();
     services
         .start_protocol_with_args(
-            ExtraServiceArgs {
-                api: vec!["--max-gas-per-order=1000000".to_string()],
-                autopilot: vec![config_arg],
+            configs::autopilot::Configuration::test("test_solver", solver.address()),
+            configs::orderbook::Configuration {
+                order_validation: OrderValidationConfig {
+                    max_gas_per_order: 1_000_000,
+                    ..Default::default()
+                },
+                ..configs::orderbook::Configuration::test_default()
             },
             solver,
         )

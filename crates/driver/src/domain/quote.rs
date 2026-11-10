@@ -1,10 +1,10 @@
 use {
-    super::competition::{auction, solution},
+    super::competition::{Competition, auction, solution},
     crate::{
         boundary,
         domain::{
+            self,
             competition::{self, order},
-            eth,
             liquidity,
             time,
         },
@@ -16,6 +16,7 @@ use {
         util,
     },
     chrono::Utc,
+    eth_domain_types as eth,
     std::collections::{HashMap, HashSet},
 };
 
@@ -24,9 +25,9 @@ use {
 pub struct Quote {
     pub clearing_prices: HashMap<eth::Address, eth::U256>,
     #[debug(ignore)]
-    pub pre_interactions: Vec<eth::Interaction>,
+    pub pre_interactions: Vec<domain::Interaction>,
     #[debug(ignore)]
-    pub interactions: Vec<eth::Interaction>,
+    pub interactions: Vec<domain::Interaction>,
     pub solver: eth::Address,
     pub gas: Option<eth::Gas>,
     /// Which `tx.origin` is required to make the quote simulation pass.
@@ -37,19 +38,23 @@ pub struct Quote {
 }
 
 impl Quote {
-    fn try_new(eth: &Ethereum, solution: competition::Solution) -> Result<Self, Error> {
-        let clearing_prices = Self::compute_clearing_prices(&solution)?;
+    async fn try_new(eth: &Ethereum, solution: &competition::Solution) -> Result<Self, Error> {
+        let clearing_prices = Self::compute_clearing_prices(solution)?;
+        let approvals = solution
+            .approvals(eth, solution::settlement::Internalization::Disable)
+            .await?;
+        let interactions = solution
+            .interactions()
+            .iter()
+            .map(|i| encode::interaction(i, eth.contracts().settlement().address()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             clearing_prices,
             pre_interactions: solution.pre_interactions().to_vec(),
-            interactions: solution
-                .interactions()
-                .iter()
-                .map(|i| encode::interaction(i, eth.contracts().settlement().address()))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
+            interactions: approvals
+                .map(|approval| solution::encoding::approve(&approval.0))
+                .chain(interactions)
                 .collect(),
             solver: solution.solver().submission_address(),
             gas: solution.gas(),
@@ -67,9 +72,12 @@ impl Quote {
 
     /// Compute clearing prices for the quote.
     ///
-    /// Uses uniform clearing prices from the solution, adjusted for haircut
-    /// when enabled. Uses `custom_prices()` which includes haircut effects
-    /// to make quotes conservative for users.
+    /// Uses uniform clearing prices from the solution. If the quoted order
+    /// carries fee policies (e.g. an injected solver fee, see
+    /// [`Solver::solver_fee`]), the pair's prices are replaced with the
+    /// trade's custom prices, which include the effect of those policies as
+    /// applied by the regular protocol fee machinery when the solution was
+    /// formed.
     fn compute_clearing_prices(
         solution: &competition::Solution,
     ) -> Result<HashMap<eth::Address, eth::U256>, Error> {
@@ -80,12 +88,13 @@ impl Quote {
             .map(|(token, amount)| (token.into(), amount))
             .collect();
 
-        // Quote competitions contain only a single order (see `fake_auction()`),
-        // so there's at most one fulfillment in the solution.
-        // Apply haircut adjustment to prices if there's a fulfillment with non-zero
-        // haircut.
+        // Quote competitions contain only a single order (see
+        // `fake_auction()`), so there's at most one fulfillment in the
+        // solution.
         if let Some(trade) = solution.trades().iter().find(|trade| match trade {
-            solution::Trade::Fulfillment(f) => f.haircut_fee() > eth::U256::ZERO,
+            solution::Trade::Fulfillment(fulfillment) => {
+                !fulfillment.order().protocol_fees.is_empty()
+            }
             _ => false,
         }) {
             let sell_token: eth::Address = trade.sell().token.into();
@@ -117,6 +126,26 @@ pub struct Order {
     pub amount: order::TargetAmount,
     pub side: order::Side,
     pub deadline: chrono::DateTime<chrono::Utc>,
+    pub enable_fast_path: bool,
+    pub price_quality: PriceQuality,
+    pub quote_id: Id,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Id(pub i64);
+
+/// How the orderbook ranks the quotes it collects for a request, which tells a
+/// solver whether its quote will be simulated. Mirrors the `priceQuality` of
+/// the orderbook's quote API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceQuality {
+    /// The best of the first few quotes to arrive wins; nothing is simulated.
+    Fast,
+    /// The best promised price wins; nothing is simulated.
+    Optimal,
+    /// Quotes are simulated where possible and a quote that passes simulation
+    /// is preferred over one that doesn't, even at a worse price.
+    Verified,
 }
 
 impl Order {
@@ -130,36 +159,81 @@ impl Order {
         solver: &Solver,
         liquidity: &infra::liquidity::Fetcher,
         tokens: &infra::tokens::Fetcher,
+        competition: &Competition,
     ) -> Result<Quote, Error> {
+        if self.enable_fast_path && !solver.fast_path_enabled() {
+            return Err(Error::QuotingFailed(QuotingFailed::FastPathNotSupported));
+        }
+
         let liquidity = match solver.liquidity() {
             solver::Liquidity::Fetch => {
                 liquidity
-                    .fetch(&self.token_liquidity(), infra::liquidity::AtBlock::Recent)
+                    .fetch(
+                        &self.token_liquidity(),
+                        infra::liquidity::AtBlock::Recent {
+                            schedule_update: false,
+                        },
+                    )
                     .await
             }
             solver::Liquidity::Skip => Default::default(),
         };
 
-        let auction = self
-            .fake_auction(eth, tokens, solver.quote_using_limit_orders())
-            .await?;
+        let auction = self.single_order_auction(eth, tokens).await?;
+        // Inject the solver fee like the competition does, so it is applied
+        // by the regular protocol fee machinery when the solution is formed.
+        let auction = match solver.solver_fee() {
+            Some(policy) => auction.with_solver_fee(&policy),
+            None => auction,
+        };
+        let auction = competition
+            .risk_detector
+            .filter_unsupported_orders_in_auction(auction)
+            .await;
+        if auction.orders.is_empty() {
+            return Err(QuotingFailed::UnsupportedToken.into());
+        }
         let solutions = solver.solve(&auction, &liquidity).await?;
-        Quote::try_new(
-            eth,
-            // TODO(#1468): choose the best solution in the future, but for now just pick the
-            // first solution
-            solutions
-                .into_iter()
-                .find(|solution| !solution.is_empty(auction.surplus_capturing_jit_order_owners()))
-                .ok_or(QuotingFailed::NoSolutions)?,
-        )
+        // TODO(#1468): choose the best solution in the future, but for now just
+        // pick the first solution.
+        let solution = solutions
+            .into_iter()
+            .find(|solution| !solution.is_empty(auction.surplus_capturing_jit_order_owners()))
+            .ok_or(QuotingFailed::NoSolutions)?;
+        let quote = Quote::try_new(eth, &solution).await?;
+
+        if self.enable_fast_path {
+            // For some cases (e.g. RWA trades) the true execution path can't be
+            // committed to at the time of quoting. In those cases solvers may
+            // return an execution plan. Since caching and executing
+            // those solutions later on clearly does not work the driver detects
+            // that and returns `FastPathNotSupported` instead.
+            //
+            // Technically `pre-`/`post-interactions`, `wrappers` and
+            // `flashloans` can also be considered part of the
+            // execution plan but the heart of it are the regular
+            // interactions so to avoid false positives we pin
+            // the check only to them.
+            if solution.interactions().is_empty() {
+                return Err(Error::QuotingFailed(QuotingFailed::FastPathNotSupported));
+            }
+
+            // Now that we are reasonably sure that the solution can actually be
+            // executed we cache it so it can be settled later by its quote id.
+            competition
+                .cache_quote_solution(self.quote_id, auction.clone(), solution)
+                .await;
+        }
+
+        Ok(quote)
     }
 
-    async fn fake_auction(
+    /// The single-order auction a quote is solved in. Token prices are unset
+    /// (`None`): a quote carries no native prices.
+    async fn single_order_auction(
         &self,
         eth: &Ethereum,
         tokens: &infra::tokens::Fetcher,
-        quote_using_limit_orders: bool,
     ) -> Result<competition::Auction, Error> {
         let tokens = tokens.get(&[self.buy().token, self.sell().token]).await;
 
@@ -167,35 +241,37 @@ impl Order {
         let sell_token_metadata = tokens.get(&self.sell().token);
 
         competition::Auction::new(
-            None,
+            auction::Kind::Quote {
+                id: self.quote_id,
+                fast_path: self.enable_fast_path,
+                price_quality: self.price_quality,
+            },
             vec![competition::Order {
-                uid: Default::default(),
-                receiver: None,
-                created: u32::try_from(Utc::now().timestamp())
-                    .unwrap_or(u32::MIN)
-                    .into(),
-                valid_to: util::Timestamp::MAX,
-                buy: self.buy(),
-                sell: self.sell(),
-                side: self.side,
-                kind: if quote_using_limit_orders {
-                    competition::order::Kind::Limit
-                } else {
-                    competition::order::Kind::Market
-                },
+                data: std::sync::Arc::new(competition::order::OrderData {
+                    uid: Default::default(),
+                    receiver: eth::Receiver::OWNER,
+                    created: u32::try_from(Utc::now().timestamp())
+                        .unwrap_or(u32::MIN)
+                        .into(),
+                    valid_to: util::Timestamp::MAX,
+                    buy: self.buy(),
+                    sell: self.sell(),
+                    side: self.side,
+                    pre_interactions: Default::default(),
+                    post_interactions: Default::default(),
+                    sell_token_balance: competition::order::SellTokenBalance::Erc20,
+                    buy_token_balance: competition::order::BuyTokenBalance::Erc20,
+                    signature: competition::order::Signature {
+                        scheme: competition::order::signature::Scheme::Eip1271,
+                        data: Default::default(),
+                        signer: Default::default(),
+                    },
+                    protocol_fees: Default::default(),
+                    quote: Default::default(),
+                    penalty_cap_native: Default::default(),
+                }),
                 app_data: Default::default(),
                 partial: competition::order::Partial::No,
-                pre_interactions: Default::default(),
-                post_interactions: Default::default(),
-                sell_token_balance: competition::order::SellTokenBalance::Erc20,
-                buy_token_balance: competition::order::BuyTokenBalance::Erc20,
-                signature: competition::order::Signature {
-                    scheme: competition::order::signature::Scheme::Eip1271,
-                    data: Default::default(),
-                    signer: Default::default(),
-                },
-                protocol_fees: Default::default(),
-                quote: Default::default(),
             }],
             [
                 auction::Token {
@@ -254,13 +330,14 @@ impl Order {
             // contract, so buy orders requiring excessively large sell amounts
             // would not work anyway. Instead we use `2 ** 144`, the rationale
             // being that Uniswap V2 pool reserves are 112-bit integers. Noting
-            // that `256 - 112 = 144`, this means that we can use it to trade a full
-            // `type(uint112).max` without overflowing a `uint256` on the smart
-            // contract level. Requiring to trade more than `type(uint112).max`
-            // is unlikely and would not work with Uniswap V2 anyway.
+            // that `256 - 112 = 144`, this means that we can use it to trade a
+            // full `type(uint112).max` without overflowing a `uint256` on the
+            // smart contract level. Requiring to trade more than
+            // `type(uint112).max` is unlikely and would not work with Uniswap
+            // V2 anyway.
             order::Side::Buy => eth::Asset {
-                // NOTE: the saturating strategy here is slightly irrelevant since we know that 1 <<
-                // 144 fits within U256
+                // NOTE: the saturating strategy here is slightly irrelevant
+                // since we know that 1 << 144 fits within U256
                 amount: (eth::U256::ONE.saturating_shl(144)).into(),
                 token: self.tokens.sell,
             },
@@ -298,13 +375,7 @@ impl Tokens {
 
 mod encode {
     use {
-        crate::domain::{
-            competition::solution,
-            eth::{
-                self,
-                allowance::{Approval, Required},
-            },
-        },
+        crate::domain::{self, competition::solution},
         alloy::primitives::Address,
         num::rational::Ratio,
     };
@@ -314,7 +385,7 @@ mod encode {
     pub(super) fn interaction(
         interaction: &solution::Interaction,
         settlement: &Address,
-    ) -> Result<Vec<eth::Interaction>, solution::encoding::Error> {
+    ) -> Result<domain::Interaction, solution::encoding::Error> {
         let slippage = solution::slippage::Parameters {
             relative: Ratio::new_raw(DEFAULT_QUOTE_SLIPPAGE_BPS.into(), 10_000.into()),
             max: None,
@@ -322,38 +393,16 @@ mod encode {
             prices: Default::default(),
         };
 
-        let encoded = match interaction {
-            solution::Interaction::Custom(interaction) => eth::Interaction {
+        Ok(match interaction {
+            solution::Interaction::Custom(interaction) => domain::Interaction {
                 value: interaction.value,
-                target: interaction.target.0,
+                target: *interaction.target,
                 call_data: interaction.call_data.clone(),
             },
             solution::Interaction::Liquidity(liquidity) => {
                 solution::encoding::liquidity_interaction(liquidity, &slippage, settlement)?
             }
-        };
-
-        Ok(interaction
-            .allowances()
-            .iter()
-            .flat_map(|Required(allowance)| {
-                let approval = Approval(*allowance);
-                // When encoding approvals for quotes, reset the allowance instead
-                // of just setting it. This is required as some tokens only allow
-                // you to approve a non-0 value if the allowance was 0 to begin
-                // with, such as Tether USD.
-                //
-                // Alternatively, we could check existing allowances and only encode
-                // the approvals if needed, but this would only result in small gas
-                // optimizations which is mostly inconsequential for quotes and not
-                // worth the performance hit.
-                vec![
-                    solution::encoding::approve(&approval.revoke().0),
-                    solution::encoding::approve(&approval.max().0),
-                ]
-            })
-            .chain(std::iter::once(encoded))
-            .collect())
+        })
     }
 }
 
@@ -386,6 +435,10 @@ pub enum QuotingFailed {
     NoSolutions,
     #[error("math error computing custom prices")]
     Math,
+    #[error("token is unsupported by this solver")]
+    UnsupportedToken,
+    #[error("solver does not support fast path quotes")]
+    FastPathNotSupported,
 }
 
 #[derive(Debug, thiserror::Error)]

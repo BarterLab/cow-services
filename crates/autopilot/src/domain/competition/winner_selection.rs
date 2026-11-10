@@ -29,10 +29,10 @@ use {
         self,
         auction::order,
         competition::{Bid, RankType, Ranked, Score, Solution, TradedOrder, Unscored},
-        eth::{self, WrappedNativeToken},
         fee,
     },
     ::winner_selection::state::{HasState, RankedItem, ScoredItem, UnscoredItem},
+    eth_domain_types::{self as eth, Address, WrappedNativeToken},
     std::collections::HashMap,
     tracing::instrument,
     winner_selection::{self as winsel},
@@ -49,10 +49,10 @@ pub struct Arbitrator(winsel::Arbitrator);
 /// changing the ordering or the `bids`.
 impl Arbitrator {
     pub fn new(max_winners: usize, wrapped_native_token: WrappedNativeToken) -> Self {
-        let token: eth::TokenAddress = wrapped_native_token.into();
+        let token: eth::TokenAddress = *wrapped_native_token;
         Self(winsel::Arbitrator {
             max_winners,
-            weth: token.0,
+            wrapped_native: *token,
         })
     }
 
@@ -75,7 +75,7 @@ impl Arbitrator {
         // Compute reference scores while we still have ws_ranking
         let reference_scores: HashMap<eth::Address, Score> = self
             .0
-            .compute_reference_scores(&ws_ranking)
+            .compute_reference_scores(&ws_ranking, &context)
             .into_iter()
             .map(|(solver, score)| (solver, Score(eth::Ether(score))))
             .collect();
@@ -125,8 +125,7 @@ impl From<&domain::Auction> for winsel::AuctionContext {
                     let policies = order
                         .protocol_fees
                         .iter()
-                        .copied()
-                        .map(winsel::primitives::FeePolicy::from)
+                        .map(|fee| winsel::primitives::FeePolicy::from(fee.policy))
                         .collect();
                     (uid, policies)
                 })
@@ -139,7 +138,7 @@ impl From<&domain::Auction> for winsel::AuctionContext {
             native_prices: auction
                 .prices
                 .iter()
-                .map(|(token, price)| (token.0, price.get().0))
+                .map(|(token, price)| (Address::from(*token), price.get().0))
                 .collect(),
         }
     }
@@ -155,11 +154,6 @@ impl From<&Solution> for winsel::Solution<winsel::Unscored> {
                 .iter()
                 .map(|(uid, order)| to_winsel_order(*uid, order))
                 .collect(),
-            solution
-                .prices()
-                .iter()
-                .map(|(token, price)| (token.0, price.get().0))
-                .collect(),
         )
     }
 }
@@ -167,8 +161,8 @@ impl From<&Solution> for winsel::Solution<winsel::Unscored> {
 fn to_winsel_order(uid: domain::OrderUid, order: &TradedOrder) -> winsel::Order {
     winsel::Order {
         uid: winsel::OrderUid(uid.0),
-        sell_token: order.sell.token.0,
-        buy_token: order.buy.token.0,
+        sell_token: *order.sell.token,
+        buy_token: *order.buy.token,
         sell_amount: order.sell.amount.0,
         buy_amount: order.buy.amount.0,
         executed_sell: order.executed_sell.0,
@@ -283,7 +277,6 @@ impl Ranking {
 mod tests {
     use {
         crate::{
-            config::solver::Account,
             domain::{
                 Auction,
                 Order,
@@ -293,11 +286,12 @@ mod tests {
                     order::{self, AppDataHash},
                 },
                 competition::{Bid, Solution, TradedOrder, Unscored},
-                eth::{self, TokenAddress},
             },
-            infra::Driver,
+            infra::{Driver, SupportedExtensions},
         },
         alloy::primitives::{Address, U160, U256, address},
+        configs::autopilot::solver::Account,
+        eth_domain_types::{self as eth, TokenAddress},
         hex_literal::hex,
         number::serialization::HexOrDecimalU256,
         serde::Deserialize,
@@ -437,8 +431,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // Two compatible batches are both selected as winners, but this time the orders
-    // are "buy" orders
+    // Two compatible batches are both selected as winners, but this time the
+    // orders are "buy" orders
     async fn buy_orders() {
         let case = json!({
             "tokens": [
@@ -580,7 +574,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // Incompatible bid does not win but increases the reference score of the winner
+    // Incompatible bid does not win but increases the reference score of the
+    // winner
     async fn incompatible_bids() {
         let case = json!({
             "tokens": [
@@ -860,8 +855,8 @@ mod tests {
     #[tokio::test]
     async fn staging_mainnet_auction_12825008() {
         // https://solver-instances.s3.eu-central-1.amazonaws.com/staging/mainnet/autopilot/12825008.json
-        // The example is an auction with one order and two competing bids for it, one
-        // having a better score than the other
+        // The example is an auction with one order and two competing bids for
+        // it, one having a better score than the other
 
         let case = json!({
             "tokens": [
@@ -918,6 +913,54 @@ mod tests {
         TestCase::from_json(case).validate().await;
     }
 
+    /// A solution settling no orders gets a score of 0 which disqualifies it
+    /// from the competition.
+    #[tokio::test]
+    async fn discards_solutions_with_zero_score() {
+        let case = json!({
+            "tokens": [
+                ["Token A", address(0)],
+                ["Token B", address(1)],
+            ],
+            "auction": {
+                "orders": {
+                    "Order 1": {
+                        "side": "sell",
+                        "sell_token": "Token A",
+                        "sell_amount": "32375066190000000000000000",
+                        "buy_token": "Token B",
+                        "buy_amount": "2161512119"
+                    }
+                },
+                "prices": {
+                    "Token A": "32429355240",
+                    "Token B": "480793239987749750742974464"
+                }
+            },
+            "solutions": {
+                "Solution 1": {
+                    "solver": "Solver 1",
+                    "trades": {},
+                },
+                "Solution 2": {
+                    "solver": "Solver 2",
+                    "trades": {
+                        "Order 1": {
+                            "sell_amount": "32375066190000000000000000",
+                            "buy_amount": "2205267875"
+                        }
+                    }
+                }
+            },
+            "expected_fair_solutions": ["Solution 2"],
+            "expected_winners": ["Solution 2"],
+            "expected_reference_scores": {
+                "Solver 2": "0",
+            },
+        });
+        TestCase::from_json(case).validate().await;
+    }
+
     #[serde_as]
     #[derive(Deserialize, Debug)]
     struct TestCase {
@@ -938,7 +981,8 @@ mod tests {
         pub async fn validate(&self) {
             let arbitrator = create_test_arbitrator();
 
-            // map (token id -> token address) for later reference during the test
+            // map (token id -> token address) for later reference during the
+            // test
             let token_map: HashMap<String, TokenAddress> = self
                 .tokens
                 .iter()
@@ -992,7 +1036,8 @@ mod tests {
 
             let auction = create_auction(orders, prices);
 
-            // map (solver id -> solver address) for later reference during the test
+            // map (solver id -> solver address) for later reference during the
+            // test
             let mut solver_map = HashMap::new();
 
             // map (solution id -> bid) for later reference during the test
@@ -1018,7 +1063,7 @@ mod tests {
                 let solution_uid = hash(solution_id);
                 solution_map.insert(
                     solution_id,
-                    create_bid(solution_uid, solver_address, trades, None).await,
+                    create_bid(solution_uid, solver_address, trades).await,
                 );
             }
 
@@ -1128,7 +1173,7 @@ mod tests {
             },
             protocol_fees: vec![],
             side,
-            receiver: None,
+            receiver: Default::default(),
             owner: Default::default(),
             partially_fillable: false,
             executed: eth::U256::ZERO.into(),
@@ -1143,6 +1188,7 @@ mod tests {
             valid_to: Default::default(),
             signature: order::Signature::PreSign,
             quote: None,
+            penalty_cap_native: None,
         }
     }
 
@@ -1200,27 +1246,20 @@ mod tests {
         solution_id: u64,
         solver_address: Address,
         trades: Vec<(OrderUid, TradedOrder)>,
-        prices: Option<HashMap<TokenAddress, Price>>,
     ) -> Bid<Unscored> {
-        // The prices of the tokens do not affect the result but they keys must exist
-        // for every token of every trade
-        let prices = prices.unwrap_or({
-            let mut res = HashMap::new();
-            for (_, trade) in &trades {
-                res.insert(trade.buy.token, create_price(eth::U256::ONE));
-                res.insert(trade.sell.token, create_price(eth::U256::ONE));
-            }
-            res
-        });
-
         let trade_order_map: HashMap<OrderUid, TradedOrder> = trades.into_iter().collect();
 
-        let solution = Solution::new(solution_id, solver_address, trade_order_map, prices);
+        let solution = Solution::new(solution_id, solver_address, trade_order_map);
 
         let driver = Driver::try_new(
             url::Url::parse("http://localhost").unwrap(),
             solver_address.to_string(),
             Account::Address(solver_address),
+            SupportedExtensions {
+                auction_deltas: false,
+                compression: false,
+            },
+            true,
         )
         .await
         .unwrap();

@@ -1,18 +1,19 @@
 //! Test cases.
 
 use {
-    crate::domain::eth,
     bigdecimal::{BigDecimal, FromPrimitive, Signed, num_traits::CheckedMul},
+    eth_domain_types as eth,
     num::BigRational,
     number::{conversions::big_decimal_to_big_rational, u256_ext::U256Ext},
     std::str::FromStr,
 };
 
 pub mod buy_eth;
+pub mod deadline_check;
 pub mod example_config;
 pub mod fees;
 mod flashloan_hints;
-pub mod haircut;
+pub mod gas_fee_override;
 pub mod internalization;
 pub mod jit_orders;
 pub mod merge_settlements;
@@ -23,7 +24,10 @@ pub mod parallel_auctions;
 pub mod protocol_fees;
 pub mod quote;
 pub mod settle;
+mod settlement_sender;
 pub mod solver_balance;
+pub mod solver_fee;
+pub mod solver_fee_pre_processing;
 
 /// The default surplus factor. Set to a high value to ensure a positive score
 /// by default. Use a surplus factor of 1 if you want to test negative scores.

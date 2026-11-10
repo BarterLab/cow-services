@@ -1,19 +1,21 @@
 use {
     crate::{
-        domain::{competition::risk_detector, eth},
+        domain::competition::risk_detector,
         infra::{
             self,
             blockchain,
             config::file,
             liquidity,
-            mempool,
             notify,
-            simulator,
             solver::{self, Account, BadOrderDetection, SolutionMerging},
         },
     },
-    alloy::{network::TxSigner, signers::{aws::AwsSigner, local::PrivateKeySigner}},
+    alloy::{
+        network::TxSigner,
+        signers::{aws::AwsSigner, local::PrivateKeySigner},
+    },
     chain::Chain,
+    eth_domain_types as eth,
     futures::future::join_all,
     number::conversions::big_decimal_to_big_rational,
     std::path::Path,
@@ -50,27 +52,28 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
         chain,
         "The configured chain ID does not match the connected Ethereum node"
     );
+
+    config
+        .balance_cache
+        .validate()
+        .unwrap_or_else(|err| panic!("invalid balance cache config: {err:?}"));
+
+    // Shared by every solver, so it is borrowed instead of moved into the
+    // per-solver futures.
+    let token_groups = &config.token_groups;
+
     infra::Config {
         solvers: join_all(config.solvers.into_iter().map(|solver_config| async move {
-            let account: Account = match solver_config.account {
-                file::Account::PrivateKey(private_key) => {
-                    PrivateKeySigner::from_bytes(&private_key)
-                        .expect(
-                            "private key should
-                                            be valid",
-                        )
-                        .into()
-                }
-                file::Account::Kms(arn) => {
-                    let sdk_config = alloy::signers::aws::aws_config::load_from_env().await;
-                    let client = alloy::signers::aws::aws_sdk_kms::Client::new(&sdk_config);
-                    AwsSigner::new(client, arn.0, config.chain_id)
-                        .await
-                        .expect("unable to load kms account {arn:?}")
-                        .into()
-                }
-                file::Account::Address(address) => Account::Address(address),
-            };
+            let tokens_supported = solver_config
+                .bad_order_detection
+                .canonicalize_token_support(token_groups)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "invalid token support for solver {}: {err:?}",
+                        solver_config.name
+                    )
+                });
+            let account = load_account(solver_config.account, config.chain_id).await;
             solver::Config {
                 endpoint: solver_config.endpoint,
                 name: solver_config.name.into(),
@@ -83,7 +86,7 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                 } else {
                     solver::Liquidity::Fetch
                 },
-                submission_address: account.address().clone(),
+                submission_address: account.address(),
                 accounts: vec![account],
                 timeouts: solver::Timeouts {
                     http_delay: chrono::Duration::from_std(solver_config.timeouts.http_time_buffer)
@@ -95,8 +98,7 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                         .unwrap(),
                 },
                 request_headers: solver_config.request_headers,
-                fee_handler: solver_config.fee_handler,
-                quote_using_limit_orders: solver_config.quote_using_limit_orders,
+                fast_path_enabled: solver_config.fast_path_enabled,
                 merge_solutions: match solver_config.merge_solutions {
                     true => SolutionMerging::Allowed {
                         max_orders_per_merged_solution: solver_config
@@ -106,16 +108,15 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                 },
                 s3: solver_config.s3.map(Into::into),
                 solver_native_token: solver_config.manage_native_token.to_domain(),
+                fee_handler: solver_config.fee_handler,
                 quote_tx_origin: solver_config.quote_tx_origin,
                 response_size_limit_max_bytes: solver_config.response_size_limit_max_bytes,
                 bad_order_detection: BadOrderDetection {
-                    tokens_supported: solver_config
-                        .bad_order_detection
-                        .token_supported
-                        .iter()
+                    tokens_supported: tokens_supported
+                        .into_iter()
                         .map(|(token, supported)| {
                             (
-                                eth::TokenAddress(eth::ContractAddress(*token)),
+                                eth::TokenAddress::from(token),
                                 match supported {
                                     true => risk_detector::Quality::Supported,
                                     false => risk_detector::Quality::Unsupported,
@@ -123,9 +124,6 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                             )
                         })
                         .collect(),
-                    enable_simulation_strategy: solver_config
-                        .bad_order_detection
-                        .enable_simulation_strategy,
                     enable_metrics_strategy: solver_config
                         .bad_order_detection
                         .enable_metrics_strategy,
@@ -150,11 +148,17 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                 },
                 settle_queue_size: solver_config.settle_queue_size,
                 flashloans_enabled: config.flashloans_enabled,
-                fetch_liquidity_at_block: match config.liquidity.fetch_at_block {
-                    file::AtBlock::Latest => liquidity::AtBlock::Latest,
-                    file::AtBlock::Finalized => liquidity::AtBlock::Finalized,
-                },
-                haircut_bps: solver_config.haircut_bps,
+                solver_fee_bps: solver_config.solver_fee_bps,
+                submission_accounts: join_all(
+                    solver_config
+                        .submission_accounts
+                        .into_inner()
+                        .into_iter()
+                        .map(|acc| load_account(acc, config.chain_id)),
+                )
+                .await,
+                max_solutions_to_propose: solver_config.max_solutions_to_propose,
+                post_processing_concurrency_limit: solver_config.post_processing_concurrency_limit,
             }
         }))
         .await,
@@ -234,35 +238,33 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                     file::UniswapV3Config::Preset {
                         preset,
                         max_pools_to_initialize,
-                        graph_url,
+                        indexer_url,
                         reinit_interval,
-                        max_pools_per_tick_query,
-                    } => liquidity::config::UniswapV3 {
-                        max_pools_to_initialize,
-                        reinit_interval,
-                        ..match preset {
+                    } => {
+                        let pool_indexer =
+                            liquidity::config::UniswapV3PoolIndexer { url: indexer_url };
+                        let preset_defaults = match preset {
                             file::UniswapV3Preset::UniswapV3 => {
-                                liquidity::config::UniswapV3::uniswap_v3(
-                                    &graph_url,
-                                    chain,
-                                    max_pools_per_tick_query,
-                                )
+                                liquidity::config::UniswapV3::uniswap_v3(pool_indexer, chain)
                             }
                         }
-                        .expect("no Uniswap V3 preset for current network")
-                    },
+                        .expect("no Uniswap V3 preset for current network");
+                        liquidity::config::UniswapV3 {
+                            max_pools_to_initialize,
+                            reinit_interval,
+                            ..preset_defaults
+                        }
+                    }
                     file::UniswapV3Config::Manual {
                         router,
                         max_pools_to_initialize,
-                        graph_url,
+                        indexer_url,
                         reinit_interval,
-                        max_pools_per_tick_query,
                     } => liquidity::config::UniswapV3 {
                         router: router.into(),
                         max_pools_to_initialize,
-                        graph_url,
+                        pool_indexer: liquidity::config::UniswapV3PoolIndexer { url: indexer_url },
                         reinit_interval,
-                        max_pools_per_tick_query,
                     },
                 })
                 .collect(),
@@ -318,6 +320,15 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                     api_key: config.api_key,
                     http_timeout: config.http_timeout,
                 }),
+            fetch_at_block: match config.liquidity.fetch_at_block {
+                file::AtBlock::Latest => liquidity::AtBlock::Latest,
+                file::AtBlock::Recent => liquidity::AtBlock::Recent {
+                    schedule_update: true,
+                },
+            },
+            refresh_cooldown: config.liquidity.refresh_cooldown,
+            max_recent_block_age: config.liquidity.max_recent_block_age,
+            max_auto_updated_pairs: config.liquidity.max_auto_updated_pairs,
         },
         liquidity_sources_notifier: config.liquidity_sources_notifier.map(|notifier| {
             notify::liquidity_sources::config::Config {
@@ -330,68 +341,47 @@ pub async fn load(chain: Chain, path: &Path) -> infra::Config {
                 }),
             }
         }),
-        mempools: config
-            .submission
-            .mempools
-            .iter()
-            .enumerate()
-            .map(|(index, mempool)| mempool::Config {
-                min_priority_fee: config.submission.min_priority_fee,
-                gas_price_cap: config.submission.gas_price_cap,
-                target_confirm_time: config.submission.target_confirm_time,
-                retry_interval: config.submission.retry_interval,
-                nonce_block_number: config.submission.nonce_block_number.map(Into::into),
-                name: mempool
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("mempool_{index}")),
-                url: mempool.url.clone(),
-                revert_protection: match mempool.mines_reverting_txs {
-                    true => mempool::RevertProtection::Disabled,
-                    false => mempool::RevertProtection::Enabled,
-                },
-                max_additional_tip: mempool.max_additional_tip,
-                additional_tip_percentage: mempool.additional_tip_percentage,
-            })
-            .collect(),
-        simulator: match (config.tenderly, config.enso) {
-            (Some(config), None) => {
-                Some(simulator::Config::Tenderly(simulator::tenderly::Config {
-                    url: config.url,
-                    api_key: config.api_key,
-                    user: config.user,
-                    project: config.project,
-                    save: config.save,
-                    save_if_fails: config.save_if_fails,
-                }))
-            }
-            (None, Some(config)) => Some(simulator::Config::Enso(simulator::enso::Config {
-                url: config.url,
-                network_block_interval: config.network_block_interval,
-            })),
-            (None, None) => None,
-            (Some(_), Some(_)) => panic!("Cannot configure both Tenderly and Enso"),
+        gas_price_parameters: blockchain::gas::GasPriceParameters {
+            max_additional_tip: config.submission.max_additional_tip,
+            additional_tip_factor: config.submission.additional_tip_percentage,
+            max_fee_per_gas: config.submission.gas_price_cap,
+            min_priority_fee: config.submission.min_priority_fee,
         },
+        receiver: config.submission.to_domain(),
+        simulator: config.simulator,
         contracts: blockchain::contracts::Addresses {
             orig_settlement: config.contracts.gp_v2_settlement.map(Into::into),
             settlement: config.contracts.gp_v2_settlement.map(Into::into),
             weth: config.contracts.weth.map(Into::into),
             balances: config.contracts.balances.map(Into::into),
             signatures: config.contracts.signatures.map(Into::into),
-            cow_amm_helper_by_factory: config
-                .contracts
-                .cow_amms
-                .into_iter()
-                .map(|cfg| (cfg.factory.into(), cfg.helper.into()))
-                .collect(),
             flashloan_router: config.contracts.flashloan_router.map(Into::into),
+            deadline_check: config.contracts.deadline_check.map(Into::into),
         },
         disable_access_list_simulation: config.disable_access_list_simulation,
         disable_gas_simulation: config.disable_gas_simulation.map(Into::into),
         gas_estimator: config.gas_estimator,
         order_priority_strategies: config.order_priority_strategies,
-        simulation_bad_token_max_age: config.simulation_bad_token_max_age,
         app_data_fetching: config.app_data_fetching,
         tx_gas_limit: config.tx_gas_limit,
+        http: config.http,
+        balance_cache: config.balance_cache,
+    }
+}
+
+async fn load_account(account: file::Account, chain_id: Option<u64>) -> Account {
+    match account {
+        file::Account::PrivateKey(pk) => PrivateKeySigner::from_bytes(&pk)
+            .expect("invalid private key")
+            .into(),
+        file::Account::Kms(arn) => {
+            let sdk_config = alloy::signers::aws::aws_config::load_from_env().await;
+            let client = alloy::signers::aws::aws_sdk_kms::Client::new(&sdk_config);
+            AwsSigner::new(client, arn.0, chain_id)
+                .await
+                .expect("unable to load kms account")
+                .into()
+        }
+        file::Account::Address(address) => Account::Address(address),
     }
 }

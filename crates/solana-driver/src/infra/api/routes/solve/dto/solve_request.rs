@@ -1,0 +1,506 @@
+//! Inbound `/solve` request: the auction the autopilot posts to the driver.
+//!
+//! This is the driver's own mirror of `autopilot-svm`'s
+//! `infra/driver/dto.rs::SolveRequest`. The pinned-literal test below (which
+//! uses the same literals as the autopilot's own test) keeps the wire format
+//! in sync.
+
+use {
+    crate::{
+        domain::{self, order_uid::OrderUid, protocol_fee},
+        infra::api::routes::Kind,
+    },
+    serde::{Deserialize, Serialize},
+    serde_with::{DisplayFromStr, base64::Base64, serde_as},
+    solana_sdk::pubkey::Pubkey,
+    std::{collections::HashMap, fmt, str::FromStr},
+};
+
+/// Application-specific data attached to a Solana order: 32 opaque bytes.
+/// Serialized as `0x`-prefixed hex on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AppData(pub [u8; 32]);
+
+impl fmt::Display for AppData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buffer = const_hex::Buffer::<32, true>::new();
+        f.write_str(buffer.format(&self.0))
+    }
+}
+
+impl FromStr for AppData {
+    type Err = const_hex::FromHexError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0u8; 32];
+        const_hex::decode_to_slice(s.strip_prefix("0x").unwrap_or(s), &mut bytes)?;
+        Ok(Self(bytes))
+    }
+}
+
+/// The auction posted to `/solve`.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SolveRequest {
+    /// Autopilot-assigned auction id.
+    id: i64,
+    /// Timestamp deadline for answering `/solve`.
+    deadline: chrono::DateTime<chrono::Utc>,
+    orders: Vec<Order>,
+    /// Reference data per auction token, keyed by mint. Tokens without a
+    /// price are absent.
+    #[serde(default)]
+    #[serde_as(as = "HashMap<DisplayFromStr, _>")]
+    tokens: HashMap<Pubkey, Token>,
+}
+
+/// What the autopilot knows about an auction token.
+#[serde_as]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Token {
+    /// Lamports per 10^9 atoms of the token.
+    #[serde_as(as = "DisplayFromStr")]
+    price: u64,
+}
+
+/// One solvable order in the auction.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Order {
+    #[serde_as(as = "DisplayFromStr")]
+    uid: OrderUid,
+    #[serde_as(as = "DisplayFromStr")]
+    owner: Pubkey,
+    /// The wallet `buy_token_account` is the associated token account of,
+    /// when that is not the owner. Absent from an autopilot that predates
+    /// custom receivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    receiver: Option<Pubkey>,
+    #[serde_as(as = "DisplayFromStr")]
+    sell_token: Pubkey,
+    #[serde_as(as = "DisplayFromStr")]
+    buy_token: Pubkey,
+    #[serde_as(as = "DisplayFromStr")]
+    sell_token_account: Pubkey,
+    #[serde_as(as = "DisplayFromStr")]
+    buy_token_account: Pubkey,
+    #[serde_as(as = "DisplayFromStr")]
+    sell_amount: u64,
+    #[serde_as(as = "DisplayFromStr")]
+    buy_amount: u64,
+    /// Unix seconds.
+    valid_to: u32,
+    kind: Kind,
+    partially_fillable: bool,
+    #[serde_as(as = "DisplayFromStr")]
+    order_pda: Pubkey,
+    #[serde_as(as = "DisplayFromStr")]
+    app_data: AppData,
+    /// The cumulative fill on the order's own side. Absent from an autopilot
+    /// that predates partial fills.
+    #[serde(default)]
+    #[serde_as(as = "DisplayFromStr")]
+    executed: u64,
+    /// The owner-signed creation transaction of an order not created on
+    /// chain yet, serialized and base64-encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde_as(as = "Option<Base64>")]
+    creation: Option<Vec<u8>>,
+    /// What the sell token account can fund. Absent for a pending sponsored
+    /// order and from an autopilot that predates balance scaling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    sell_balance: Option<u64>,
+    /// The protocol fee policies the driver takes from the order's fills,
+    /// in order. Missing means none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    protocol_fees: Vec<FeePolicy>,
+}
+
+/// A protocol fee policy, in the EVM driver's wire shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FeePolicy {
+    #[serde(rename_all = "camelCase")]
+    Surplus { factor: f64, max_volume_factor: f64 },
+    #[serde(rename_all = "camelCase")]
+    PriceImprovement {
+        factor: f64,
+        max_volume_factor: f64,
+        quote: Quote,
+    },
+    #[serde(rename_all = "camelCase")]
+    Volume { factor: f64 },
+}
+
+/// The best quote the order got, which a price improvement policy measures
+/// the fill against.
+#[serde_as]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Quote {
+    #[serde_as(as = "DisplayFromStr")]
+    sell_amount: u64,
+    #[serde_as(as = "DisplayFromStr")]
+    buy_amount: u64,
+    #[serde_as(as = "DisplayFromStr")]
+    fee: u64,
+    #[serde_as(as = "DisplayFromStr")]
+    solver: Pubkey,
+}
+
+impl FeePolicy {
+    /// The domain policy, refused when a factor lies outside `[0, 1)`: a
+    /// fee at or past the whole fill, or a negative one, is no fee.
+    fn into_domain(self) -> Result<protocol_fee::FeePolicy, Error> {
+        let factor = |factor: f64| {
+            (0.0..1.0)
+                .contains(&factor)
+                .then_some(factor)
+                .ok_or(Error::InvalidFeePolicy)
+        };
+        Ok(match self {
+            Self::Surplus {
+                factor: surplus,
+                max_volume_factor,
+            } => protocol_fee::FeePolicy::Surplus {
+                factor: factor(surplus)?,
+                max_volume_factor: factor(max_volume_factor)?,
+            },
+            Self::PriceImprovement {
+                factor: improvement,
+                max_volume_factor,
+                quote,
+            } => protocol_fee::FeePolicy::PriceImprovement {
+                factor: factor(improvement)?,
+                max_volume_factor: factor(max_volume_factor)?,
+                quote: protocol_fees::Quote {
+                    sell_amount: quote.sell_amount,
+                    buy_amount: quote.buy_amount,
+                    fee: quote.fee,
+                    solver: chain_types::solana::Pubkey(quote.solver.to_bytes()),
+                },
+            },
+            Self::Volume { factor: volume } => protocol_fee::FeePolicy::Volume {
+                factor: factor(volume)?,
+            },
+        })
+    }
+}
+
+impl From<Order> for domain::Order {
+    fn from(order: Order) -> Self {
+        Self {
+            uid: order.uid,
+            owner: order.owner,
+            receiver: order.receiver,
+            sell_token: order.sell_token,
+            buy_token: order.buy_token,
+            sell_token_account: order.sell_token_account,
+            buy_token_account: order.buy_token_account,
+            sell_amount: order.sell_amount,
+            buy_amount: order.buy_amount,
+            valid_to: order.valid_to,
+            side: order.kind.into(),
+            partially_fillable: order.partially_fillable,
+            order_pda: order.order_pda,
+            app_data: order.app_data.0,
+            executed: order.executed,
+            sell_balance: order.sell_balance,
+        }
+    }
+}
+
+/// A `/solve` request that could not become a domain auction.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("invalid auction id")]
+    InvalidAuctionId,
+    #[error("a creation transaction does not decode")]
+    InvalidCreation,
+    #[error("a fee policy factor is outside [0, 1)")]
+    InvalidFeePolicy,
+}
+
+impl From<domain::auction::InvalidAuctionId> for Error {
+    fn from(_: domain::auction::InvalidAuctionId) -> Self {
+        Self::InvalidAuctionId
+    }
+}
+
+impl SolveRequest {
+    /// Convert the wire request into a domain auction.
+    pub fn into_domain(self) -> Result<domain::Auction, Error> {
+        let id = domain::auction::Id::try_from(self.id)?;
+        let mut creations = HashMap::new();
+        let mut fee_policies = HashMap::new();
+        for order in &self.orders {
+            if let Some(bytes) = &order.creation {
+                let creation = bincode::deserialize(bytes).map_err(|_| Error::InvalidCreation)?;
+                creations.insert(order.uid, creation);
+            }
+            if !order.protocol_fees.is_empty() {
+                let policies = order
+                    .protocol_fees
+                    .iter()
+                    .cloned()
+                    .map(FeePolicy::into_domain)
+                    .collect::<Result<_, _>>()?;
+                fee_policies.insert(order.uid, policies);
+            }
+        }
+        Ok(domain::Auction {
+            id: Some(id),
+            orders: self.orders.into_iter().map(Into::into).collect(),
+            // Placeholder; the domain does not consume it yet.
+            deadline_slot: domain::Slot(0),
+            deadline: self.deadline,
+            creations,
+            native_prices: self
+                .tokens
+                .into_iter()
+                .map(|(mint, token)| (mint, token.price))
+                .collect(),
+            fee_policies,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pubkey(byte: u8) -> Pubkey {
+        Pubkey::new_from_array([byte; 32])
+    }
+
+    fn order() -> Order {
+        Order {
+            uid: OrderUid([0x11; 32]),
+            owner: Pubkey::new_from_array([0x22; 32]),
+            receiver: None,
+            sell_token: Pubkey::new_from_array([0x33; 32]),
+            buy_token: Pubkey::new_from_array([0x44; 32]),
+            sell_token_account: Pubkey::new_from_array([0x55; 32]),
+            buy_token_account: Pubkey::new_from_array([0x66; 32]),
+            sell_amount: u64::MAX,
+            buy_amount: 2_000,
+            valid_to: 42,
+            kind: Kind::Sell,
+            partially_fillable: false,
+            order_pda: Pubkey::new_from_array([0x77; 32]),
+            app_data: AppData([0; 32]),
+            executed: 0,
+            creation: Some(vec![1, 2, 3]),
+            sell_balance: Some(500),
+            protocol_fees: Vec::new(),
+        }
+    }
+
+    fn request_with_policies(policies: serde_json::Value) -> SolveRequest {
+        let mut request = serde_json::to_value(SolveRequest {
+            id: 7,
+            deadline: "2026-01-01T00:00:00Z".parse().unwrap(),
+            orders: vec![Order {
+                creation: None,
+                ..order()
+            }],
+            tokens: HashMap::new(),
+        })
+        .unwrap();
+        request["orders"][0]["protocolFees"] = policies;
+        serde_json::from_value(request).unwrap()
+    }
+
+    /// The EVM driver's `FeePolicy` wire shape, amounts as strings and the
+    /// solver as base58.
+    #[test]
+    fn protocol_fees_pin_the_evm_wire_shape() {
+        let request = request_with_policies(serde_json::json!([
+            {"surplus": {"factor": 0.5, "maxVolumeFactor": 0.01}},
+            {"priceImprovement": {
+                "factor": 0.5,
+                "maxVolumeFactor": 0.01,
+                "quote": {
+                    "sellAmount": "1000",
+                    "buyAmount": "2000",
+                    "fee": "0",
+                    "solver": pubkey(0x99).to_string(),
+                },
+            }},
+            {"volume": {"factor": 0.001}},
+        ]));
+        let auction = request.into_domain().unwrap();
+        assert_eq!(
+            auction.fee_policies[&OrderUid([0x11; 32])],
+            vec![
+                protocol_fee::FeePolicy::Surplus {
+                    factor: 0.5,
+                    max_volume_factor: 0.01,
+                },
+                protocol_fee::FeePolicy::PriceImprovement {
+                    factor: 0.5,
+                    max_volume_factor: 0.01,
+                    quote: protocol_fees::Quote {
+                        sell_amount: 1_000,
+                        buy_amount: 2_000,
+                        fee: 0,
+                        solver: chain_types::solana::Pubkey([0x99; 32]),
+                    },
+                },
+                protocol_fee::FeePolicy::Volume { factor: 0.001 },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_order_without_policies_is_absent_from_the_map() {
+        let request = request_with_policies(serde_json::json!([]));
+        assert!(request.into_domain().unwrap().fee_policies.is_empty());
+    }
+
+    #[test]
+    fn into_domain_rejects_a_factor_outside_the_unit_interval() {
+        for policies in [
+            serde_json::json!([{"volume": {"factor": 1.0}}]),
+            serde_json::json!([{"volume": {"factor": -0.1}}]),
+            serde_json::json!([{"surplus": {"factor": 0.5, "maxVolumeFactor": 1.0}}]),
+        ] {
+            let err = request_with_policies(policies.clone())
+                .into_domain()
+                .expect_err("a factor outside [0, 1) must be rejected");
+            assert!(matches!(err, Error::InvalidFeePolicy), "{policies}");
+        }
+    }
+
+    /// Pins the wire format against the same literals as
+    /// `autopilot-svm/src/infra/driver/dto.rs::tests`, so drift between the two
+    /// crates breaks a test.
+    #[test]
+    fn solve_request_pins_the_wire_format() {
+        let request = SolveRequest {
+            id: 7,
+            deadline: "2026-01-01T00:00:00Z".parse().unwrap(),
+            orders: vec![order()],
+            tokens: HashMap::from([(
+                pubkey(0x33),
+                Token {
+                    price: 1_500_000_000,
+                },
+            )]),
+        };
+        let mut expected = serde_json::json!({
+            "id": 7,
+            "deadline": "2026-01-01T00:00:00Z",
+            "orders": [{
+                "uid": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "owner": "3JF3sEqM796hk5WFqA6EtmEwJQ9quALszsfJyvXNQKy3",
+                "sellToken": pubkey(0x33).to_string(),
+                "buyToken": pubkey(0x44).to_string(),
+                "sellTokenAccount": pubkey(0x55).to_string(),
+                "buyTokenAccount": pubkey(0x66).to_string(),
+                "sellAmount": "18446744073709551615",
+                "buyAmount": "2000",
+                "validTo": 42,
+                "kind": "sell",
+                "partiallyFillable": false,
+                "orderPda": pubkey(0x77).to_string(),
+                "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "executed": "0",
+                "creation": "AQID",
+                "sellBalance": "500",
+            }],
+            "tokens": {"4Ss5JMkXAD9Z7cktFEdrqeMuT6jGMF1pVozTyPHZ6zT4": {"price": "1500000000"}},
+        });
+        assert_eq!(serde_json::to_value(&request).unwrap(), expected);
+
+        // An autopilot that predates partial fills sends no `executed`, one
+        // that predates balance scaling no `sellBalance`.
+        let order = expected["orders"][0].as_object_mut().unwrap();
+        order.remove("executed");
+        order.remove("sellBalance");
+        let parsed: SolveRequest = serde_json::from_value(expected).unwrap();
+        assert_eq!(parsed.orders[0].executed, 0);
+        assert_eq!(parsed.orders[0].sell_balance, None);
+    }
+
+    /// An order without a receiver is serialized without the key, one with
+    /// it parses the wallet.
+    #[test]
+    fn the_receiver_is_optional() {
+        let mut json = serde_json::to_value(order()).unwrap();
+        assert!(json.get("receiver").is_none());
+
+        json["receiver"] = serde_json::json!(pubkey(0x23).to_string());
+        let parsed: Order = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.receiver, Some(pubkey(0x23)));
+        assert_eq!(domain::Order::from(parsed).receiver, Some(pubkey(0x23)));
+    }
+
+    #[test]
+    fn tokens_are_optional() {
+        let request: SolveRequest = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "deadline": "2026-01-01T00:00:00Z",
+            "orders": [],
+        }))
+        .unwrap();
+        assert!(request.tokens.is_empty());
+    }
+
+    #[test]
+    fn into_domain_keeps_the_token_prices() {
+        let request = SolveRequest {
+            id: 7,
+            deadline: "2026-01-01T00:00:00Z".parse().unwrap(),
+            orders: vec![],
+            tokens: HashMap::from([(
+                pubkey(0x33),
+                Token {
+                    price: 1_500_000_000,
+                },
+            )]),
+        };
+        assert_eq!(
+            request.into_domain().unwrap().native_prices,
+            HashMap::from([(pubkey(0x33), 1_500_000_000)])
+        );
+    }
+
+    #[test]
+    fn into_domain_decodes_creations() {
+        let transaction = solana_sdk::transaction::VersionedTransaction::default();
+        let request = SolveRequest {
+            id: 7,
+            deadline: "2026-01-01T00:00:00Z".parse().unwrap(),
+            orders: vec![Order {
+                creation: Some(bincode::serialize(&transaction).unwrap()),
+                ..order()
+            }],
+            tokens: HashMap::new(),
+        };
+        let auction = request.into_domain().unwrap();
+        assert_eq!(
+            auction.creations.get(&OrderUid([0x11; 32])),
+            Some(&transaction)
+        );
+    }
+
+    #[test]
+    fn into_domain_rejects_non_positive_id() {
+        let request = SolveRequest {
+            id: 0,
+            deadline: "2026-01-01T00:00:00Z".parse().unwrap(),
+            orders: vec![order()],
+            tokens: HashMap::new(),
+        };
+        let err = request
+            .into_domain()
+            .expect_err("non-positive id must be rejected");
+        assert!(matches!(err, Error::InvalidAuctionId));
+    }
+}

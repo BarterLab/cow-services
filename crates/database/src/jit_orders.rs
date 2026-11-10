@@ -19,9 +19,9 @@ use {
 
 pub const SELECT: &str = r#"
 o.uid, o.owner, o.creation_timestamp, o.sell_token, o.buy_token, o.sell_amount, o.buy_amount,
-o.valid_to, o.app_data, o.fee_amount, o.kind, o.partially_fillable, o.signature,
-o.receiver, o.signing_scheme, '\x9008d19f58aabd9ed0d60971565aa8510560ab41'::bytea AS settlement_contract, o.sell_token_balance, o.buy_token_balance,
-'liquidity'::OrderClass AS class,
+o.valid_to, NULL AS valid_from, FALSE AS fast_path, o.app_data, o.fee_amount, o.kind, o.partially_fillable, o.signature,
+COALESCE(o.receiver, '\x0000000000000000000000000000000000000000'::bytea) AS receiver, o.signing_scheme, '\x9008d19f58aabd9ed0d60971565aa8510560ab41'::bytea AS settlement_contract, o.sell_token_balance, o.buy_token_balance,
+TRUE AS is_liquidity_order,
 (SELECT COALESCE(SUM(t.buy_amount), 0) FROM trades t WHERE t.order_uid = o.uid) AS sum_buy,
 (SELECT COALESCE(SUM(t.sell_amount), 0) FROM trades t WHERE t.order_uid = o.uid) AS sum_sell,
 (SELECT COALESCE(SUM(t.fee_amount), 0) FROM trades t WHERE t.order_uid = o.uid) AS sum_fee,
@@ -34,7 +34,8 @@ NULL AS onchain_user,
 NULL AS onchain_placement_error,
 COALESCE((SELECT SUM(executed_fee) FROM order_execution oe WHERE oe.order_uid = o.uid), 0) as executed_fee,
 COALESCE((SELECT executed_fee_token FROM order_execution oe WHERE oe.order_uid = o.uid LIMIT 1), o.sell_token) as executed_fee_token, -- TODO surplus token
-NULL AS full_app_data
+NULL AS full_app_data,
+(SELECT CASE WHEN COUNT(*) = COUNT(t.gas_cost) THEN SUM(t.gas_cost) END FROM trades t WHERE t.order_uid = o.uid) as gas_cost
 "#;
 
 pub const FROM: &str = "jit_orders o";
@@ -55,6 +56,16 @@ SELECT,
 }
 
 #[instrument(skip_all)]
+pub async fn get_many_by_uid<'a>(
+    ex: &'a mut PgConnection,
+    order_uids: &'a [OrderUid],
+) -> Result<Vec<orders::FullOrder>, sqlx::Error> {
+    const QUERY: &str =
+        const_format::concatcp!("SELECT ", SELECT, " FROM ", FROM, " WHERE o.uid = ANY($1)");
+    sqlx::query_as(QUERY).bind(order_uids).fetch_all(ex).await
+}
+
+#[instrument(skip_all)]
 pub async fn get_by_tx(
     ex: &mut PgConnection,
     tx_hash: &TransactionHash,
@@ -70,7 +81,7 @@ pub async fn get_by_tx(
         t.block_number = (SELECT block_number FROM settlement) AND
         -- BETWEEN is inclusive
         t.log_index BETWEEN (SELECT * from previous_settlement) AND (SELECT log_index FROM \
-         settlement) 
+         settlement)
         AND NOT EXISTS (
             SELECT 1 FROM orders ord
             WHERE ord.uid = o.uid)
@@ -131,7 +142,7 @@ pub async fn insert(ex: &mut PgConnection, jit_orders: &[JitOrder]) -> Result<()
             signing_scheme,
             sell_token_balance,
             buy_token_balance
-        ) 
+        )
         "#,
     );
 

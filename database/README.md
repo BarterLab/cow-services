@@ -24,18 +24,6 @@ Column                | Type        | Nullable | Details
 Indexes:
 - "app\_data\_pkey" PRIMARY KEY, btree (`contract_app_data`)
 
-### auction\_prices
-
-Stores the native price of a token in a given auction. Used for computations related to CIP-20.
-
- Column     | Type    | Nullable | Details
-------------|---------|----------|--------
-auction\_id | bigint  | not null | in which auction this price was provided
-token       | bytea   | not null | address of the token the price refers to
-price       | numeric | not null | the atoms of ETH that can be bought with 1 atom of the token
-
-Indexes:
-- PRIMARY KEY: btree(`auction_uid`, `token`)
 
 ### auctions (and auctions\_id\_seq counter)
 
@@ -53,19 +41,22 @@ Indexes:
 
 Contains all auctions for which a valid solver competition exists.
 
- Column        | Type    | Nullable | Details
----------------|---------|----------|--------
- id            | bigint  | not null | other tables refer to this as `auction\_id`
- block         | bigint  | not null | the block number on top of which the auction was created
- deadline      | bigint  | not null | the block number until which all winning solutions are expected to be settled on-chain.
- order\_uids   | bytea[] | not null | orders that are part of the auction
- price\_tokens | bytea[] | not null | native price tokens
- price\_values | numeric | not null | native price values, mapped one-to-one with `price\_tokens`
+ Column        | Type      | Nullable | Details
+---------------|-----------|----------|--------
+ id            | bigint    | not null | other tables refer to this as `auction\_id`
+ block         | bigint    | not null | the block number on top of which the auction was created
+ deadline      | bigint    | not null | the block number until which all winning solutions are expected to be settled on-chain.
+ order\_uids   | bytea[]   | not null | orders that are part of the auction
+ price\_tokens | bytea[]   | not null | native price tokens
+ price\_values | numeric[] | not null | native price values, mapped one-to-one with `price\_tokens`
  surplus\_capturing\_jit\_order\_owners | bytea[] | not null | surplus capturing jit order owners that are part of the auction
+ penalty\_caps\_native | numeric[] | nullable | caps on the penalty a solver can incur for winning an order but failing to execute it, in native token wei, mapped one-to-one with `order\_uids`; null for auctions created before this column existed or while penalties were disabled
+ fast\_path\_quote\_id | bigint | nullable | the `quotes.id` this auction settled, for fast-path auctions; null for regular auctions
 
 Indexes:
 - PRIMARY KEY: btree(`id`)
 - competition_auction_deadline: btree(`deadline`)
+- competition_auctions_order_uids_gin: gin(`order_uids`)
 
 ### ethflow\_orders
 
@@ -183,11 +174,12 @@ Indexes:
 
 Stores timestamped events throughout an order's life cycle. This information is used to get detailed metrics on a per order basis.
 
- Column           | Type                     | Nullable | Details
-------------------|--------------------------|----------|--------
- order\_uid       | bytea                    | not null | order this event belongs to
- timestamp        | timestamptz              | not null | when the event was registered
- label            | [enum](#ordereventlabel) | not null | which event happened exactly
+ Column           | Type                       | Nullable | Details
+------------------|----------------------------|----------|--------
+ order\_uid       | bytea                      | not null | order this event belongs to
+ timestamp        | timestamptz                | not null | when the event was registered
+ label            | [enum](#ordereventlabel)   | not null | which event happened exactly
+ reason           | [enum](#orderfilterreason) | nullable | why the order was filtered or marked invalid (only set for `filtered` and `invalid` labels)
 
 Indexes:
 - order\_events\_by\_uid: btree(`order_uid`, `timestamp`)
@@ -234,9 +226,11 @@ Quotes that an order was created with. These quotes get stored persistently and 
  verified            | boolean     | not null | information if quote was verified
  metadata            | json        | not null | additional data associated with the quote in json format
  creation\_timestamp | timestamptz | not null | when the entry was created (DEFAULT NOW() for new and 1970-01-01 for historical data)
+ quote\_id           | bigint      | nullable | `quotes.id` this order was placed against — used by the autopilot's fast-path handler to look up the associated `quote_competitions` staging row
 
 Indexes:
 - PRIMARY KEY: btree(`order_uid`)
+- order_quotes_creation_timestamp: btree(`creation_timestamp`)
 
 ### orders
 
@@ -263,21 +257,21 @@ Column                    | Type                         | Nullable | Details
  settlement\_contract     | bytea                        | not null | address of the contract that should be used to settle this order
  sell\_token\_balance     | [enum](#selltokensource)     | not null | defines how sell\_tokens need to be transferred into the settlement contract
  buy\_token\_balance      | [enum](#buytokendestination) | not null | defined how buy\_tokens need to be transferred back to the user
- class                    | [enum](#orderclass)          | not null | determines which special trade semantics will apply to the execution of this order
- true_valid_to | timestamptz                  | not null | timestamp at which order is no longer executable. For regular orders it is the same value as valid_to. Some orders may have multiple valid_to values, such as ethflow: which is initially signed with u32::MAX. Their true validity comes from the Settlement contract's events which is used for liveness checks.
+ true_valid_to | bigint                       | not null | UNIX timestamp at which order is no longer executable. For regular orders it is the same value as valid_to. Some orders may have multiple valid_to values, such as ethflow: which is initially signed with u32::MAX. Their true validity comes from the Settlement contract's events which is used for liveness checks.
+ valid\_from               | bigint                       | nullable | earliest UNIX timestamp (in seconds) at which the order may enter a batch auction. Taken from the order's app-data (`validFrom`). NULL means no lower bound, i.e. the order is eligible immediately (the default for all existing orders).
 
 Indexes:
 - PRIMARY KEY: btree(`uid`)
 - order_cancellation_timestamp: btree(`cancellation_timestamp`)
 - order_creation_timestamp: btree(`creation_timestamp`)
-- order_owner: hash(`owner`)
 - order_quoting_parameters: btree(`sell_token`, `buy_token`, `sell_amount`)
 - order_sell_buy_tokens: btree(`sell_token`, `buy_token`)
 - user_order_creation_timestamp: btree(`owner`, `creation_timestamp` DESC)
 - version_idx: btree(`settlement_contract`)
 - orders\_true\_valid\_to: btree(`true_valid_to`)
+- orders\_valid\_from: btree(`valid_from`) WHERE valid_from IS NOT NULL
 - orders_owner_covering: btree(`owner`) INCLUDE (`uid`, `kind`, `buy_amount`, `sell_amount`, `fee_amount`, `buy_token`, `sell_token`)
-- orders_owner_class_valid_composite: btree(`owner`, `class`, `true_valid_to` DESC) WHERE cancellation_timestamp IS NULL
+- orders_owner_valid_composite: btree(`owner`, `true_valid_to` DESC) WHERE cancellation_timestamp IS NULL
 
 ### fee_policies
 
@@ -294,6 +288,7 @@ Column                               | Type                         | Nullable |
  volume_factor                       | double precision             |          | fee percentage of the order volume; value is between 0 and 1
  price_improvement_factor            | double precision             |          | percentage of the price improvement over the best quote received during order creation; value is between 0 and 1
  price_improvement_max_volume_factor | double precision             |          | cap for the fee as a percentage of the order volume; value is between 0 and 1
+ origin                              | [PolicyOrigin](#policyorigin) |         | who the fee is charged for, defined in the PolicyOrigin enum; NULL for policies stored before this column was added
 
 Indexes:
 - PRIMARY KEY: composite key(`auction_id`, `order_uid`, `application_order`)
@@ -307,6 +302,13 @@ Indexes:
     - `surplus`: The fee is based on the surplus achieved in the trade.
     - `priceimprovement`: The fee is based on a better executed price than the top quote.
     - `volume`: The fee is based on the volume of the order.
+
+- #### PolicyOrigin
+    Enum for the `origin` column in `fee_policies` table.
+
+    Values:
+    - `protocol`: The fee policy is configured by the protocol.
+    - `partner`: The fee policy is requested by a partner via the order's app data.
 
 ### presignature\_events
 
@@ -350,6 +352,18 @@ Stores quotes in order to determine whether it makes sense to allow a user to cr
 Indexes:
 - PRIMARY KEY: btree(`id`)
 - quotes\_token\_expiration: btree (`sell_token`, `buy_token`, `expiration_timestamp` DESC)
+
+### quote\_competitions
+
+Stores the full competition data (all quotes, native prices, quote request, etc.) that produced the `quotes` row with the same id. Similar to the `quotes` table data in this table is temporary and only gets moved into permanent tables once the fast path execution of an order that requests it was initiated. The data is stored in a JSON blob for maximum flexibility and may change across deployments.
+
+ Column       | Type   | Nullable | Details
+--------------|--------|----------|--------
+ quote\_id    | bigint | not null | `quotes.id` this staging row belongs to
+ competition  | jsonb  | not null | serialized competition data — carries the `auction_id`, sell/buy tokens, order side, native prices, and one entry per participating solver (solver, `solution_id`, `is_winner`, quoted amounts)
+
+Indexes:
+- PRIMARY KEY: btree(`quote_id`)
 
 ### proposed\_solutions
 
@@ -420,14 +434,18 @@ Indexes:
 
 Stores data and metadata of [`Settlement`](https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol#L67-L68) events emitted from the settlement contract.
 
- Column        | Type   | Nullable | Details
----------------|--------|----------|--------
- block\_number | bigint | not null | block in which the settlement happened
- log\_index    | bigint | not null | index in which the event was emitted
- solver        | bytea  | not null | public address of the executing solver
- tx\_hash      | bytea  | not null | transaction hash in which the settlement got executed
- auction\_id    | bigint | nullable | corresponding auction ID that initiated the settlement
- solution\_uid  | bigint | nullable | corresponding winning solver's solution UID, which is also used to identify settlements from the current environment
+ Column                | Type           | Nullable | Details
+-----------------------|----------------|----------|--------
+block\_number          | bigint         | not null | block in which the settlement happened
+log\_index             | bigint         | not null | index in which the event was emitted
+solver                 | bytea          | not null | public address of the executing solver
+tx\_hash               | bytea          | not null | transaction hash in which the settlement got executed
+auction\_id            | bigint         | nullable | corresponding auction ID that initiated the settlement
+solution\_uid          | bigint         | nullable | corresponding winning solver's solution UID, which is also used to identify settlements from the current environment
+gas\_used              | numeric(78, 0) | nullable | gas consumed by the settlement transaction, read from the transaction receipt
+ effective\_gas\_price | numeric(78, 0) | nullable | gas price actually paid per unit of gas (in wei), read from the transaction receipt
+
+The total on-chain cost of a settlement is `gas_used * effective_gas_price`. Both columns are populated by the `autopilot`'s settlement observer and are only set for settlements observed after the migration that added them; historical rows were not backfilled, so consumers (e.g. the `orderbook` attributing gas cost to individual trades and orders) must handle `NULL`.
 
 Indexes:
 - PRIMARY KEY: btree(`block_number`,`log_index`)
@@ -454,18 +472,6 @@ Indexes:
 - PRIMARY KEY: btree(`auction_id`, `solver`, `solution_uid`)
 - settlement\_executions\_time\_range\_index: btree(`start_timestamp`, `end_timestamp`)
 
-### solver\_competitions
-
-Stores an overview of the solver competition. It contains orders in the auction along with prices for every relevant token as well as all valid solutions submitted by solvers together with their quality.
-
- Column | Type   | Nullable | Details
---------|--------|----------|--------
- id     | bigint | not null | id of the auction that the solver competition belongs to
- json   | jsonb  | nullable | overview of the solver competition with unspecified format
-
-Indexes:
-- PRIMARY KEY: btree(`id`)
-
 ### trades
 
 This table contains data of [`Trade`](https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol#L49-L58) events issued by the settlement contract after a successful settlement.
@@ -478,23 +484,13 @@ This table contains data of [`Trade`](https://github.com/cowprotocol/contracts/b
  sell\_amount  | numeric | not null | amount of sell\_token that got taken from the order owner
  buy\_amount   | numeric | not null | amount of buy\_token received by the order owner
  fee\_amount   | numeric | not null | fee amount in sell\_token that got taken in this trade. Note that this amount refers to all or a portion of the static fee\_amount the user signed during the order creation.
+ gas\_cost     | numeric | nullable | this trade's share of its settlement's gas cost in wei (estimated as `gas_used` * `gas_price`), rounded down. `NULL` for settlements observed before the migration that added it.
 
 Indexes:
 - PRIMARY KEY: btree(`block_number`, `log_index`)
 - trade\_order\_uid: btree (`order_uid`, `block_number`, `log_index`)
 - trades_covering: btree(`order_uid`) INCLUDE (`buy_amount`, `sell_amount`, `fee_amount`)
-
-### surplus\_capturing\_jit\_order\_owners
-
-Stores all surplus capturing jit order owners that are part of an auction. JIT orders settled for addresses which were not part of a given auction will not count towards surplus.
-
- Column     | Type    | Nullable | Details
-------------|---------|----------|--------
-auction\_id | bigint  | not null | which auction this order was part of
-owners      | bytea[] | not null | surplus capturing jit order owner included in the auction
-
-Indexes:
-- PRIMARY KEY: btree(`auction_id`)
+- trades_owner_covering: btree(`substring(order_uid, 33, 20)`, `block_number` DESC, `log_index` DESC) INCLUDE (`order_uid`)
 
 ### jit\_orders
 
@@ -520,7 +516,6 @@ Column                    | Type                         | Nullable | Details
  signing\_scheme          | [enum](#signingscheme)       | not null | what kind of signature was used to proof that the `owner` actually created the order
  sell\_token\_balance     | [enum](#selltokensource)     | not null | defines how sell\_tokens need to be transferred into the settlement contract
  buy\_token\_balance      | [enum](#buytokendestination) | not null | defined how buy\_tokens need to be transferred back to the user
- class                    | [enum](#orderclass)          | not null | determines which special trade semantics will apply to the execution of this order
 
 Indexes:
 - PRIMARY KEY: btree(`block_number`, `log_index`)
@@ -530,21 +525,7 @@ Indexes:
 - jit\_user\_order\_creation\_timestamp: btree(`owner`, `creation_timestamp` DESC)
 - jit\_event\_id: btree(`block_number`, `log_index`)
 
-### cow\_amms
-
-Stores information about indexed CoW AMMs that have been discovered through blockchain events. Each row represents a CoW AMM pool with its associated factory contract and tradeable tokens.
-
- Column             | Type     | Nullable | Details
---------------------|----------|----------|--------
- address            | bytea    | not null | Address of the CoW AMM pool contract
- factory\_address   | bytea    | not null | Address of the factory contract associated with this AMM
- tradeable\_tokens  | bytea[]  | not null | Token addresses that can be traded through this AMM
- block\_number      | bigint   | not null | Block number in which the AMM was deployed/finalized
- tx\_hash           | bytea    | not null | Transaction hash in which the AMM was deployed/finalized
-
-Indexes:
-- PRIMARY KEY: btree (`address`)
-- cow\_amms\_factory\_block: btree (`factory_address`, `block_number`)
+The `pool-indexer` service uses its own per-network database, not these shared DBs. Its tables (`pool_indexer_checkpoints`, `uniswap_v3_pools`, `uniswap_v3_pool_states`, `uniswap_v3_ticks`) and migrations live in [`sql-pool-indexer/`](sql-pool-indexer/).
 
 ### Enums
 
@@ -581,6 +562,18 @@ Indexes:
  considered | order was in a valid solution
  traded     | order was traded on-chain
  cancelled  | user cancelled the order
+
+#### orderfilterreason
+
+ Value                  | Meaning
+------------------------|--------
+ in\_flight             | order already won a previous auction and is being settled on-chain
+ banned\_user           | order owner is on the ban list
+ invalid\_signature     | presign or EIP-1271 signature is not yet valid
+ unsupported\_token     | sell or buy token is on the deny list
+ insufficient\_balance  | owner does not have enough sell token balance or allowance
+ dust\_order            | order value is too small to be worth settling
+ missing\_native\_price | no native price available for the order's tokens
 
 #### orderkind
 
@@ -622,14 +615,6 @@ We support different expiration times for orders with different signing schemes.
 ----------|--------
  erc20    | Bought tokens will be added to the ERC20 token balance of that user
  internal | Bought tokens will be added to the balancer vault internal balance of the user ([docs](https://docs.cow.fi/smart-contracts/vault-relayer/balancer-internal-balances))
-
-#### orderclass
-
- Value     | Meaning
------------|--------
- market    | Short lived order that may receive surplus. Users agree to a static fee upfront by signing it.
- liquidity | These orders must be traded at their limit price and may not receive any surplus. Violating this is a slashable offence.
- limit     | Long lived order that may receive surplus. Users sign a static fee of 0 upfront and either the backend or the solvers compute a dynamic fee that gets taken from the surplus (while still respecting the user's limit price!).
 
 ## Notes on Migrations
 

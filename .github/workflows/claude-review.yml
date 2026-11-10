@@ -1,0 +1,20 @@
+name: Claude PR Review
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+# Review specific instructions go in .claude/skills/pr-review/SKILL.md.
+jobs:
+  review:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+      statuses: write
+    uses: cowprotocol/claude-review/.github/workflows/claude-review.yml@d224a33b575e0fe2bcffcaab41c5bce052ecdc03
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

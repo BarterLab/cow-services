@@ -1,12 +1,15 @@
 use {
     crate::{
-        domain::eth,
+        domain,
         infra::{Ethereum, blockchain},
         util,
     },
     alloy::primitives::FixedBytes,
     derive_more::{From, Into},
+    eth_domain_types as eth,
     model::order::{BuyTokenDestination, SellTokenSource},
+    number::u256_ext::U256Ext,
+    std::sync::Arc,
 };
 pub use {fees::FeePolicy, signature::Signature};
 
@@ -14,12 +17,14 @@ pub mod app_data;
 pub mod fees;
 pub mod signature;
 
-/// An order in the auction.
+/// The immutable, auction-independent data of an order. Wrapped in [`Arc`] so
+/// that per-solver copies of [`Order`] share a single allocation.
 #[derive(Debug, Clone)]
-pub struct Order {
+pub struct OrderData {
     pub uid: Uid,
-    /// The user specified a custom address to receive the output of this order.
-    pub receiver: Option<eth::Address>,
+    /// The user specified a custom address to receive the output of this
+    /// order. `Address::ZERO` means "pay the owner".
+    pub receiver: eth::Receiver,
     pub created: util::Timestamp,
     pub valid_to: util::Timestamp,
     /// The minimum amount this order must buy when completely filled.
@@ -27,17 +32,14 @@ pub struct Order {
     /// The maximum amount this order is allowed to sell when completely filled.
     pub sell: eth::Asset,
     pub side: Side,
-    pub kind: Kind,
-    pub app_data: app_data::AppData,
-    pub partial: Partial,
     /// The onchain calls to run before sending user funds to the settlement
     /// contract.
     /// These are set by the user and included in the settlement transaction.
-    pub pre_interactions: Vec<eth::Interaction>,
+    pub pre_interactions: Vec<domain::Interaction>,
     /// The onchain calls to run after sending tokens from the settlement
     /// contract to the user.
     /// These are set by the user and included in the settlement transaction.
-    pub post_interactions: Vec<eth::Interaction>,
+    pub post_interactions: Vec<domain::Interaction>,
     pub sell_token_balance: SellTokenBalance,
     pub buy_token_balance: BuyTokenBalance,
     pub signature: Signature,
@@ -47,6 +49,35 @@ pub struct Order {
     pub protocol_fees: Vec<FeePolicy>,
     /// The winning quote.
     pub quote: Option<Quote>,
+    /// Cap on the penalty a solver can incur for winning this order but
+    /// failing to execute it, in native token.
+    pub penalty_cap_native: Option<eth::Ether>,
+}
+
+/// An order in the auction.
+///
+/// Designed to be cheap to clone. Most of the data is immutable and is
+/// reference counted. Solvers only get individual copies of data they
+/// have need to update during the pre-processing phase.
+#[derive(Debug, Clone)]
+pub struct Order {
+    /// Immutable order data shared across all per-solver copies.
+    pub data: Arc<OrderData>,
+    /// Per-solver mutable as the data may only become available after
+    /// assembling the orders.
+    pub app_data: app_data::AppData,
+    /// Per-solver mutable as the driver may allocated different amounts of
+    /// the user's available balance based on the solver's order prioritization
+    /// logic.
+    pub partial: Partial,
+}
+
+impl std::ops::Deref for Order {
+    type Target = OrderData;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
 }
 
 /// An amount denominated in the sell token of an [`Order`].
@@ -132,7 +163,7 @@ impl Order {
     /// address. Otherwise, return the address which was used to place the
     /// order.
     pub fn receiver(&self) -> eth::Address {
-        self.receiver.unwrap_or(self.signature.signer)
+        self.receiver.resolve(self.signature.signer)
     }
 
     /// Returns the order's available amounts to be passed to a solver engine.
@@ -150,22 +181,23 @@ impl Order {
         };
         let target = self.target();
 
-        amounts.sell.amount = util::math::mul_ratio(amounts.sell.amount.0, available.0, target.0)
+        amounts.sell.amount = amounts
+            .sell
+            .amount
+            .0
+            .checked_mul_ratio(&available.0, &target.0)
             .unwrap_or_default()
             .into();
 
-        amounts.buy.amount =
-            util::math::mul_ratio_ceil(amounts.buy.amount.0, available.0, target.0)
-                .unwrap_or_default()
-                .into();
+        amounts.buy.amount = amounts
+            .buy
+            .amount
+            .0
+            .checked_mul_ratio_ceil(&available.0, &target.0)
+            .unwrap_or_default()
+            .into();
 
         amounts
-    }
-
-    /// Should the order fee be determined by the solver? This is true for
-    /// partial limit orders.
-    pub fn solver_determines_fee(&self) -> bool {
-        matches!(self.kind, Kind::Limit)
     }
 }
 
@@ -283,23 +315,6 @@ impl From<Uid> for [u8; UID_LEN] {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    /// Order intended to be immediately executed. This is the "regular" type of
-    /// order.
-    Market,
-    /// Order intended to be fulfilled possibly far into the future, when the
-    /// price is such that the order can be executed. Because the fulfillment
-    /// can happen any time into the future, it's impossible to calculate
-    /// the order fees ahead of time, so the fees are taken from the order
-    /// surplus instead.
-    ///
-    /// The order surplus is the additional money that the solver managed to
-    /// solve for, above what the user specified in the order. The exact amount
-    /// of fees that are taken is determined by the solver.
-    Limit,
-}
-
 /// [Balancer V2](https://docs.balancer.fi/) integration, used for settlement encoding.
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub enum SellTokenBalance {
@@ -380,7 +395,7 @@ pub struct Jit {
     /// The amount this order wants to buy when completely filled.
     /// The actual executed amount depends on partial fills and the order side.
     pub buy: eth::Asset,
-    pub receiver: eth::Address,
+    pub receiver: eth::Receiver,
     pub valid_to: util::Timestamp,
     pub partially_fillable: bool,
     pub app_data: app_data::AppDataHash,
@@ -432,37 +447,43 @@ mod tests {
             amount: eth::U256::from(amount).into(),
         };
 
-        let order = |sell_amount: u64, buy_amount: u64, available: Option<eth::Asset>| Order {
-            uid: Default::default(),
-            receiver: Default::default(),
-            created: util::Timestamp(100),
-            valid_to: util::Timestamp(u32::MAX),
-            buy: buy(buy_amount),
-            sell: sell(sell_amount),
-            side: match available {
+        let order = |sell_amount: u64, buy_amount: u64, available: Option<eth::Asset>| {
+            let side = match available {
                 None => Side::Sell,
                 Some(executed) if executed.token == sell(0).token => Side::Sell,
                 Some(executed) if executed.token == buy(0).token => Side::Buy,
                 _ => panic!(),
-            },
-            kind: Kind::Limit,
-            app_data: Default::default(),
-            partial: available
+            };
+            let partial = available
                 .map(|available| Partial::Yes {
                     available: available.amount.into(),
                 })
-                .unwrap_or(Partial::No),
-            pre_interactions: Default::default(),
-            post_interactions: Default::default(),
-            sell_token_balance: SellTokenBalance::Erc20,
-            buy_token_balance: BuyTokenBalance::Erc20,
-            signature: Signature {
-                scheme: signature::Scheme::PreSign,
-                data: Default::default(),
-                signer: Default::default(),
-            },
-            protocol_fees: Default::default(),
-            quote: Default::default(),
+                .unwrap_or(Partial::No);
+            Order {
+                data: Arc::new(OrderData {
+                    uid: Default::default(),
+                    receiver: Default::default(),
+                    created: util::Timestamp(100),
+                    valid_to: util::Timestamp(u32::MAX),
+                    buy: buy(buy_amount),
+                    sell: sell(sell_amount),
+                    side,
+                    pre_interactions: Default::default(),
+                    post_interactions: Default::default(),
+                    sell_token_balance: SellTokenBalance::Erc20,
+                    buy_token_balance: BuyTokenBalance::Erc20,
+                    signature: Signature {
+                        scheme: signature::Scheme::PreSign,
+                        data: Default::default(),
+                        signer: Default::default(),
+                    },
+                    protocol_fees: Default::default(),
+                    quote: Default::default(),
+                    penalty_cap_native: Default::default(),
+                }),
+                app_data: Default::default(),
+                partial,
+            }
         };
 
         assert_eq!(

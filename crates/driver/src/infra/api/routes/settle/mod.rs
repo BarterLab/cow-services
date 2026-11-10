@@ -4,7 +4,7 @@ use {
     crate::{
         domain::competition::auction,
         infra::{
-            api::{self, Error, State},
+            api::{self, Error, State, extract::LoggingJson},
             observe,
         },
     },
@@ -17,7 +17,7 @@ pub(in crate::infra::api) fn settle(router: axum::Router<State>) -> axum::Router
 
 async fn route(
     state: axum::extract::State<State>,
-    req: axum::Json<dto::SettleRequest>,
+    LoggingJson(req): LoggingJson<dto::SettleRequest>,
 ) -> Result<(), (axum::http::StatusCode, axum::Json<Error>)> {
     let auction_id =
         auction::Id::try_from(req.auction_id).map_err(api::routes::AuctionError::from)?;
@@ -30,7 +30,7 @@ async fn route(
             .settle(
                 auction_id,
                 req.solution_id,
-                req.submission_deadline_latest_block,
+                req.submission_deadline_latest_block.into(),
             )
             .await;
         result.map(|_| ()).map_err(Into::into)

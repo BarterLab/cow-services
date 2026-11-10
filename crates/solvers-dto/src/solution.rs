@@ -1,18 +1,82 @@
 use {
-    alloy::{
-        primitives::{Address, U256},
-        rpc::types::state::StateOverride,
-    },
+    alloy_primitives::{Address, U256},
+    alloy_rpc_types::state::StateOverride,
+    eth_domain_types::Receiver,
     number::serialization::HexOrDecimalU256,
-    serde::{Deserialize, Serialize},
+    serde::{Deserialize, Deserializer, Serialize, de},
     serde_with::serde_as,
-    std::collections::HashMap,
+    std::collections::{HashMap, HashSet},
 };
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SolverError {
+    pub code: SolverErrorCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SolverErrorCode {
+    /// Token can only be traded during specific time windows (e.g., RWA tokens)
+    TradingOutsideAllowedWindow,
+    /// Token is temporarily suspended from trading
+    TokenTemporarilySuspended,
+    /// Insufficient liquidity for the requested trade size
+    InsufficientLiquidity,
+    /// Generic solver error with custom message
+    Other,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Solutions {
     pub solutions: Vec<Solution>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum SolverResponse {
+    Solutions { solutions: Vec<Solution> },
+    Error { error: SolverError },
+}
+
+/// Hand written because `#[serde(untagged)]` discards the error of every
+/// variant it tries and reports only that none matched, which hides why a
+/// solution was rejected from the solver we notify about it.
+impl<'de> Deserialize<'de> for SolverResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            solutions: Option<Vec<Solution>>,
+            error: Option<SolverError>,
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw {
+                solutions: Some(solutions),
+                ..
+            } => Ok(Self::Solutions { solutions }),
+            Raw {
+                error: Some(error), ..
+            } => Ok(Self::Error { error }),
+            Raw { .. } => Err(de::Error::custom(
+                "expected either a `solutions` or an `error` field",
+            )),
+        }
+    }
+}
+
+impl Default for SolverResponse {
+    fn default() -> Self {
+        Self::Solutions {
+            solutions: Vec::new(),
+        }
+    }
 }
 
 #[serde_as]
@@ -22,6 +86,7 @@ pub struct Solution {
     pub id: u64,
     #[serde_as(as = "HashMap<_, HexOrDecimalU256>")]
     pub prices: HashMap<Address, U256>,
+    #[serde(deserialize_with = "deserialize_trades")]
     pub trades: Vec<Trade>,
     #[serde(default)]
     pub pre_interactions: Vec<Call>,
@@ -30,6 +95,8 @@ pub struct Solution {
     pub post_interactions: Vec<Call>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gas: Option<u64>,
+    #[serde(flatten)]
+    pub gas_fee_override: Option<GasFeeOverride>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub state_overrides: Option<StateOverride>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -45,6 +112,30 @@ pub struct Solution {
 pub enum StateOverrideBlock {
     Number(u64),
     Pending,
+}
+
+/// A partially fillable order may be split across several solutions, but a
+/// single solution settles each order exactly once.
+fn deserialize_trades<'de, D>(deserializer: D) -> Result<Vec<Trade>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let trades = Vec::<Trade>::deserialize(deserializer)?;
+
+    let mut settled = HashSet::with_capacity(trades.len());
+    for trade in &trades {
+        let Trade::Fulfillment(fulfillment) = trade else {
+            continue;
+        };
+        if !settled.insert(&fulfillment.order) {
+            let uid = const_hex::encode_prefixed(fulfillment.order.0);
+            return Err(de::Error::custom(format!(
+                "order {uid} is settled by more than one trade"
+            )));
+        }
+    }
+
+    Ok(trades)
 }
 
 #[serde_as]
@@ -88,7 +179,8 @@ pub struct JitTrade {
 pub struct JitOrder {
     pub sell_token: Address,
     pub buy_token: Address,
-    pub receiver: Address,
+    #[serde(default)]
+    pub receiver: Receiver,
     #[serde_as(as = "HexOrDecimalU256")]
     pub sell_amount: U256,
     #[serde_as(as = "HexOrDecimalU256")]
@@ -199,7 +291,15 @@ pub struct Allowance {
 pub enum SellTokenBalance {
     #[default]
     Erc20,
+    #[deprecated(
+        note = "Balancer Vault token sources are deprecated and no longer appear in auctions; \
+                only erc20 is used"
+    )]
     Internal,
+    #[deprecated(
+        note = "Balancer Vault token sources are deprecated and no longer appear in auctions; \
+                only erc20 is used"
+    )]
     External,
 }
 
@@ -208,6 +308,10 @@ pub enum SellTokenBalance {
 pub enum BuyTokenBalance {
     #[default]
     Erc20,
+    #[deprecated(
+        note = "Balancer Vault token sources are deprecated and no longer appear in auctions; \
+                only erc20 is used"
+    )]
     Internal,
 }
 
@@ -218,6 +322,17 @@ pub enum SigningScheme {
     EthSign,
     PreSign,
     Eip1271,
+}
+
+/// Solver-provided gas fee overrides for the settlement transaction.
+#[serde_as]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GasFeeOverride {
+    #[serde_as(as = "HexOrDecimalU256")]
+    pub max_fee_per_gas: U256,
+    #[serde_as(as = "HexOrDecimalU256")]
+    pub max_priority_fee_per_gas: U256,
 }
 
 #[serde_as]
@@ -240,4 +355,150 @@ pub struct WrapperCall {
     #[serde_as(as = "serde_ext::Hex")]
     #[serde(default)]
     pub data: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, serde_json::json};
+
+    #[test]
+    fn serializes_empty_solutions_response() {
+        let response = SolverResponse::default();
+
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "solutions": [],
+            })
+        );
+    }
+
+    #[test]
+    fn roundtrips_solver_state_overrides() {
+        let mut solution = solution_with_fulfillments(&[]);
+        let plain: Solution = serde_json::from_value(solution.clone()).unwrap();
+        let plain = serde_json::to_value(plain).unwrap();
+        assert!(plain.get("stateOverrides").is_none());
+        assert!(plain.get("stateOverridesBlock").is_none());
+        for block in [
+            json!({"kind": "pending"}),
+            json!({"kind": "number", "number": 17}),
+        ] {
+            solution["stateOverrides"] = json!({
+                "0x0000000000000000000000000000000000000001": {"balance": "0x42"}
+            });
+            solution["stateOverridesBlock"] = block.clone();
+            let wrapper = json!({"solutions": [solution.clone()]});
+            let solutions: Solutions = serde_json::from_value(wrapper.clone()).unwrap();
+            let SolverResponse::Solutions { solutions: native } =
+                serde_json::from_value(wrapper).unwrap()
+            else {
+                panic!("expected solutions")
+            };
+            for decoded in [solutions.solutions, native] {
+                let value = serde_json::to_value(&decoded[0]).unwrap();
+                assert_eq!(value["stateOverrides"], solution["stateOverrides"]);
+                assert_eq!(value["stateOverridesBlock"], block);
+            }
+        }
+    }
+
+    fn order_uid(byte: u8) -> String {
+        const_hex::encode_prefixed([byte; 56])
+    }
+
+    fn solution_with_fulfillments(orders: &[String]) -> serde_json::Value {
+        json!({
+            "id": 0,
+            "prices": {},
+            "trades": orders.iter().map(|order| json!({
+                "kind": "fulfillment",
+                "order": order,
+                "executedAmount": "1000",
+            })).collect::<Vec<_>>(),
+            "interactions": [],
+        })
+    }
+
+    #[test]
+    fn rejects_solutions_settling_the_same_order_twice() {
+        let order = order_uid(1);
+        let solution = solution_with_fulfillments(&[order.clone(), order.clone()]);
+
+        let err = serde_json::from_value::<Solution>(solution).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("order {order} is settled by more than one trade")
+        );
+    }
+
+    #[test]
+    fn accepts_one_trade_per_order() {
+        let solution = solution_with_fulfillments(&[order_uid(1), order_uid(2)]);
+
+        let solution = serde_json::from_value::<Solution>(solution).unwrap();
+        assert_eq!(solution.trades.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_trade_error_survives_the_response_wrapper() {
+        let order = order_uid(1);
+        let response = json!({
+            "solutions": [solution_with_fulfillments(&[order.clone(), order.clone()])],
+        });
+
+        let err = serde_json::from_value::<SolverResponse>(response).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("order {order} is settled by more than one trade")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn serializes_and_deserializes_error_responses() {
+        let cases = vec![
+            (
+                SolverErrorCode::TradingOutsideAllowedWindow,
+                "tradingOutsideAllowedWindow",
+            ),
+            (
+                SolverErrorCode::TokenTemporarilySuspended,
+                "tokenTemporarilySuspended",
+            ),
+            (
+                SolverErrorCode::InsufficientLiquidity,
+                "insufficientLiquidity",
+            ),
+            (SolverErrorCode::Other, "other"),
+        ];
+
+        for (code, expected_code) in cases {
+            let response = SolverResponse::Error {
+                error: SolverError {
+                    code: code.clone(),
+                    message: Some("custom message".to_string()),
+                },
+            };
+
+            let value = serde_json::to_value(response).unwrap();
+            assert_eq!(
+                value,
+                json!({
+                    "error": {
+                        "code": expected_code,
+                        "message": "custom message",
+                    },
+                })
+            );
+
+            let decoded: SolverResponse = serde_json::from_value(value).unwrap();
+            assert!(matches!(
+                decoded,
+                SolverResponse::Error { error }
+                if error.code == code && error.message.as_deref() == Some("custom message")
+            ));
+        }
+    }
 }

@@ -1,28 +1,41 @@
 use {
-    crate::{app_data, arguments::VolumeFeeConfig},
-    alloy::primitives::{U256, U512, Uint, ruint::UintTryFrom},
+    crate::app_data,
+    alloy::primitives::{Address, U256},
     bigdecimal::{BigDecimal, FromPrimitive},
     chrono::{TimeZone, Utc},
+    configs::orderbook::VolumeFeeConfig,
+    event_bus_dto::{
+        query::{OrderKind as DtoOrderKind, QueryFields},
+        quote_computed::QuoteComputedEvent,
+        quote_requested::{PriceQuality as DtoPriceQuality, QuoteRequestedEvent},
+    },
+    futures::stream::{BoxStream, StreamExt},
     model::{
-        order::OrderCreationAppData,
+        order::{OrderCreationAppData, OrderKind},
         quote::{OrderQuote, OrderQuoteRequest, OrderQuoteResponse, OrderQuoteSide, PriceQuality},
     },
+    price_estimation::{PriceEstimationError, Verification},
     shared::{
-        arguments::TokenBucketFeeOverride,
         fee::VolumeFeePolicy,
-        fee_factor::FeeFactor,
-        order_quoting::{CalculateQuoteError, OrderQuoting, Quote, QuoteParameters},
+        order_quoting::{
+            CalculateQuoteError,
+            EstimatorKind,
+            OrderQuoting,
+            Quote,
+            QuoteParameters,
+            StreamingQuoting,
+        },
         order_validation::{
             AppDataValidationError,
             OrderValidating,
             PartialValidationError,
             PreOrderData,
         },
-        price_estimation::Verification,
-        trade_finding,
     },
     std::sync::Arc,
     thiserror::Error,
+    token_info::TokenInfoFetching,
+    tokio::join,
     tracing::instrument,
 };
 
@@ -50,10 +63,28 @@ impl AdjustedQuoteData {
 pub struct QuoteHandler {
     order_validator: Arc<dyn OrderValidating>,
     optimal_quoter: Arc<dyn OrderQuoting>,
+    verified_quoter: Arc<dyn OrderQuoting>,
     fast_quoter: Arc<dyn OrderQuoting>,
     app_data: Arc<app_data::Registry>,
     volume_fee: Option<VolumeFeeConfig>,
-    volume_fee_policy: VolumeFeePolicy,
+    volume_fee_policy: Arc<VolumeFeePolicy>,
+    token_info_fetcher: Arc<dyn TokenInfoFetching>,
+    streaming_quoters: Option<StreamingQuoters>,
+}
+
+struct StreamingQuoters {
+    optimal: Arc<dyn StreamingQuoting>,
+    verified: Arc<dyn StreamingQuoting>,
+}
+
+impl StreamingQuoters {
+    fn get(&self, price_quality: PriceQuality) -> Option<&Arc<dyn StreamingQuoting>> {
+        match price_quality {
+            PriceQuality::Fast => None,
+            PriceQuality::Optimal => Some(&self.optimal),
+            PriceQuality::Verified => Some(&self.verified),
+        }
+    }
 }
 
 impl QuoteHandler {
@@ -62,26 +93,38 @@ impl QuoteHandler {
         quoter: Arc<dyn OrderQuoting>,
         app_data: Arc<app_data::Registry>,
         volume_fee: Option<VolumeFeeConfig>,
-        volume_fee_bucket_overrides: Vec<TokenBucketFeeOverride>,
-        enable_sell_equals_buy_volume_fee: bool,
+        volume_fee_policy: Arc<VolumeFeePolicy>,
+        token_info_fetcher: Arc<dyn TokenInfoFetching>,
     ) -> Self {
-        let volume_fee_policy = VolumeFeePolicy::new(
-            volume_fee_bucket_overrides,
-            volume_fee.as_ref().and_then(|config| config.factor),
-            enable_sell_equals_buy_volume_fee,
-        );
         Self {
             order_validator,
             optimal_quoter: quoter.clone(),
+            verified_quoter: quoter.clone(),
             fast_quoter: quoter,
             app_data,
             volume_fee,
             volume_fee_policy,
+            token_info_fetcher,
+            streaming_quoters: None,
         }
     }
 
     pub fn with_fast_quoter(mut self, fast_quoter: Arc<dyn OrderQuoting>) -> Self {
         self.fast_quoter = fast_quoter;
+        self
+    }
+
+    pub fn with_verified_quoter(mut self, verified_quoter: Arc<dyn OrderQuoting>) -> Self {
+        self.verified_quoter = verified_quoter;
+        self
+    }
+
+    pub fn with_streaming_quoters(
+        mut self,
+        optimal: Arc<dyn StreamingQuoting>,
+        verified: Arc<dyn StreamingQuoting>,
+    ) -> Self {
+        self.streaming_quoters = Some(StreamingQuoters { optimal, verified });
         self
     }
 }
@@ -92,7 +135,157 @@ impl QuoteHandler {
         &self,
         request: &OrderQuoteRequest,
     ) -> Result<OrderQuoteResponse, OrderQuoteError> {
-        tracing::debug!(?request, "calculating quote");
+        let (params, valid_to) = self.build_quote_params(request).await?;
+        // Captured before `params` is consumed below; the document isn't
+        // available on the response.
+        let app_code = ::app_data::app_code(params.verification.app_data.as_bytes());
+
+        let quote = match request.price_quality {
+            PriceQuality::Optimal | PriceQuality::Verified => {
+                let quoter = match request.price_quality {
+                    PriceQuality::Verified => &self.verified_quoter,
+                    _ => &self.optimal_quoter,
+                };
+                let competition = quoter.calculate_quote(params.clone()).await?;
+                let id = quoter
+                    .store_quote(competition.clone())
+                    .await
+                    .map_err(CalculateQuoteError::Other)?;
+                let mut quote = competition.to_final_quote(&params);
+                quote.id = Some(id);
+                quote
+            }
+            PriceQuality::Fast => {
+                let mut competition = self.fast_quoter.calculate_quote(params.clone()).await?;
+                // Fast quotes always have an expiry of zero because they're not
+                // very accurate and can be considered to expire immediately.
+                competition.metadata.expiration = Utc.timestamp_millis_opt(0).unwrap();
+                competition.to_final_quote(&params)
+            }
+        };
+
+        let adjusted = get_vol_fee_adjusted_quote_data(
+            &quote,
+            &request.side,
+            self.volume_fee.as_ref(),
+            &self.volume_fee_policy,
+            request.buy_token,
+            request.sell_token,
+        )
+        .map_err(|err| OrderQuoteError::CalculateQuote(err.into()))?;
+
+        let response = build_order_quote_response(request, &quote, &adjusted, quote.id, valid_to)?;
+        tracing::debug!(?response, "finished computing quote");
+        observe::event_bus::publish_event(QuoteComputedEvent {
+            quote_id: response.id,
+            app_code,
+            verified: response.verified,
+        });
+        Ok(response)
+    }
+
+    pub async fn calculate_quote_stream(
+        &self,
+        request: &OrderQuoteRequest,
+    ) -> Result<BoxStream<'static, Result<OrderQuoteResponse, OrderQuoteError>>, OrderQuoteError>
+    {
+        // Resolve the streaming quoter before `build_quote_params` so a
+        // misconfigured endpoint fails fast without emitting a `quoteRequested`
+        // event that could never be followed by a `quoteComputed`.
+        let streaming = self
+            .streaming_quoters
+            .as_ref()
+            .ok_or_else(|| {
+                OrderQuoteError::CalculateQuote(
+                    anyhow::anyhow!("streaming quoters not configured").into(),
+                )
+            })?
+            .get(request.price_quality)
+            .ok_or(OrderQuoteError::UnsupportedPriceQuality(
+                request.price_quality,
+            ))?
+            .clone();
+
+        let (params, valid_to) = self.build_quote_params(request).await?;
+        // Captured before `params` is consumed below; the document isn't
+        // available on the response.
+        let app_code = ::app_data::app_code(params.verification.app_data.as_bytes());
+
+        let inner = streaming.calculate_quote_stream(params).await?;
+
+        let request = request.clone();
+        let volume_fee = self.volume_fee.clone();
+        let volume_fee_policy = self.volume_fee_policy.clone();
+
+        let stream = async_stream::stream! {
+            futures::pin_mut!(inner);
+            let mut any_ok = false;
+            while let Some(item) = inner.next().await {
+                let quote = match item {
+                    Ok(quote) => quote,
+                    // The inner stream only yields terminal errors.
+                    Err(err) => {
+                        yield Err(OrderQuoteError::CalculateQuote(err));
+                        return;
+                    }
+                };
+                let response = get_vol_fee_adjusted_quote_data(
+                    &quote,
+                    &request.side,
+                    volume_fee.as_ref(),
+                    &volume_fee_policy,
+                    request.buy_token,
+                    request.sell_token,
+                )
+                .map_err(|err| OrderQuoteError::CalculateQuote(err.into()))
+                .and_then(|adjusted| {
+                    build_order_quote_response(&request, &quote, &adjusted, quote.id, valid_to)
+                });
+                match response {
+                    Ok(response) => {
+                        any_ok = true;
+                        // One event per streamed quote so streaming requests get a
+                        // `quoteComputed` counterpart to their `quoteRequested`, just
+                        // like the one-shot endpoint.
+                        observe::event_bus::publish_event(QuoteComputedEvent {
+                            quote_id: response.id,
+                            app_code: app_code.clone(),
+                            verified: response.verified,
+                        });
+                        yield Ok(response);
+                    }
+                    Err(err) => tracing::debug!(%err, "dropping unconvertible streamed quote"),
+                }
+            }
+            if !any_ok {
+                // No solver produced a usable quote. Route through the same
+                // NoLiquidity mapping the one-shot endpoint returns.
+                yield Err(OrderQuoteError::CalculateQuote(CalculateQuoteError::from((
+                    EstimatorKind::Regular,
+                    PriceEstimationError::NoLiquidity,
+                ))));
+            }
+        };
+
+        Ok(stream.boxed())
+    }
+
+    async fn build_quote_params(
+        &self,
+        request: &OrderQuoteRequest,
+    ) -> Result<(QuoteParameters, u32), OrderQuoteError> {
+        let (sell_token_info, buy_token_info) = join!(
+            self.token_info_fetcher.get_token_info(request.sell_token),
+            self.token_info_fetcher.get_token_info(request.buy_token),
+        );
+        let sell_token_symbol = sell_token_info.ok().and_then(|info| info.symbol);
+        let buy_token_symbol = buy_token_info.ok().and_then(|info| info.symbol);
+        tracing::debug!(
+            ?request,
+            ?sell_token_symbol,
+            ?buy_token_symbol,
+            "calculating quote"
+        );
 
         let full_app_data_override = match request.app_data {
             OrderCreationAppData::Hash { hash } => self.app_data.find(&hash).await.unwrap_or(None),
@@ -104,99 +297,136 @@ impl QuoteHandler {
             .validate_app_data(&request.app_data, &full_app_data_override)?;
 
         let order = PreOrderData::from(request);
+        // Capture valid_to once so the value validated here is the exact value
+        // returned in the response (and, for streaming, shared by all events).
         let valid_to = order.valid_to;
         self.order_validator.partial_validate(order).await?;
 
-        let params = QuoteParameters {
-            sell_token: request.sell_token,
-            buy_token: request.buy_token,
-            side: request.side,
-            verification: Verification {
-                from: request.from,
-                receiver: request.receiver.unwrap_or(request.from),
-                sell_token_source: request.sell_token_balance,
-                buy_token_destination: request.buy_token_balance,
-                pre_interactions: trade_finding::map_interactions(&app_data.interactions.pre),
-                post_interactions: trade_finding::map_interactions(&app_data.interactions.post),
-            },
-            signing_scheme: request.signing_scheme,
-            additional_gas: app_data.inner.protocol.hooks.gas_limit(),
-            timeout: request.timeout,
-        };
+        // Emit only after validation succeeds so we don't announce requests
+        // that never reach the estimator (invalid app-data / order data return
+        // early above). This is best-effort correlation, not a guarantee: if
+        // every estimator errors, (at the time of writing) price estimation
+        // emits no `priceEstimate` events, so a `quoteRequested` can
+        // still end up without follow up none following.
+        emit_quote_requested_event(
+            request,
+            sell_token_symbol,
+            buy_token_symbol,
+            &app_data.inner.document,
+        );
 
-        let quote = match request.price_quality {
-            PriceQuality::Optimal | PriceQuality::Verified => {
-                let quote = self.optimal_quoter.calculate_quote(params).await?;
-                self.optimal_quoter
-                    .store_quote(quote)
-                    .await
-                    .map_err(CalculateQuoteError::Other)?
-            }
-            PriceQuality::Fast => {
-                let mut quote = self.fast_quoter.calculate_quote(params).await?;
-                // We maintain an API guarantee that fast quotes always have an expiry of zero,
-                // because they're not very accurate and can be considered to
-                // expire immediately.
-                quote.data.expiration = Utc.timestamp_millis_opt(0).unwrap();
-                quote
-            }
-        };
-
-        let adjusted_quote = get_vol_fee_adjusted_quote_data(
-            &quote,
-            &request.side,
-            self.volume_fee.as_ref(),
-            &self.volume_fee_policy,
-            request.buy_token,
-            request.sell_token,
-        )
-        .map_err(|err| OrderQuoteError::CalculateQuote(err.into()))?;
-        let response = OrderQuoteResponse {
-            quote: OrderQuote {
+        Ok((
+            QuoteParameters {
                 sell_token: request.sell_token,
                 buy_token: request.buy_token,
-                receiver: request.receiver,
-                sell_amount: adjusted_quote.sell_amount,
-                buy_amount: adjusted_quote.buy_amount,
-                valid_to,
-                app_data: match &request.app_data {
-                    OrderCreationAppData::Full { full } => OrderCreationAppData::Both {
-                        full: full.clone(),
-                        expected: request.app_data.hash(),
-                    },
-                    app_data => app_data.clone(),
+                side: request.side,
+                verification: Verification {
+                    from: request.from,
+                    receiver: request.receiver,
+                    app_data: Arc::new(app_data.inner.document.clone()),
                 },
-                fee_amount: quote.fee_amount,
-                gas_amount: BigDecimal::from_f64(quote.data.fee_parameters.gas_amount).ok_or(
-                    OrderQuoteError::CalculateQuote(
-                        anyhow::anyhow!("gas_amount is not a valid BigDecimal").into(),
-                    ),
-                )?,
-                gas_price: BigDecimal::from_f64(quote.data.fee_parameters.gas_price).ok_or(
-                    OrderQuoteError::CalculateQuote(
-                        anyhow::anyhow!("gas_price is not a valid BigDecimal").into(),
-                    ),
-                )?,
-                sell_token_price: BigDecimal::from_f64(quote.data.fee_parameters.sell_token_price)
-                    .ok_or(OrderQuoteError::CalculateQuote(
-                        anyhow::anyhow!("sell_token_price is not a valid BigDecimal").into(),
-                    ))?,
-                kind: quote.data.kind,
-                partially_fillable: false,
-                sell_token_balance: request.sell_token_balance,
-                buy_token_balance: request.buy_token_balance,
-                signing_scheme: request.signing_scheme.into(),
+                signing_scheme: request.signing_scheme,
+                hook_gas: app_data.inner.protocol.hooks.gas_limit(),
+                fast_path: matches!(
+                    app_data.inner.protocol.execution_mode,
+                    ::app_data::ExecutionMode::FastPath
+                ),
+                price_quality: request.price_quality,
+                timeout: request.timeout,
             },
-            from: request.from,
-            expiration: quote.data.expiration,
-            id: quote.id,
-            verified: quote.data.verified,
-            protocol_fee_bps: adjusted_quote.protocol_fee_bps,
-        };
-
-        tracing::debug!(?response, "finished computing quote");
-        Ok(response)
+            valid_to,
+        ))
     }
+}
+
+/// Publishes a "calculating quote" event on the event bus so downstream
+/// analytics can correlate quote requests with their price estimates via the
+/// envelope's request id. Carries the app code and token symbols, which the
+/// per-estimator `priceEstimate` events don't have.
+fn emit_quote_requested_event(
+    request: &OrderQuoteRequest,
+    sell_token_symbol: Option<String>,
+    buy_token_symbol: Option<String>,
+    document: &str,
+) {
+    let (kind, in_amount) = request.side.kind_and_amount();
+    let kind = match kind {
+        OrderKind::Sell => DtoOrderKind::Sell,
+        OrderKind::Buy => DtoOrderKind::Buy,
+    };
+
+    let event = QuoteRequestedEvent {
+        query: QueryFields {
+            sell_token: request.sell_token.to_string(),
+            buy_token: request.buy_token.to_string(),
+            in_amount: in_amount.to_string(),
+            kind,
+        },
+        from: request.from.to_string(),
+        // Deliberate second parse: `appCode` lives at the document root, not in
+        // the already-parsed `ProtocolAppData`. Cheap given the 8KB app-data
+        // cap.
+        app_code: ::app_data::app_code(document.as_bytes()),
+        sell_token_symbol,
+        buy_token_symbol,
+        price_quality: match request.price_quality {
+            PriceQuality::Fast => DtoPriceQuality::Fast,
+            PriceQuality::Optimal => DtoPriceQuality::Optimal,
+            PriceQuality::Verified => DtoPriceQuality::Verified,
+        },
+    };
+    observe::event_bus::publish_event(event);
+}
+
+fn build_order_quote_response(
+    request: &OrderQuoteRequest,
+    quote: &Quote,
+    adjusted: &AdjustedQuoteData,
+    id: Option<model::quote::QuoteId>,
+    valid_to: u32,
+) -> Result<OrderQuoteResponse, OrderQuoteError> {
+    Ok(OrderQuoteResponse {
+        quote: OrderQuote {
+            sell_token: request.sell_token,
+            buy_token: request.buy_token,
+            receiver: request.receiver,
+            sell_amount: adjusted.sell_amount,
+            buy_amount: adjusted.buy_amount,
+            valid_to,
+            app_data: match &request.app_data {
+                OrderCreationAppData::Full { full } => OrderCreationAppData::Both {
+                    full: full.clone(),
+                    expected: request.app_data.hash(),
+                },
+                app_data => app_data.clone(),
+            },
+            fee_amount: quote.fee_amount,
+            gas_amount: BigDecimal::from_f64(quote.data.fee_parameters.gas_amount).ok_or(
+                OrderQuoteError::CalculateQuote(
+                    anyhow::anyhow!("gas_amount is not a valid BigDecimal").into(),
+                ),
+            )?,
+            gas_price: BigDecimal::from_f64(quote.data.fee_parameters.gas_price).ok_or(
+                OrderQuoteError::CalculateQuote(
+                    anyhow::anyhow!("gas_price is not a valid BigDecimal").into(),
+                ),
+            )?,
+            sell_token_price: BigDecimal::from_f64(quote.data.fee_parameters.sell_token_price)
+                .ok_or(OrderQuoteError::CalculateQuote(
+                    anyhow::anyhow!("sell_token_price is not a valid BigDecimal").into(),
+                ))?,
+            kind: quote.data.kind,
+            partially_fillable: false,
+            sell_token_balance: request.sell_token_balance,
+            buy_token_balance: request.buy_token_balance,
+            signing_scheme: request.signing_scheme.into(),
+        },
+        from: request.from,
+        expiration: quote.data.expiration,
+        id,
+        verified: quote.data.verified,
+        protocol_fee_bps: adjusted.protocol_fee_bps.clone(),
+    })
 }
 
 /// Calculates the protocol fee based on volume fee and adjusts quote
@@ -206,66 +436,51 @@ fn get_vol_fee_adjusted_quote_data(
     side: &OrderQuoteSide,
     volume_fee: Option<&VolumeFeeConfig>,
     volume_fee_policy: &VolumeFeePolicy,
-    buy_token: alloy::primitives::Address,
-    sell_token: alloy::primitives::Address,
+    buy_token: Address,
+    sell_token: Address,
 ) -> anyhow::Result<AdjustedQuoteData> {
-    let Some(_) = volume_fee.as_ref()
+    let Some(_) = volume_fee
+        .as_ref()
         // Only apply volume fee if effective timestamp has come
-        .filter(|config| config.effective_from_timestamp.is_none_or(|ts| ts <= Utc::now()))
+        .filter(|config| {
+            config
+                .effective_from_timestamp
+                .is_none_or(|ts| ts <= Utc::now())
+        })
     else {
         return Ok(AdjustedQuoteData::unchanged(quote));
     };
 
-    // Determine applicable fee factor considering same-token config and overrides
+    // Determine applicable fee factor considering same-token config and
+    // overrides
     let factor = volume_fee_policy.get_applicable_volume_fee_factor(buy_token, sell_token, None);
 
     let Some(factor) = factor else {
-        return Ok(AdjustedQuoteData {
-            sell_amount: quote.sell_amount,
-            buy_amount: quote.buy_amount,
-            protocol_fee_bps: None,
-        });
+        return Ok(AdjustedQuoteData::unchanged(quote));
     };
-    // Calculate the volume (surplus token amount) to apply fee to
-    // Following driver's logic in
-    // crates/driver/src/domain/competition/solution/fee.rs:189-202:
-    // Use high precision scaling to support sub-basis-point fee factors (e.g., 0.3
-    // BPS)
-    let scaled_factor = U256::from(factor.to_high_precision());
-    let scale = U512::from(FeeFactor::HIGH_PRECISION_SCALE);
     let (adjusted_sell_amount, adjusted_buy_amount) = match side {
         OrderQuoteSide::Sell { .. } => {
-            // For SELL orders, fee is calculated on buy amount
-            let protocol_fee = U256::uint_try_from(
-                quote
-                    .buy_amount
-                    .widening_mul(scaled_factor)
-                    .checked_div(scale)
-                    .ok_or_else(|| anyhow::anyhow!("volume fee calculation division by zero"))?,
+            // apply volume fee by reducing the quoted buy amount by the given
+            // fraction
+            let protocol_fee = shared::fee::compute_volume_fee(quote.buy_amount, factor);
+            (
+                quote.sell_amount,
+                quote.buy_amount.saturating_sub(protocol_fee),
             )
-            .map_err(|_| anyhow::anyhow!("volume fee calculation overflow"))?;
-
-            // Reduce buy amount by protocol fee
-            let adjusted_buy = quote.buy_amount.saturating_sub(protocol_fee);
-
-            (quote.sell_amount, adjusted_buy)
         }
         OrderQuoteSide::Buy { .. } => {
-            // For BUY orders, fee is calculated on sell amount + network fee.
-            // Network fee is already in sell token, so it is added to get the total volume.
+            // apply volume by increasing the quote sell amount by the given
+            // fraction. the API returns sell amount and fee amount
+            // separately and sell amount + fee amount is the value
+            // the user must transfer at least. That's why we
+            // compute the volume fraction from sell+fee but return sell +
+            // volume_fee as the new sell amount.
             let total_sell_volume = quote.sell_amount.saturating_add(quote.fee_amount);
-            let volume_scaled: Uint<512, 8> = total_sell_volume.widening_mul(scaled_factor);
-            let protocol_fee = U256::uint_try_from(
-                volume_scaled
-                    .checked_div(scale)
-                    .ok_or_else(|| anyhow::anyhow!("volume fee calculation division by zero"))?,
+            let protocol_fee = shared::fee::compute_volume_fee(total_sell_volume, factor);
+            (
+                quote.sell_amount.saturating_add(protocol_fee),
+                quote.buy_amount,
             )
-            .map_err(|_| anyhow::anyhow!("volume fee calculation overflow"))?;
-
-            // Increase sell amount by protocol fee
-            let adjusted_sell = quote.sell_amount.saturating_add(protocol_fee);
-
-            (adjusted_sell, quote.buy_amount)
         }
     };
 
@@ -279,6 +494,9 @@ fn get_vol_fee_adjusted_quote_data(
 /// Result from handling a quote request.
 #[derive(Debug, Error)]
 pub enum OrderQuoteError {
+    #[error("{0:?} price quality is not supported for streamed quotes")]
+    UnsupportedPriceQuality(PriceQuality),
+
     #[error("error validating app data: {0:?}")]
     AppData(AppDataValidationError),
 
@@ -306,11 +524,11 @@ mod tests {
     use {
         super::*,
         alloy::primitives::U256,
+        configs::fee_factor::FeeFactor,
         model::quote::OrderQuoteSide,
         number::units::EthUnit,
         shared::{
             fee::VolumeFeePolicy,
-            fee_factor::FeeFactor,
             order_quoting::{Quote, QuoteData},
         },
     };
@@ -349,7 +567,8 @@ mod tests {
             factor: Some(volume_fee),
             effective_from_timestamp: None,
         };
-        let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+        let volume_fee_policy =
+            VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
         // Selling 100 tokens, expecting to buy 100 tokens
         let quote = create_test_quote(100u64.eth(), 100u64.eth());
@@ -391,7 +610,8 @@ mod tests {
             // Effective date in the past to ensure fee is applied
             effective_from_timestamp: Some(past_timestamp),
         };
-        let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+        let volume_fee_policy =
+            VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
         // Buying 100 tokens, expecting to sell 100 tokens, with no network fee
         let quote = create_test_quote(100u64.eth(), 100u64.eth());
@@ -416,8 +636,8 @@ mod tests {
         assert_eq!(result.buy_amount, 100u64.eth());
         assert_eq!(result.protocol_fee_bps, Some("2".to_string()));
 
-        // sell_amount should be increased by 0.02% of sell_amount (no network fee)
-        // Expected: 100 + (100 * 0.0002) = 100 + 0.02 = 100.02
+        // sell_amount should be increased by 0.02% of sell_amount (no network
+        // fee) Expected: 100 + (100 * 0.0002) = 100 + 0.02 = 100.02
         let expected_sell = 100u64.eth() + (100u64.eth() / U256::from(5000)); // 0.02% = 1/5000
         assert_eq!(result.sell_amount, expected_sell);
     }
@@ -429,9 +649,11 @@ mod tests {
             factor: Some(volume_fee),
             effective_from_timestamp: None,
         };
-        let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+        let volume_fee_policy =
+            VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
-        // Buying 100 tokens, expecting to sell 100 tokens, with 5 token network fee
+        // Buying 100 tokens, expecting to sell 100 tokens, with 5 token network
+        // fee
         let mut quote = create_test_quote(100u64.eth(), 100u64.eth());
         quote.fee_amount = 5u64.eth(); // Network fee in sell token
         let side = OrderQuoteSide::Buy {
@@ -472,7 +694,8 @@ mod tests {
             factor: Some(volume_fee),
             effective_from_timestamp: None,
         };
-        let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+        let volume_fee_policy =
+            VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
         // Selling 100 tokens, expecting to buy 200 tokens (2:1 price ratio)
         let quote = create_test_quote(100u64.eth(), 200u64.eth());
@@ -516,7 +739,8 @@ mod tests {
                 factor: Some(volume_fee),
                 effective_from_timestamp: None,
             };
-            let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+            let volume_fee_policy =
+                VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
             let quote = create_test_quote(100u64.eth(), 100u64.eth());
             let side = OrderQuoteSide::Sell {
@@ -547,7 +771,8 @@ mod tests {
             factor: Some(volume_fee),
             effective_from_timestamp: Some(future_timestamp),
         };
-        let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+        let volume_fee_policy =
+            VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
         // Selling 100 tokens, expecting to buy 100 tokens
         let quote = create_test_quote(100u64.eth(), 100u64.eth());
@@ -567,7 +792,8 @@ mod tests {
         )
         .unwrap();
 
-        // Since the effective date is in the future, no volume fee should be applied
+        // Since the effective date is in the future, no volume fee should be
+        // applied
         assert_eq!(result.sell_amount, 100u64.eth());
         assert_eq!(result.buy_amount, 100u64.eth());
         assert_eq!(result.protocol_fee_bps, None);
@@ -581,7 +807,8 @@ mod tests {
             factor: Some(volume_fee),
             effective_from_timestamp: None,
         };
-        let volume_fee_policy = VolumeFeePolicy::new(vec![], Some(volume_fee), false);
+        let volume_fee_policy =
+            VolumeFeePolicy::new(vec![], Some(volume_fee), false, Default::default());
 
         // Large amount to make the sub-BPS fee visible
         let sell_amount = 1_000_000u64.eth();

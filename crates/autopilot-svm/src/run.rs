@@ -1,0 +1,251 @@
+//! Autopilot entry point wiring.
+
+use {
+    crate::{
+        domain::{arbitrator::SolanaArbitrator, fee::ProtocolFees},
+        infra::{
+            api,
+            cleanup,
+            competition::DriverCompetition,
+            config::{self, Config},
+            db,
+            driver::Driver,
+            executor::DriverExecutor,
+            listen::ListenSession,
+            observation::SettlementWindows,
+            observer::CompetitionObserver,
+            prices::NativePrices,
+            provider::DbAuctionProvider,
+            sponsor::Sponsor,
+            trigger::SlotTrigger,
+        },
+        run_loop::{AuctionLoop, Probes},
+    },
+    chain_types::solana::Pubkey,
+    clap::Parser,
+    cow_solana_rpc::{CommitmentConfig, SolanaRPC},
+    database::leader_pg_lock::LeaderLock,
+    observe::metrics::LivenessChecking,
+    sqlx::postgres::PgPoolOptions,
+    std::{
+        net::SocketAddr,
+        path::PathBuf,
+        sync::{Arc, RwLock, atomic::AtomicBool},
+        time::{Duration, Instant},
+    },
+    tokio_util::sync::CancellationToken,
+};
+
+/// How long startup waits for the first slot before skipping the sweep of
+/// windows a previous process left behind.
+const STARTUP_SWEEP_WAIT: Duration = Duration::from_secs(10);
+
+/// Fails the liveness probe when the auction loop makes no auction in
+/// `max_auction_age`.
+pub struct Liveness {
+    max_auction_age: Duration,
+    last_auction: RwLock<Instant>,
+}
+
+impl Liveness {
+    pub fn new(max_auction_age: Duration) -> Self {
+        Self {
+            max_auction_age,
+            last_auction: RwLock::new(Instant::now()),
+        }
+    }
+
+    /// Records an auction, or a cut that found no order for one.
+    pub fn auction(&self) {
+        *self.last_auction.write().unwrap() = Instant::now();
+    }
+}
+
+#[async_trait::async_trait]
+impl LivenessChecking for Liveness {
+    async fn is_alive(&self) -> bool {
+        self.last_auction.read().unwrap().elapsed() <= self.max_auction_age
+    }
+}
+
+/// The Solana autopilot command line arguments.
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
+pub struct Args {
+    /// Path to the TOML configuration file.
+    #[arg(long, env)]
+    config: PathBuf,
+}
+
+/// The autopilot entry point. Parses command line arguments and runs until a
+/// shutdown signal.
+pub async fn start(args: impl Iterator<Item = String>) {
+    let args = Args::parse_from(args);
+    let config = config::load(&args.config).await;
+    observe::panic_hook::install();
+    observe::tracing::init::initialize_reentrant(&config.observe_config());
+    let version = observe::version::git_version();
+    tracing::info!(%version, "running solana autopilot");
+    run(config).await
+}
+
+async fn run(config: Config) {
+    // The autopilot writes settlement executions, so the pool always points
+    // at the write URL.
+    let pool = PgPoolOptions::new()
+        .max_connections(config.database.max_connections.get())
+        .connect(config.database.write_url.as_str())
+        .await
+        .expect("database connection");
+    db::spawn_table_rows_metric(pool.clone());
+    cleanup::spawn(pool.clone(), config.db_cleanup);
+
+    let rpc = SolanaRPC::new_with_timeout_and_commitment(
+        &config.rpc.endpoint,
+        config.rpc.request_timeout,
+        CommitmentConfig::confirmed(),
+        "slot_trigger",
+    );
+    let trigger = SlotTrigger::new(rpc, config.min_auction_interval);
+
+    let windows = SettlementWindows::new(pool.clone(), trigger.tip(), config.max_indexer_lag_slots);
+    let listen = ListenSession::spawn(
+        pool.clone(),
+        db::SETTLEMENT_FINALIZED_CHANNEL,
+        windows.clone(),
+    );
+    // Windows a previous process dispatched lost their timeout waiters with
+    // it. Sweep the overdue ones once the poller reports a slot.
+    match tokio::time::timeout(STARTUP_SWEEP_WAIT, trigger.tip().wait_for(|slot| *slot > 0)).await {
+        Ok(Ok(slot)) => {
+            let slot = *slot;
+            if let Err(err) = windows.expire_past_deadline(slot).await {
+                tracing::warn!(?err, "the startup window sweep failed");
+            }
+        }
+        _ => tracing::warn!("no slot observed at startup, skipping the window sweep"),
+    }
+
+    let drivers: Vec<Arc<Driver>> = config
+        .drivers
+        .iter()
+        .map(|driver| Arc::new(Driver::new(driver.name.clone(), &driver.url)))
+        .collect();
+
+    let sponsor = match &config.sponsoring {
+        Some(sponsoring) => {
+            let signer = sponsoring
+                .funder
+                .load()
+                .await
+                .expect("load the funder signer");
+            tracing::info!(funder = %signer.pubkey(), "loaded the funder signer");
+            Some(Arc::new(Sponsor::new(
+                signer,
+                SolanaRPC::new_with_timeout_and_commitment(
+                    &config.rpc.endpoint,
+                    config.rpc.request_timeout,
+                    CommitmentConfig::confirmed(),
+                    "sponsoring",
+                ),
+                pool.clone(),
+                sponsoring.max_displaced_creations,
+            )))
+        }
+        None => None,
+    };
+
+    let prices = NativePrices::new(
+        &config.native_prices,
+        SolanaRPC::new_with_timeout_and_commitment(
+            &config.rpc.endpoint,
+            config.rpc.request_timeout,
+            CommitmentConfig::confirmed(),
+            "native_prices",
+        ),
+        config.contracts.wrapped_native_mint,
+    );
+    let forward_prices = !matches!(prices, NativePrices::Denominated);
+    let api = api::serve(
+        tokio::net::TcpListener::bind(config.api_address)
+            .await
+            .expect("bind the HTTP API"),
+        prices.clone(),
+    );
+    let leader_lock = config.enable_leader_lock.then(|| {
+        LeaderLock::new(
+            pool.clone(),
+            "solana_autopilot".to_string(),
+            Duration::from_millis(200),
+        )
+    });
+    let liveness = Arc::new(Liveness::new(config.max_auction_age));
+    let startup = Arc::new(Some(AtomicBool::new(false)));
+    let auction_loop = AuctionLoop::new(
+        Box::new(trigger),
+        Box::new(DbAuctionProvider::new(
+            pool.clone(),
+            SolanaRPC::new_with_timeout_and_commitment(
+                &config.rpc.endpoint,
+                config.rpc.request_timeout,
+                CommitmentConfig::confirmed(),
+                "auction_provider",
+            ),
+            config.max_indexer_lag_slots,
+            prices,
+            config.contracts.state_pda(),
+            ProtocolFees::new(config.fee_policies.clone()),
+        )),
+        Box::new(DriverCompetition::new(
+            drivers.clone(),
+            config.competition.solve_deadline,
+            forward_prices,
+        )),
+        Box::new(SolanaArbitrator::new(
+            config.competition.max_winners.get(),
+            Pubkey(config.contracts.wrapped_native_mint.to_bytes()),
+        )),
+        Box::new(DriverExecutor::new(drivers, windows.clone(), sponsor)),
+        Box::new(CompetitionObserver::new(pool, windows)),
+        config.competition.submission_deadline_slots.get(),
+        Probes {
+            liveness: liveness.clone(),
+            startup: startup.clone(),
+        },
+    );
+    let metrics = observe::metrics::serve_metrics(
+        liveness,
+        SocketAddr::from(([0, 0, 0, 0], config.metrics_port)),
+        Default::default(),
+        startup,
+    );
+    let shutdown = CancellationToken::new();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            observe::shutdown::shutdown_signal().await;
+            tracing::info!("shutting down");
+            shutdown.cancel();
+        }
+    });
+    let cycles = auction_loop.run_forever(leader_lock, shutdown);
+
+    // The servers and the listen session never end on their own, so an end
+    // means the task panicked. They keep serving while the auction loop
+    // finishes its last cycle.
+    tokio::select! {
+        () = cycles => (),
+        _ = metrics => panic!("metrics server stopped"),
+        result = api => panic!("HTTP API server stopped: {result:?}"),
+        _ = listen => panic!("settlement listen session stopped"),
+    }
+}
+
+#[cfg(test)]
+impl Liveness {
+    /// Makes the probe fail until the next auction.
+    pub(crate) fn expire(&self) {
+        *self.last_auction.write().unwrap() =
+            Instant::now() - self.max_auction_age - Duration::from_secs(1);
+    }
+}

@@ -1,31 +1,35 @@
+pub use simulator::encoding::WrapperCall;
 use {
-    self::trade::{ClearingPrices, Fee, Fulfillment},
+    self::trade::{ClearingPrices, Fulfillment},
     super::auction,
     crate::{
         boundary,
         domain::{
+            self,
             competition::{self, order},
-            eth::{self, Flashloan, TokenAddress},
         },
         infra::{
-            Simulator,
             blockchain::{self, Ethereum},
-            config::file::FeeHandler,
-            simulator,
-            solver::{ManageNativeToken, Solver},
+            solver::Solver,
         },
     },
     alloy::{
         network::TxSigner,
-        primitives::{map::B256HashMap, B256},
+        primitives::{B256, map::B256HashMap},
         rpc::types::state::{AccountOverride, StateOverride},
     },
     chrono::Utc,
+    contracts::ERC20::ERC20,
+    eth_domain_types::{self as eth, TokenAddress},
     futures::future::try_join_all,
     itertools::Itertools,
     num::{BigRational, One},
-    number::conversions::{big_rational_to_u256, u256_to_big_int, u256_to_big_rational},
-    solvers_dto::solution::StateOverrideBlock,
+    number::{
+        conversions::{big_rational_to_u256, u256_to_big_int, u256_to_big_rational},
+        u256_ext::U256Ext,
+    },
+    simulator::{self, Simulator},
+    solvers_dto::solution::{Flashloan, StateOverrideBlock},
     std::{
         collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
         sync::atomic::{AtomicU64, Ordering},
@@ -100,10 +104,10 @@ fn merge_account_override(
 
     merge_storage_override(&mut lhs.state, &rhs.state)?;
     merge_storage_override(&mut lhs.state_diff, &rhs.state_diff)?;
-    if let Some(state) = &mut lhs.state {
-        if let Some(state_diff) = lhs.state_diff.take() {
-            merge_storage_map(state, &state_diff)?;
-        }
+    if let Some(state) = &mut lhs.state
+        && let Some(state_diff) = lhs.state_diff.take()
+    {
+        merge_storage_map(state, &state_diff)?;
     }
 
     Ok(())
@@ -165,7 +169,7 @@ fn merge_storage_map(
 
 fn canonicalize_prices(
     prices: Prices,
-    weth: eth::WethAddress,
+    weth: eth::WrappedNativeToken,
 ) -> Result<Prices, error::Solution> {
     let mut canonicalized = HashMap::with_capacity(prices.len());
     for (token, price) in prices {
@@ -188,12 +192,6 @@ fn canonicalize_prices(
     Ok(canonicalized)
 }
 
-#[derive(Clone)]
-pub struct WrapperCall {
-    pub address: eth::Address,
-    pub data: Vec<u8>,
-}
-
 // TODO Add a constructor and ensure that the clearing prices are included for
 // each trade
 /// A solution represents a set of orders which the solver has found an optimal
@@ -205,16 +203,17 @@ pub struct Solution {
     pub trades: Vec<Trade>,
     pub prices: Prices,
     #[debug(ignore)]
-    pub pre_interactions: Vec<eth::Interaction>,
+    pub pre_interactions: Vec<domain::Interaction>,
     #[debug(ignore)]
     pub interactions: Vec<Interaction>,
     #[debug(ignore)]
-    pub post_interactions: Vec<eth::Interaction>,
+    pub post_interactions: Vec<domain::Interaction>,
     #[debug("{}", solver.name())]
     pub solver: Solver,
     #[debug(ignore)]
-    pub weth: eth::WethAddress,
+    pub weth: eth::WrappedNativeToken,
     pub gas: Option<eth::Gas>,
+    gas_fee_override: Option<GasFeeOverride>,
     #[debug(ignore)]
     pub state_overrides: Option<StateOverride>,
     pub state_overrides_block: Option<StateOverrideBlock>,
@@ -225,31 +224,93 @@ pub struct Solution {
     pub wrappers: Vec<WrapperCall>,
 }
 
+/// Gas fee overrides provided by the solver, used instead of the driver's
+/// own gas price estimation during settlement submission.
+///
+/// Note: the driver may raise these values above what the solver specified
+/// if a pending replacement transaction requires a higher gas price (a node
+/// requirement for transaction replacement).
+#[derive(Clone, Copy, Debug)]
+pub struct GasFeeOverride {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+/// The sell/buy amounts a fast-path order was quoted and signed at. The cached
+/// solution must fill at least as well as these for the fast path to proceed.
+#[derive(Clone, Copy, Debug)]
+pub struct LimitPrices {
+    pub sell: eth::U256,
+    pub buy: eth::U256,
+}
+
+/// Whether `order` describes the same trade as `quoted`: same tokens, side and
+/// target amount. Native ETH and WETH are treated as the same token: the
+/// orderbook rewrites buy-ETH quote requests to WETH before they hit the
+/// driver, so a cached fast-path solution's order holds WETH while the signed
+/// order carried into `/settle_fast_path` still carries the ETH marker.
+fn compare_orders(
+    order: &competition::Order,
+    quoted: &competition::Order,
+    weth: eth::WrappedNativeToken,
+) -> bool {
+    order.buy.token.as_erc20(weth) == quoted.buy.token.as_erc20(weth)
+        // only the BUY side has a sentinel value for ETH so sell tokens
+        // get compared as they are
+        && order.sell.token == quoted.sell.token
+        && order.side == quoted.side
+        && order.target() == quoted.target()
+}
+
+fn recover_flashloans_and_wrappers(
+    order: &competition::Order,
+) -> (HashMap<order::Uid, Flashloan>, Vec<WrapperCall>) {
+    let flashloans = order
+        .app_data
+        .flashloan()
+        .map(|f| {
+            let flashloan = domain::flashloan::Flashloan::from(f);
+            (order.uid, (&flashloan).into())
+        })
+        .into_iter()
+        .collect();
+    let wrappers = order
+        .app_data
+        .wrappers()
+        .iter()
+        .map(|w| WrapperCall {
+            address: w.address,
+            data: w.data.clone().into(),
+        })
+        .collect();
+    (flashloans, wrappers)
+}
+
 impl Solution {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: Id,
         mut trades: Vec<Trade>,
         prices: Prices,
-        pre_interactions: Vec<eth::Interaction>,
+        pre_interactions: Vec<domain::Interaction>,
         interactions: Vec<Interaction>,
-        post_interactions: Vec<eth::Interaction>,
+        post_interactions: Vec<domain::Interaction>,
         solver: Solver,
-        weth: eth::WethAddress,
+        weth: eth::WrappedNativeToken,
         gas: Option<eth::Gas>,
         state_overrides: Option<StateOverride>,
         state_overrides_block: Option<StateOverrideBlock>,
-        fee_handler: FeeHandler,
+        gas_fee_override: Option<GasFeeOverride>,
         surplus_capturing_jit_order_owners: &HashSet<eth::Address>,
         flashloans: HashMap<order::Uid, Flashloan>,
         wrappers: Vec<WrapperCall>,
     ) -> Result<Self, error::Solution> {
         let prices = canonicalize_prices(prices, weth)?;
 
-        // Surplus capturing JIT orders behave like Fulfillment orders. They capture
-        // surplus, pay network fees and contribute to score of a solution.
-        // To make sure that all the same logic and checks get applied we convert them
-        // right away.
+        // Surplus capturing JIT orders behave like Fulfillment orders. They
+        // capture surplus, pay network fees and contribute to score of
+        // a solution. To make sure that all the same logic and checks
+        // get applied we convert them right away.
         for trade in &mut trades {
             let Trade::Jit(jit) = trade else { continue };
             if !surplus_capturing_jit_order_owners.contains(&jit.order().signature.signer) {
@@ -259,31 +320,30 @@ impl Solution {
             *trade = Trade::Fulfillment(
                 Fulfillment::new(
                     competition::Order {
-                        uid: jit.order().uid,
-                        kind: order::Kind::Limit,
-                        side: jit.order().side,
-                        sell: jit.order().sell,
-                        buy: jit.order().buy,
-                        signature: jit.order().signature.clone(),
-                        receiver: Some(jit.order().receiver),
-                        created: u32::try_from(Utc::now().timestamp())
-                            .unwrap_or(u32::MIN)
-                            .into(),
-                        valid_to: jit.order().valid_to,
+                        data: std::sync::Arc::new(order::OrderData {
+                            uid: jit.order().uid,
+                            side: jit.order().side,
+                            sell: jit.order().sell,
+                            buy: jit.order().buy,
+                            signature: jit.order().signature.clone(),
+                            receiver: jit.order().receiver,
+                            created: u32::try_from(Utc::now().timestamp())
+                                .unwrap_or(u32::MIN)
+                                .into(),
+                            valid_to: jit.order().valid_to,
+                            pre_interactions: vec![],
+                            post_interactions: vec![],
+                            sell_token_balance: jit.order().sell_token_balance,
+                            buy_token_balance: jit.order().buy_token_balance,
+                            protocol_fees: vec![],
+                            quote: None,
+                            penalty_cap_native: None,
+                        }),
                         app_data: jit.order().app_data.into(),
                         partial: jit.order().partially_fillable(),
-                        pre_interactions: vec![],
-                        post_interactions: vec![],
-                        sell_token_balance: jit.order().sell_token_balance,
-                        buy_token_balance: jit.order().buy_token_balance,
-                        protocol_fees: vec![],
-                        quote: None,
                     },
                     jit.executed(),
-                    Fee::Dynamic(jit.fee()),
-                    // JIT orders don't get haircut because they supply private
-                    // liquidity which should not prone to negative slippage.
-                    eth::U256::ZERO,
+                    jit.fee(),
                 )
                 .map_err(error::Solution::InvalidJitTrade)?,
             );
@@ -306,36 +366,26 @@ impl Solution {
             state_overrides,
             state_overrides_block,
             simulation_context: None,
+            gas_fee_override,
             flashloans,
             wrappers,
         };
 
         // Check that the solution includes clearing prices for all user trades.
-        if solution.user_trades().any(|trade| {
+        if let Some(trade) = solution.user_trades().find(|trade| {
             solution.clearing_price(trade.order().sell.token).is_none()
                 || solution.clearing_price(trade.order().buy.token).is_none()
         }) {
-            let trade = solution
-                .user_trades()
-                .find(|trade| {
-                    solution.clearing_price(trade.order().sell.token).is_none()
-                        || solution.clearing_price(trade.order().buy.token).is_none()
-                })
-                .expect("there should be a trade without clearing price");
             let sell_price = solution.clearing_price(trade.order().sell.token);
             let buy_price = solution.clearing_price(trade.order().buy.token);
             return Err(error::Solution::InvalidClearingPrices(
-                trade.clone(),
+                Box::new(trade.clone()),
                 sell_price,
                 buy_price,
             ));
         }
 
-        // Apply protocol fees only if the drivers is set to handler the fees
-        if fee_handler != FeeHandler::Driver {
-            return Ok(solution);
-        }
-
+        // Apply the protocol and partner fees to every fulfillment.
         let mut trades = Vec::with_capacity(solution.trades.len());
         for trade in solution.trades {
             match &trade {
@@ -346,7 +396,8 @@ impl Solution {
                         buy: solution.prices
                             [&fulfillment.order().buy.token.as_erc20(solution.weth)],
                     };
-                    let fulfillment = fulfillment.with_protocol_fees(prices)?;
+                    let fulfillment = fulfillment
+                        .with_driver_fees(prices, solution.solver.config().fee_handler)?;
                     trades.push(Trade::Fulfillment(fulfillment))
                 }
                 Trade::Jit(_) => trades.push(trade),
@@ -387,11 +438,11 @@ impl Solution {
         &self.interactions
     }
 
-    pub fn pre_interactions(&self) -> &[eth::Interaction] {
+    pub fn pre_interactions(&self) -> &[domain::Interaction] {
         &self.pre_interactions
     }
 
-    pub fn post_interactions(&self) -> &[eth::Interaction] {
+    pub fn post_interactions(&self) -> &[domain::Interaction] {
         &self.post_interactions
     }
 
@@ -400,8 +451,24 @@ impl Solution {
         &self.solver
     }
 
+    pub fn revertable(&self) -> bool {
+        self.interactions()
+            .iter()
+            .any(|interaction| !interaction.internalize())
+            || self.user_trades().any(|trade| {
+                matches!(
+                    trade.order().signature.scheme,
+                    order::signature::Scheme::Eip1271
+                )
+            })
+    }
+
     pub fn gas(&self) -> Option<eth::Gas> {
         self.gas
+    }
+
+    pub fn gas_fee_override(&self) -> Option<GasFeeOverride> {
+        self.gas_fee_override
     }
 
     fn trade_count_for_scorable(
@@ -427,8 +494,8 @@ impl Solution {
         for trade in self.trades().iter().filter(|trade| {
             self.trade_count_for_scorable(trade, surplus_capturing_jit_order_owners)
         }) {
-            // Solver generated fulfillment does not include the fee in the executed amount
-            // for sell orders.
+            // Solver generated fulfillment does not include the fee in the
+            // executed amount for sell orders.
             let executed = match trade.side() {
                 order::Side::Sell => (trade.executed().0 + trade.fee().0).into(),
                 order::Side::Buy => trade.executed(),
@@ -444,11 +511,15 @@ impl Solution {
                     .ok_or(error::Scoring::InvalidClearingPrices)?,
             };
             trades.push(scoring::Trade::new(
+                trade.uid(),
                 sell,
                 buy,
                 trade.side(),
                 executed,
                 trade.custom_prices(&uniform_prices)?,
+                // Every policy is passed on, including the ones that do not
+                // count towards the score: scoring needs them to reconstruct
+                // the prices the earlier policies were applied at.
                 trade.protocol_fees(),
             ))
         }
@@ -457,25 +528,53 @@ impl Solution {
     }
 
     /// Approval interactions necessary for encoding the settlement.
+    /// To support tokens like USDT which first need to have their allowance
+    /// set to 0 before it can be set to the desired value we simulate each
+    /// `approve()` call and inject additional `approve(0)` interactions when
+    /// we encounter a revert.
+    /// Whenever the needed allowance is less the current allowance no
+    /// `approve()` interactions get encoded to save on gas.
+    /// See <https://github.com/ethereum/EIPs/issues/20#issuecomment-263524729>
     pub async fn approvals(
         &self,
         eth: &Ethereum,
         internalization: settlement::Internalization,
-    ) -> Result<impl Iterator<Item = eth::allowance::Approval> + use<>, Error> {
-        // Allowances belong to the contract executing interactions, not the submission proxy.
-        let settlement_contract = &eth.contracts().orig_settlement();
+    ) -> Result<impl Iterator<Item = eth::allowance::Approval> + use<>, blockchain::Error> {
+        let settlement_contract = *eth.contracts().orig_settlement().address();
         let allowances =
             try_join_all(self.allowances(internalization).map(|required| async move {
-                eth.erc20(required.0.token)
-                    .allowance(*settlement_contract.address(), required.0.spender)
+                let erc20_token = ERC20::new(required.0.token.into(), &eth.web3().provider);
+
+                let current_allowance = erc20_token
+                    .allowance(settlement_contract, required.0.spender)
+                    .call()
+                    .await?;
+
+                // if the current allowance is sufficient we can skip that
+                // interaction
+                if current_allowance >= required.0.amount {
+                    return Ok::<_, blockchain::Error>(vec![]);
+                }
+
+                let regular_approval_succeeds = erc20_token
+                    .approve(required.0.spender, required.0.amount)
+                    .from(settlement_contract)
+                    .call()
                     .await
-                    .map(|existing| (required, existing))
+                    .is_ok();
+
+                let approval = eth::allowance::Approval(required.0);
+                if regular_approval_succeeds {
+                    Ok(vec![approval])
+                } else {
+                    // setting the desired approval reverts so we assume we are
+                    // dealing with a USDT-like token that needs to have the
+                    // approval reset to 0 first
+                    Ok(vec![approval.revoke(), approval])
+                }
             }))
             .await?;
-        let approvals = allowances
-            .into_iter()
-            .filter_map(|(required, existing)| required.approval(&existing));
-        Ok(approvals)
+        Ok(allowances.into_iter().flatten())
     }
 
     /// An empty solution has no trades which is allowed to capture surplus and
@@ -497,14 +596,15 @@ impl Solution {
             return Err(error::Merge::Incompatible("Solvers"));
         }
 
-        // External-state solutions are valid for one exact block context. The generic
-        // solution merger has no resource-aware semantics for combining such contexts.
+        // External-state solutions are valid for one exact block context. The
+        // generic solution merger has no resource-aware semantics for combining
+        // such contexts.
         if self.simulation_context.is_some() || other.simulation_context.is_some() {
             return Err(error::Merge::Incompatible("simulation contexts"));
         }
 
-        // Skip merging the solutions if the expected merged solution has more orders
-        // than allowed
+        // Skip merging the solutions if the expected merged solution has more
+        // orders than allowed
         if self.trades.len() + other.trades().len() > max_orders_per_merged_solution {
             return Err(error::Merge::MoreOrdersThanAllowed);
         }
@@ -516,8 +616,9 @@ impl Solution {
             return Err(error::Merge::DuplicateTrade);
         }
 
-        // Solution prices need to be congruent, i.e. there needs to be a unique factor
-        // to scale all common tokens from one solution into the other.
+        // Solution prices need to be congruent, i.e. there needs to be a unique
+        // factor to scale all common tokens from one solution into the
+        // other.
         let factor =
             scaling_factor(&self.prices, &other.prices).ok_or(error::Merge::IncongruentPrices)?;
 
@@ -533,7 +634,8 @@ impl Solution {
                 .map_err(error::Merge::Math)?;
             match prices.entry(*token) {
                 Entry::Occupied(entry) => {
-                    // This shouldn't fail unless there are rounding errors given that the scaling
+                    // This shouldn't fail unless there are rounding errors
+                    // given that the scaling
                     // factor is unique
                     if *entry.get() != scaled {
                         return Err(error::Merge::IncongruentPrices);
@@ -550,8 +652,10 @@ impl Solution {
             merged.extend(other.flashloans.clone());
             merged
         };
-        let state_overrides =
-            merge_state_overrides(self.state_overrides.as_ref(), other.state_overrides.as_ref())?;
+        let state_overrides = merge_state_overrides(
+            self.state_overrides.as_ref(),
+            other.state_overrides.as_ref(),
+        )?;
         let state_overrides_block =
             merge_state_override_blocks(self.state_overrides_block, other.state_overrides_block)?;
 
@@ -583,12 +687,16 @@ impl Solution {
             state_overrides,
             state_overrides_block,
             simulation_context: None,
+            // Gas fee overrides are per-solution; no meaningful way to merge
+            // them.
+            gas_fee_override: None,
             flashloans,
             wrappers: self.wrappers.clone(),
         })
     }
 
-    /// Attach trusted external state after converting and validating a solver DTO.
+    /// Attach trusted external state after converting and validating a solver
+    /// DTO.
     ///
     /// Raw solver-provided overrides must not be promoted into this context.
     pub fn set_simulation_context(
@@ -608,6 +716,36 @@ impl Solution {
 
     pub fn simulation_context(&self) -> Option<&SimulationContext> {
         self.simulation_context.as_ref()
+    }
+
+    pub(crate) async fn simulate_gas(
+        &self,
+        tx: eth::Tx,
+        eth: &Ethereum,
+        simulator: &Simulator,
+    ) -> Result<eth::Gas, simulator::Error> {
+        let block = self
+            .simulation_context()
+            .map(SimulationContext::base_number)
+            .unwrap_or_else(|| eth.current_block().borrow().number)
+            .into();
+        let result = if let Some(context) = self.simulation_context() {
+            eth.estimate_gas_with_simulation_context(tx.clone(), context)
+                .await
+        } else if self.state_overrides.is_some() || self.state_overrides_block.is_some() {
+            if let Some(gas) = simulator.fixed_gas() {
+                return Ok(gas);
+            }
+            eth.estimate_gas_with_state_overrides(
+                tx.clone(),
+                self.state_overrides.as_ref(),
+                self.state_overrides_block,
+            )
+            .await
+        } else {
+            return simulator.gas(tx).await;
+        };
+        result.map_err(|err| err.into_simulator_error(tx, block))
     }
 
     /// Return the trades which fulfill non-liquidity auction orders. These are
@@ -657,28 +795,123 @@ impl Solution {
 
     /// Encode the solution into a [`Settlement`], which can be used to execute
     /// the solution onchain.
+    pub async fn prepare(
+        self,
+        auction: &competition::Auction,
+        eth: &Ethereum,
+        simulator: &Simulator,
+    ) -> Result<Settlement, Error> {
+        let native = self.solver().solver_native_token();
+        self.encode(auction, eth, simulator, native).await
+    }
+
     pub async fn encode(
         self,
         auction: &competition::Auction,
         eth: &Ethereum,
         simulator: &Simulator,
-        solver_native_token: ManageNativeToken,
+        native: crate::infra::solver::ManageNativeToken,
     ) -> Result<Settlement, Error> {
         let sender = self.solver().address();
-        self.encode_from(auction, eth, simulator, solver_native_token, sender).await
+        self.encode_from(auction, eth, simulator, native, sender)
+            .await
     }
 
-    /// Encode and validate using the actual funded transaction sender, without
-    /// changing the solver identity, prices, trades or interactions.
     pub async fn encode_from(
         self,
         auction: &competition::Auction,
         eth: &Ethereum,
         simulator: &Simulator,
-        solver_native_token: ManageNativeToken,
+        native: crate::infra::solver::ManageNativeToken,
         sender: eth::Address,
     ) -> Result<Settlement, Error> {
-        Settlement::encode(self, auction, eth, simulator, solver_native_token, sender).await
+        let auction_id = auction.auction_id().ok_or(Error::MissingAuctionId)?;
+        Settlement::new(self, auction, auction_id, eth, simulator, native, sender).await
+    }
+
+    /// Swap this quote solution's single user order for the real signed
+    /// `order`, pin the fill to the signed limit, and recover the order's
+    /// flashloans/wrappers from its app-data.
+    pub fn finalize_fast_path_solution(
+        &self,
+        order: competition::Order,
+        limit_prices: LimitPrices,
+    ) -> Result<Self, error::Error> {
+        let mut solution = self.clone();
+        let Ok(user) = solution
+            .trades
+            .iter_mut()
+            .filter_map(|trade| match trade {
+                Trade::Fulfillment(fulfillment) => Some(fulfillment),
+                Trade::Jit(_) => None,
+            })
+            .exactly_one()
+        else {
+            return Err(error::Error::FastPathTradeCount(self.user_trades().count()));
+        };
+
+        if !compare_orders(&order, user.order(), self.weth) {
+            return Err(error::Error::FastPathOrderMismatch);
+        }
+
+        let clearing = ClearingPrices {
+            sell: self
+                .clearing_price(order.sell.token)
+                .ok_or(error::Error::FastPathOrderMismatch)?,
+            buy: self
+                .clearing_price(order.buy.token)
+                .ok_or(error::Error::FastPathOrderMismatch)?,
+        };
+        // This solution was cached from a quote request. If there is a bug
+        // that causes the autopilot to tell us to settle an order with at a
+        // price our original solution cannot support we want to detect that
+        // and throw an error instead of submitting a transaction that will
+        // ultimately revert.
+        // This should not happen but let's check just to be sure.
+        let within_limit = match order.side {
+            order::Side::Sell => {
+                let sell_amount = order.sell.amount.0;
+                let projected_buy_amount = sell_amount
+                    .checked_mul(clearing.sell)
+                    .ok_or(error::Math::Overflow)?
+                    .checked_ceil_div(&clearing.buy)
+                    .ok_or(error::Math::DivisionByZero)?;
+                projected_buy_amount >= limit_prices.buy
+            }
+            order::Side::Buy => {
+                let buy_amount = order.buy.amount.0;
+                let projected_sell_amount = buy_amount
+                    .checked_mul(clearing.buy)
+                    .ok_or(error::Math::Overflow)?
+                    .checked_ceil_div(&clearing.sell)
+                    .ok_or(error::Math::DivisionByZero)?;
+                projected_sell_amount <= limit_prices.sell
+            }
+        };
+        if !within_limit {
+            return Err(error::Error::FastPathLimitNotMet);
+        }
+
+        // Fast-path orders are fill-or-kill and shouldn't contain any fees. In
+        // the case the solver charges a solver fee this should have been
+        // reflected in the quote and thus in the signed limit prices already.
+        let executed = order.target();
+        *user = Fulfillment::new(order, executed, Default::default())?;
+
+        // However, limit prices may be different than the ones found in the
+        // quote, because the orderbook adds room for network and
+        // protocol fees. Update the solution accordingly.
+        let sell = user.order().sell.token.as_erc20(self.weth);
+        let buy = user.order().buy.token.as_erc20(self.weth);
+        solution.prices.insert(sell, limit_prices.buy);
+        solution.prices.insert(buy, limit_prices.sell);
+
+        // Add other parts the quote might not have known about
+        let (flashloans, wrappers) = recover_flashloans_and_wrappers(user.order());
+        solution.flashloans = flashloans;
+        solution.wrappers = wrappers;
+
+        Ok(solution)
     }
 
     /// Token prices settled by this solution, expressed using an arbitrary
@@ -691,29 +924,31 @@ impl Solution {
         let prices = self.prices.clone();
 
         if self.user_trades().any(|trade| trade.order().buys_eth()) {
-            // The solution contains an order which buys ETH. Solvers only produce solutions
-            // for ERC20 tokens, while the driver adds special [`Interaction`]s to
-            // wrap/unwrap the ETH tokens into WETH, and sends orders to the solver with
-            // WETH instead of ETH. Once the driver receives the solution which fulfills an
-            // ETH order, a clearing price for ETH needs to be added, equal to the
-            // WETH clearing price.
+            // The solution contains an order which buys ETH. Solvers only
+            // produce solutions for ERC20 tokens, while the driver
+            // adds special [`Interaction`]s to wrap/unwrap the ETH
+            // tokens into WETH, and sends orders to the solver with
+            // WETH instead of ETH. Once the driver receives the solution which
+            // fulfills an ETH order, a clearing price for ETH needs
+            // to be added, equal to the WETH clearing price.
 
-            // If no order trades WETH, the WETH price is not necessary, only the ETH
-            // price is needed. Remove the unneeded WETH price, which slightly reduces
-            // gas used by the settlement.
+            // If no order trades WETH, the WETH price is not necessary, only
+            // the ETH price is needed. Remove the unneeded WETH
+            // price, which slightly reduces gas used by the
+            // settlement.
             let mut prices: Prices = if self.user_trades().all(|trade| {
-                trade.order().sell.token != self.weth.0 && trade.order().buy.token != self.weth.0
+                trade.order().sell.token != *self.weth && trade.order().buy.token != *self.weth
             }) {
                 prices
                     .into_iter()
-                    .filter(|(token, _price)| *token != self.weth.0)
+                    .filter(|(token, _price)| *token != *self.weth)
                     .collect()
             } else {
                 prices
             };
 
             // Add a clearing price for ETH equal to WETH.
-            prices.insert(eth::ETH_TOKEN, self.prices[&self.weth.into()].to_owned());
+            prices.insert(eth::ETH_TOKEN, self.prices[&self.weth].to_owned());
 
             return prices;
         }
@@ -728,29 +963,6 @@ impl Solution {
         // The clearing price of ETH is equal to WETH.
         let token = token.as_erc20(self.weth);
         self.prices.get(&token).map(ToOwned::to_owned)
-    }
-
-    /// Whether there is a reasonable risk of this solution reverting on chain.
-    pub fn revertable(&self) -> bool {
-        self.interactions
-            .iter()
-            .any(|interaction| !interaction.internalize())
-            || self.user_trades().any(|trade| {
-                matches!(
-                    trade.order().signature.scheme,
-                    order::signature::Scheme::Eip1271
-                )
-            })
-    }
-
-    /// Returns true if any trade in this solution has a non-zero haircut fee.
-    /// Used to determine if simulation failures should suppress solver
-    /// notifications.
-    pub fn has_haircut(&self) -> bool {
-        self.trades.iter().any(|trade| match trade {
-            Trade::Fulfillment(fulfillment) => !fulfillment.haircut_fee().is_zero(),
-            Trade::Jit(_) => false, // JIT orders don't have haircut
-        })
     }
 }
 
@@ -865,6 +1077,12 @@ pub mod error {
         NonBufferableTokensUsed(BTreeSet<TokenAddress>),
         #[error("invalid internalization: uninternalized solution fails to simulate")]
         FailingInternalization,
+        #[error("expected exactly one user trade in the fast-path quote solution, found {0}")]
+        FastPathTradeCount(usize),
+        #[error("fast-path order does not match the quoted order")]
+        FastPathOrderMismatch,
+        #[error(transparent)]
+        FastPathTrade(#[from] Trade),
         #[error("Gas estimate of {0:?} exceeded the per settlement limit of {1:?}")]
         GasLimitExceeded(eth::Gas, eth::Gas),
         #[error("insufficient solver account Ether balance, required {0:?}")]
@@ -873,6 +1091,12 @@ pub mod error {
         DifferentSolvers,
         #[error("encoding error: {0:?}")]
         Encoding(#[from] encoding::Error),
+        #[error("fast-path fill would not meet the order's signed limit")]
+        FastPathLimitNotMet,
+        #[error(transparent)]
+        Math(#[from] Math),
+        #[error("auction has no id (quote auctions cannot be settled)")]
+        MissingAuctionId,
     }
 
     // Custom conversion function because clippy wants us to box this
@@ -893,10 +1117,29 @@ pub mod error {
         Negative,
     }
 
+    impl From<number::MathError> for Math {
+        fn from(err: number::MathError) -> Self {
+            match err {
+                number::MathError::DivisionByZero => Self::DivisionByZero,
+                number::MathError::Overflow => Self::Overflow,
+            }
+        }
+    }
+
+    impl From<chain_types::MathError> for Math {
+        fn from(err: chain_types::MathError) -> Self {
+            match err {
+                chain_types::MathError::Overflow => Self::Overflow,
+                chain_types::MathError::DivisionByZero => Self::DivisionByZero,
+                chain_types::MathError::Negative => Self::Negative,
+            }
+        }
+    }
+
     #[derive(Debug, thiserror::Error)]
     pub enum Solution {
         #[error("invalid clearing prices")]
-        InvalidClearingPrices(Fulfillment, Option<eth::U256>, Option<eth::U256>),
+        InvalidClearingPrices(Box<Fulfillment>, Option<eth::U256>, Option<eth::U256>),
         #[error("conflicting clearing prices for token {token:?}")]
         ConflictingClearingPrices {
             token: TokenAddress,
@@ -933,8 +1176,6 @@ pub mod error {
 
     #[derive(Debug, thiserror::Error)]
     pub enum Trade {
-        #[error("orders with non solver determined gas cost fees are not supported")]
-        ProtocolFeeOnStaticOrder,
         #[error("invalid executed amount")]
         InvalidExecutedAmount,
         #[error(transparent)]
@@ -948,41 +1189,38 @@ mod tests {
 
     #[test]
     fn canonicalize_prices_normalizes_eth_to_weth() {
-        let weth = eth::WethAddress(eth::Address::repeat_byte(0x42).into());
+        let weth = eth::WrappedNativeToken::from(eth::Address::repeat_byte(0x42));
         let expected = eth::U256::from(7);
 
-        let prices = canonicalize_prices(
-            HashMap::from([(eth::ETH_TOKEN, expected)]),
-            weth,
-        )
-        .unwrap();
+        let prices =
+            canonicalize_prices(HashMap::from([(eth::ETH_TOKEN, expected)]), weth).unwrap();
 
-        assert_eq!(prices.get(&weth.0), Some(&expected));
+        assert_eq!(prices.get(&*weth), Some(&expected));
         assert_eq!(prices.get(&eth::ETH_TOKEN), None);
     }
 
     #[test]
     fn canonicalize_prices_accepts_matching_eth_and_weth_aliases() {
-        let weth = eth::WethAddress(eth::Address::repeat_byte(0x42).into());
+        let weth = eth::WrappedNativeToken::from(eth::Address::repeat_byte(0x42));
         let expected = eth::U256::from(7);
 
         let prices = canonicalize_prices(
-            HashMap::from([(eth::ETH_TOKEN, expected), (weth.0, expected)]),
+            HashMap::from([(eth::ETH_TOKEN, expected), (*weth, expected)]),
             weth,
         )
         .unwrap();
 
         assert_eq!(prices.len(), 1);
-        assert_eq!(prices.get(&weth.0), Some(&expected));
+        assert_eq!(prices.get(&*weth), Some(&expected));
     }
 
     #[test]
     fn canonicalize_prices_rejects_conflicting_eth_and_weth_aliases() {
-        let weth = eth::WethAddress(eth::Address::repeat_byte(0x42).into());
+        let weth = eth::WrappedNativeToken::from(eth::Address::repeat_byte(0x42));
         let err = canonicalize_prices(
             HashMap::from([
                 (eth::ETH_TOKEN, eth::U256::from(7)),
-                (weth.0, eth::U256::from(8)),
+                (*weth, eth::U256::from(8)),
             ]),
             weth,
         )
@@ -994,9 +1232,11 @@ mod tests {
                 existing,
                 duplicate,
             } => {
-                assert_eq!(token, weth.0);
-                assert_eq!(existing, eth::U256::from(7));
-                assert_eq!(duplicate, eth::U256::from(8));
+                assert_eq!(token, *weth);
+                assert_eq!(
+                    HashSet::from([existing, duplicate]),
+                    HashSet::from([eth::U256::from(7), eth::U256::from(8)])
+                );
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -1070,8 +1310,14 @@ mod tests {
     #[test]
     fn merge_state_overrides_rejects_conflicting_slots() {
         let err = merge_state_overrides(
-            Some(&state_diff_overrides(eth::Address::repeat_byte(0x11), [(1, 2)])),
-            Some(&state_diff_overrides(eth::Address::repeat_byte(0x11), [(1, 3)])),
+            Some(&state_diff_overrides(
+                eth::Address::repeat_byte(0x11),
+                [(1, 2)],
+            )),
+            Some(&state_diff_overrides(
+                eth::Address::repeat_byte(0x11),
+                [(1, 3)],
+            )),
         )
         .unwrap_err();
 
@@ -1080,11 +1326,8 @@ mod tests {
 
     #[test]
     fn merge_state_overrides_rejects_conflicting_account_fields() {
-        let err = merge_state_overrides(
-            Some(&state_overrides(1)),
-            Some(&state_overrides(2)),
-        )
-        .unwrap_err();
+        let err = merge_state_overrides(Some(&state_overrides(1)), Some(&state_overrides(2)))
+            .unwrap_err();
 
         assert!(matches!(err, error::Merge::Incompatible("state overrides")));
     }
@@ -1110,7 +1353,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, error::Merge::Incompatible("state override blocks")));
+        assert!(matches!(
+            err,
+            error::Merge::Incompatible("state override blocks")
+        ));
     }
 
     fn state_overrides(balance: u64) -> StateOverride {

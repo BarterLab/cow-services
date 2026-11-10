@@ -8,7 +8,7 @@ use {
         rpc::types::trace::geth::{CallConfig, GethDebugTracingOptions},
     },
     app_data::{AppDataHash, hash_full_app_data},
-    contracts::alloy::ERC20,
+    contracts::ERC20,
     e2e::setup::*,
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -17,15 +17,22 @@ use {
         signature::EcdsaSigningScheme,
     },
     number::units::EthUnit,
+    reqwest::StatusCode,
     serde_json::json,
     shared::web3::Web3,
 };
 
 /// The block number from which we will fetch state for the forked test.
-const FORK_BLOCK_MAINNET: u64 = 23688436;
+const FORK_BLOCK_MAINNET: u64 = 24843565;
 
 /// EmptyWrapper contract address deployed on mainnet.
 const EMPTY_WRAPPER_MAINNET: Address = address!("751871E9cA28B441Bb6d3b7C4255cf2B5873d56a");
+
+#[tokio::test]
+#[ignore]
+async fn local_node_invalid_wrapper() {
+    run_test(invalid_wrapper_test).await;
+}
 
 #[tokio::test]
 #[ignore]
@@ -98,8 +105,8 @@ async fn forked_mainnet_wrapper_test(web3: Web3) {
         .await
         .unwrap();
 
-    // Start services
-    let services = Services::new(&onchain).await;
+    let mut services = Services::new(&onchain).await;
+    services.min_solve_deadline = std::time::Duration::from_secs(1);
     services.start_protocol(solver).await;
 
     onchain.mint_block().await;
@@ -300,8 +307,8 @@ async fn forked_mainnet_wrapper_test(web3: Web3) {
     tracing::info!("Wrapper call data: {:?}", call_data_strings);
 
     // Check that the auction ID propogated through the wrappers ok
-    // Sometimes the API isnt ready to respond to the request immediately so we wait
-    // a bit for success
+    // Sometimes the API isnt ready to respond to the request immediately so we
+    // wait a bit for success
     wait_for_condition(TIMEOUT, || async {
         let auction_info = services.get_solver_competition(solve_tx_hash).await;
 
@@ -318,4 +325,63 @@ async fn forked_mainnet_wrapper_test(web3: Web3) {
     tracing::info!(
         "Order with wrapper successfully traded on forked mainnet with verified wrapper calls"
     );
+}
+
+/// Test that orders get rejected if a wrapper isn't a wrapper contract that is
+/// authorized to call `settle()`. The happy path is covered by
+/// [`forked_mainnet_wrapper_test`].
+async fn invalid_wrapper_test(web3: Web3) {
+    let mut onchain = OnchainComponents::deploy(web3).await;
+
+    let [solver] = onchain.make_solvers(1u64.eth()).await;
+    let solver_address = solver.address();
+    let [trader] = onchain.make_accounts(1u64.eth()).await;
+    let cow = onchain
+        .deploy_cow_weth_pool(1_000_000u64.eth(), 1_000u64.eth(), 1_000u64.eth())
+        .await;
+
+    cow.fund(trader.address(), 5u64.eth()).await;
+    cow.approve(onchain.contracts().allowance, 5u64.eth())
+        .from(trader.address())
+        .send_and_watch()
+        .await
+        .unwrap();
+
+    let services = Services::new(&onchain).await;
+    services.start_protocol(solver).await;
+
+    for wrapper in [
+        // not an authorized solver
+        Address::repeat_byte(0x42),
+        // authorized solver but not a wrapper contract
+        solver_address,
+    ] {
+        let order = OrderCreation {
+            sell_token: *cow.address(),
+            sell_amount: 4u64.eth(),
+            buy_token: *onchain.contracts().weth.address(),
+            buy_amount: 3u64.eth(),
+            valid_to: model::time::now_in_epoch_seconds() + 300,
+            kind: OrderKind::Sell,
+            app_data: OrderCreationAppData::Full {
+                full: json!({
+                    "metadata": {
+                        "wrappers": [{"address": wrapper, "data": "0x"}],
+                    },
+                })
+                .to_string(),
+            },
+            ..Default::default()
+        }
+        .sign(
+            EcdsaSigningScheme::Eip712,
+            &onchain.contracts().domain_separator,
+            &trader.signer,
+        );
+
+        let (status, body) = services.create_order(&order).await.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("InvalidAppData"), "{body}");
+        assert!(body.contains(&format!("{wrapper:?}")), "{body}");
+    }
 }

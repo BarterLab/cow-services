@@ -2,7 +2,7 @@
 
 use {
     crate::domain::solver::Solver,
-    observe::distributed_tracing::tracing_axum::{make_span, record_trace_id},
+    observe::tracing::distributed::axum::{make_span, record_trace_id},
     std::{future::Future, net::SocketAddr, sync::Arc},
     tokio::sync::oneshot,
 };
@@ -35,7 +35,8 @@ impl Api {
                     .map_request(record_trace_id),
             )
             .with_state(Arc::new(self.solver))
-            // axum's default body limit needs to be disabled to not have the default limit on top of our custom limit
+            // axum's default body limit needs to be disabled to not have the default limit on top
+            // of our custom limit
             .layer(axum::extract::DefaultBodyLimit::disable());
 
         let listener = tokio::net::TcpListener::bind(self.addr).await?;

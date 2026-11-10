@@ -1,15 +1,18 @@
-use alloy::{
-    eips::BlockId,
-    primitives::{B256, U256},
-    rpc::types::{BlockOverrides, state::StateOverride},
+use {
+    alloy::{
+        eips::BlockId,
+        primitives::{B256, U256},
+        rpc::types::{BlockOverrides, state::StateOverride},
+    },
+    std::sync::Arc,
 };
-use std::sync::Arc;
 
-/// Exact and immutable context in which a state-dependent solution was verified.
+/// Exact and immutable context in which a state-dependent solution was
+/// verified.
 ///
-/// This value is deliberately not part of the solver DTO. It can only be attached
-/// to a domain solution by trusted in-process code after the solver response was
-/// validated.
+/// This value is deliberately not part of the solver DTO. It can only be
+/// attached to a domain solution by trusted in-process code after the solver
+/// response was validated.
 #[derive(Clone)]
 pub struct SimulationContext {
     base_number: u64,
@@ -37,9 +40,7 @@ impl SimulationContext {
             return Err(Error::EmptyStateOverrides);
         }
 
-        let expected = base_number
-            .checked_add(1)
-            .ok_or(Error::BaseBlockOverflow)?;
+        let expected = base_number.checked_add(1).ok_or(Error::BaseBlockOverflow)?;
         if target_block != expected {
             return Err(Error::TargetBlockMismatch {
                 expected,
@@ -116,9 +117,10 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use alloy::{primitives::Address, rpc::types::state::AccountOverride};
-
-    use super::*;
+    use {
+        super::*,
+        alloy::{primitives::Address, rpc::types::state::AccountOverride},
+    };
 
     #[test]
     fn accepts_exact_context_and_serializes_rpc_quantities() {
@@ -186,13 +188,7 @@ mod tests {
             Err(Error::EmptyStateOverrides),
         ));
         assert!(matches!(
-            context(
-                Address::repeat_byte(0x33),
-                10,
-                B256::ZERO,
-                11,
-                30,
-            ),
+            context(Address::repeat_byte(0x33), 10, B256::ZERO, 11, 30,),
             Err(Error::ZeroBaseBlockHash),
         ));
         assert!(matches!(

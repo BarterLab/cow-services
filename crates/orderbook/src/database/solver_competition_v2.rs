@@ -16,6 +16,7 @@ impl Postgres {
     pub async fn load_competition_by_id(
         &self,
         auction_id: i64,
+        current_block: Option<i64>,
     ) -> Result<ApiResponse, LoadSolverCompetitionError> {
         let _timer = super::Metrics::get()
             .database_queries
@@ -23,7 +24,7 @@ impl Postgres {
             .start_timer();
 
         let mut ex = self.pool.acquire().await.map_err(anyhow::Error::from)?;
-        database::solver_competition_v2::load_by_id(&mut ex, auction_id)
+        database::solver_competition_v2::load_by_id(&mut ex, auction_id, current_block)
             .await
             .context("solver_competition_v2::load_by_id")?
             .map(try_into_dto)
@@ -33,6 +34,7 @@ impl Postgres {
     pub async fn load_competition_by_tx_hash(
         &self,
         tx_hash: B256,
+        current_block: Option<i64>,
     ) -> Result<ApiResponse, LoadSolverCompetitionError> {
         let _timer = super::Metrics::get()
             .database_queries
@@ -40,25 +42,52 @@ impl Postgres {
             .start_timer();
 
         let mut ex = self.pool.acquire().await.map_err(anyhow::Error::from)?;
-        database::solver_competition_v2::load_by_tx_hash(&mut ex, ByteArray(tx_hash.0))
-            .await
-            .context("solver_competition_v2::load_by_tx_hash")?
-            .map(try_into_dto)
-            .ok_or(LoadSolverCompetitionError::NotFound)?
+        database::solver_competition_v2::load_by_tx_hash(
+            &mut ex,
+            ByteArray(tx_hash.0),
+            current_block,
+        )
+        .await
+        .context("solver_competition_v2::load_by_tx_hash")?
+        .map(try_into_dto)
+        .ok_or(LoadSolverCompetitionError::NotFound)?
     }
 
-    pub async fn load_latest_competition(&self) -> Result<ApiResponse, LoadSolverCompetitionError> {
+    pub async fn load_latest_competition(
+        &self,
+        current_block: Option<i64>,
+    ) -> Result<ApiResponse, LoadSolverCompetitionError> {
         let _timer = super::Metrics::get()
             .database_queries
             .with_label_values(&["load_latest_solver_competition_v2"])
             .start_timer();
 
         let mut ex = self.pool.acquire().await.map_err(anyhow::Error::from)?;
-        database::solver_competition_v2::load_latest(&mut ex)
+        database::solver_competition_v2::load_latest(&mut ex, current_block)
             .await
             .context("solver_competition_v2::load_latest")?
             .map(try_into_dto)
             .ok_or(LoadSolverCompetitionError::NotFound)?
+    }
+
+    pub async fn order_is_actively_bid_on(
+        &self,
+        order_uid: &OrderUid,
+        latest_competitions_count: u32,
+    ) -> anyhow::Result<bool> {
+        let _timer = super::Metrics::get()
+            .database_queries
+            .with_label_values(&["order_is_actively_bid_on_v2"])
+            .start_timer();
+
+        let mut ex = self.pool.acquire().await?;
+        database::solver_competition_v2::order_is_in_recent_solutions(
+            &mut ex,
+            &ByteArray(order_uid.0),
+            latest_competitions_count as i64,
+        )
+        .await
+        .map_err(Into::into)
     }
 }
 
@@ -154,6 +183,7 @@ fn try_into_dto(value: DbResponse) -> Result<ApiResponse, LoadSolverCompetitionE
         auction_id: value.auction.id,
         auction_start_block: value.auction.block,
         auction_deadline_block: value.auction.deadline,
+        fast_path: value.auction.fast_path_quote_id.is_some(),
         transaction_hashes: settlements.values().cloned().collect(),
         reference_scores,
         auction: Auction {

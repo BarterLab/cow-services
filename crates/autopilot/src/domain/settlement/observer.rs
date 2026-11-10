@@ -13,15 +13,15 @@
 use {
     crate::{
         domain::{
-            eth,
+            Metrics,
             settlement::{self, Settlement},
         },
         infra,
     },
     anyhow::{Context, Result, anyhow},
+    eth_domain_types as eth,
     futures::StreamExt,
-    rand::Rng,
-    std::time::Duration,
+    shared::retry::retry_with_sleep,
 };
 
 #[derive(Clone)]
@@ -34,6 +34,7 @@ impl Observer {
     /// Creates a new Observer and asynchronously schedules the first update
     /// run.
     pub fn new(eth: infra::Ethereum, persistence: infra::Persistence) -> Self {
+        Metrics::init_settlement_math_errors();
         Self { eth, persistence }
     }
 
@@ -47,9 +48,7 @@ impl Observer {
     /// prod vs. staging).
     pub async fn post_process_outstanding_settlement_transactions(&self) {
         let settlements =
-            match Self::retry_with_sleep(|| self.persistence.get_settlements_without_auction())
-                .await
-            {
+            match retry_with_sleep(|| self.persistence.get_settlements_without_auction()).await {
                 Ok(settlements) => settlements,
                 Err(errs) => {
                     tracing::warn!(?errs, "failed to fetch unprocessed settlements");
@@ -69,7 +68,7 @@ impl Observer {
         futures::stream::iter(settlements)
             .for_each_concurrent(MAX_CONCURRENCY, |settlement| async move {
                 tracing::debug!(tx = ?settlement.transaction, "start post processing of settlement");
-                match Self::retry_with_sleep(|| self.post_process_settlement(settlement)).await {
+                match retry_with_sleep(|| self.post_process_settlement(settlement)).await {
                     Ok(_) =>  tracing::debug!(
                         tx = ?settlement.transaction,
                         "successfully post-processed settlement"
@@ -84,7 +83,7 @@ impl Observer {
             .await;
     }
 
-    async fn post_process_settlement(&self, settlement: eth::SettlementEvent) -> Result<()> {
+    async fn post_process_settlement(&self, settlement: super::SettlementEvent) -> Result<()> {
         let settlement_data = self
             .fetch_auction_data_for_transaction(settlement.transaction)
             .await?;
@@ -109,6 +108,7 @@ impl Observer {
                     &transaction,
                     separator,
                     settlement_contract,
+                    self.eth.contracts().wrapped_native_token(),
                     self.eth.contracts().authenticator(),
                 )
                 .await
@@ -152,8 +152,10 @@ impl Observer {
                         Ok(None)
                     }
                     settlement::transaction::Error::Authentication(_) => {
-                        // This has to be a temporary error because the settlement contract
-                        // guarantees that SOME allow listed contract executed the transaction.
+                        // This has to be a temporary error because the
+                        // settlement contract
+                        // guarantees that SOME allow listed contract executed
+                        // the transaction.
                         Err(anyhow!(format!(
                             "could not determing solver address - err: {err:?}"
                         )))
@@ -161,29 +163,5 @@ impl Observer {
                 }
             }
         }
-    }
-
-    async fn retry_with_sleep<F, OK, ERR>(future: impl Fn() -> F) -> Result<OK, Vec<ERR>>
-    where
-        F: Future<Output = Result<OK, ERR>>,
-        ERR: std::fmt::Debug,
-    {
-        const MAX_RETRIES: usize = 5;
-
-        let mut errors = Vec::new();
-        let mut tries = 0;
-        while tries < MAX_RETRIES {
-            match future().await {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    errors.push(err);
-                    tries += 1;
-                    // wait a little to give temporary errors a chance to resolve themselves
-                    let timeout_with_jitter = 50u64 + rand::thread_rng().gen_range(0..=50);
-                    tokio::time::sleep(Duration::from_millis(timeout_with_jitter)).await;
-                }
-            }
-        }
-        Err(errors)
     }
 }

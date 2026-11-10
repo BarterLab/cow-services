@@ -2,28 +2,37 @@ mod buffering;
 pub mod errors;
 mod evm_ext;
 mod instrumentation;
+mod rpc_headers;
 mod wallet;
 
 use {
     crate::{AlloyProvider, Config},
-    alloy::{
-        providers::{Provider, ProviderBuilder},
-        rpc::client::{ClientBuilder, RpcClient},
-    },
+    alloy_provider::{Provider, ProviderBuilder},
+    alloy_rpc_client::{ClientBuilder, RpcClient},
     buffering::BatchCallLayer,
     instrumentation::{InstrumentationLayer, LabelingLayer},
+    rpc_headers::{RpcHeadersLayer, TracingRequestIdLayer},
 };
 pub use {evm_ext::EvmProviderExt, instrumentation::ProviderLabelingExt, wallet::MutWallet};
 
 /// Creates an [`RpcClient`] from the given URL with [`LabelingLayer`],
-/// [`InstrumentationLayer`] and [`BatchCallLayer`].
+/// [`InstrumentationLayer`], [`TracingRequestIdLayer`], [`BatchCallLayer`] and
+/// [`RpcHeadersLayer`].
+///
+/// [`TracingRequestIdLayer`] is installed *before* [`BatchCallLayer`] so it
+/// runs on the caller's task and can capture the tracing request id from the
+/// current span. [`RpcHeadersLayer`] is installed last so it runs innermost —
+/// it must observe the packet after [`BatchCallLayer`] has coalesced calls into
+/// a batch.
 fn rpc(url: &str, config: Config, label: Option<&str>) -> RpcClient {
     ClientBuilder::default()
         .layer(LabelingLayer {
             label: label.unwrap_or("main").into(),
         })
         .layer(InstrumentationLayer)
+        .layer(TracingRequestIdLayer)
         .layer(BatchCallLayer::new(config))
+        .layer(RpcHeadersLayer)
         .http(url.parse().unwrap())
 }
 
@@ -39,6 +48,8 @@ fn unbuffered_rpc(url: &str, label: Option<&str>) -> RpcClient {
             label: label.unwrap_or("main_unbuffered").into(),
         })
         .layer(InstrumentationLayer)
+        .layer(TracingRequestIdLayer)
+        .layer(RpcHeadersLayer)
         .http(url.parse().unwrap())
 }
 
@@ -85,10 +96,11 @@ pub trait RpcClientRandomIdExt {
 impl RpcClientRandomIdExt for RpcClient {
     /// Creates a new [`RpcClient`] with a random request ID.
     fn with_random_id(t: impl IntoBoxTransport, is_local: bool) -> Self {
-        // The random ID mitigates the possibility of duplicate request IDs between
-        // providers when batching; furthemore, since we're using a uniform distribution
-        // we need to be aware that we might get a value close enough to u64::MAX to
-        // overflow after a couple requests, to solve that we generate a u32 first and
+        // The random ID mitigates the possibility of duplicate request IDs
+        // between providers when batching; furthemore, since we're
+        // using a uniform distribution we need to be aware that we
+        // might get a value close enough to u64::MAX to overflow after
+        // a couple requests, to solve that we generate a u32 first and
         // convert it to u64 to ensure we have plenty space.
         let id = rand::random::<u32>().into();
         let inner = RpcClientInner::new(t, is_local).with_id(id);
@@ -122,12 +134,16 @@ impl ProviderSignerExt for AlloyProvider {
 mod test_util {
     use {
         super::*,
-        alloy::{
-            contract::{CallBuilder, CallDecoder},
-            primitives::TxHash,
-            providers::Network,
-            rpc::types::TransactionRequest,
+        alloy_contract::{CallBuilder, CallDecoder},
+        alloy_primitives::{Address, TxHash, address, utils::parse_ether},
+        alloy_provider::{
+            MULTICALL3_ADDRESS,
+            Network,
+            ext::{AnvilApi, ImpersonateConfig},
         },
+        alloy_rpc_types::TransactionRequest,
+        anyhow::{Context, ensure},
+        contracts::Multicall3,
         std::time::Duration,
         tokio::time::timeout,
     };
@@ -143,6 +159,12 @@ mod test_util {
             &self,
             tx: TransactionRequest,
         ) -> impl Future<Output = anyhow::Result<TxHash>>;
+
+        /// Puts `Multicall3` where every network keeps it, which only a fresh
+        /// local node needs: forked networks inherit the real deployment.
+        /// Liquidity sources batch their pool reads through it, so without it
+        /// they cannot read anything.
+        fn deploy_multicall3(&self) -> impl Future<Output = anyhow::Result<()>>;
     }
 
     impl ProviderExt for AlloyProvider {
@@ -150,6 +172,54 @@ mod test_util {
             let pending = self.send_transaction(tx).await?;
             let result = timeout(DEFAULT_WATCH_TIMEOUT, pending.watch()).await??;
             Ok(result)
+        }
+
+        async fn deploy_multicall3(&self) -> anyhow::Result<()> {
+            // The canonical address is the one the original deployer got from
+            // its very first transaction, so replaying that
+            // transaction is the only way to land there. It works
+            // because a fresh node still has that account at nonce 0.
+            const DEPLOYER: Address = address!("0x05f32B3cC3888453ff71B01135B34FF8e41263F2");
+
+            if !self
+                .get_code_at(MULTICALL3_ADDRESS)
+                .await
+                .context("could not fetch Multicall3 code")?
+                .is_empty()
+            {
+                return Ok(());
+            }
+
+            // A wallet-less provider makes alloy hand the transaction to the
+            // node for signing instead of looking for a key we do
+            // not have.
+            let deployment = Multicall3::Instance::deploy_builder(self.without_wallet())
+                .from(DEPLOYER)
+                .into_transaction_request();
+
+            self.anvil_send_impersonated_transaction_with_config(
+                deployment,
+                ImpersonateConfig {
+                    fund_amount: Some(parse_ether("1").expect("valid ETH amount")),
+                    stop_impersonate: true,
+                },
+            )
+            .await
+            .context("failed to deploy Multicall3")?
+            .watch()
+            .await
+            .context("Multicall3 deployment was not mined")?;
+
+            ensure!(
+                !self
+                    .get_code_at(MULTICALL3_ADDRESS)
+                    .await
+                    .context("could not fetch Multicall3 code")?
+                    .is_empty(),
+                "Multicall3 did not end up at {MULTICALL3_ADDRESS}"
+            );
+
+            Ok(())
         }
     }
 
@@ -171,6 +241,6 @@ mod test_util {
     }
 }
 
-use alloy::{rpc::client::RpcClientInner, transports::IntoBoxTransport};
 #[cfg(feature = "test-util")]
 pub use test_util::{CallBuilderExt, ProviderExt};
+use {alloy_rpc_client::RpcClientInner, alloy_transport::IntoBoxTransport};

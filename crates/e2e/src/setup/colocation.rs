@@ -14,8 +14,11 @@ pub struct SolverEngine {
     pub account: TestAccount,
     pub base_tokens: Vec<Address>,
     pub merge_solutions: bool,
-    /// Haircut in basis points (0-10000) for conservative bidding.
-    pub haircut_bps: u32,
+    /// Solver fee in basis points (0-10000) for conservative bidding.
+    pub solver_fee_bps: u32,
+    /// Additional EOAs that can submit settlement txs on behalf of the solver
+    /// via EIP-7702 delegation. When non-empty, enables parallel submission.
+    pub submission_keys: Vec<TestAccount>,
 }
 
 pub async fn start_baseline_solver(
@@ -26,7 +29,7 @@ pub async fn start_baseline_solver(
     max_hops: usize,
     merge_solutions: bool,
 ) -> SolverEngine {
-    start_baseline_solver_with_haircut(
+    start_baseline_solver_with_solver_fee(
         name,
         account,
         weth,
@@ -38,14 +41,14 @@ pub async fn start_baseline_solver(
     .await
 }
 
-pub async fn start_baseline_solver_with_haircut(
+pub async fn start_baseline_solver_with_solver_fee(
     name: String,
     account: TestAccount,
     weth: Address,
     base_tokens: Vec<Address>,
     max_hops: usize,
     merge_solutions: bool,
-    haircut_bps: u32,
+    solver_fee_bps: u32,
 ) -> SolverEngine {
     let encoded_base_tokens = encode_base_tokens(base_tokens.clone());
     let config_file = config_tmp_file(format!(
@@ -66,7 +69,8 @@ uni-v3-node-url = "http://localhost:8545"
         account,
         base_tokens,
         merge_solutions,
-        haircut_bps,
+        solver_fee_bps,
+        submission_keys: vec![],
     }
 }
 
@@ -90,7 +94,6 @@ async fn start_solver(config_file: TempPath, solver_name: String) -> Url {
 
 pub enum LiquidityProvider {
     UniswapV2,
-    UniswapV3 { subgraph: Url },
     ZeroEx { api_port: u16 },
 }
 
@@ -117,13 +120,6 @@ http-timeout = "10s"
                 format!("http://0.0.0.0:{}", api_port),
                 "no-api-key".to_string()
             ),
-            Self::UniswapV3 { subgraph } => format!(
-                r#"
-[[liquidity.uniswap-v3]]
-preset = "uniswap-v3"
-graph-url = "{subgraph}"
-"#
-            ),
         }
     }
 }
@@ -132,22 +128,14 @@ pub fn start_driver(
     contracts: &Contracts,
     solvers: Vec<SolverEngine>,
     liquidity: LiquidityProvider,
-    quote_using_limit_orders: bool,
 ) -> JoinHandle<()> {
-    start_driver_with_config_override(
-        contracts,
-        solvers,
-        liquidity,
-        quote_using_limit_orders,
-        None,
-    )
+    start_driver_with_config_override(contracts, solvers, liquidity, None)
 }
 
 pub fn start_driver_with_config_override(
     contracts: &Contracts,
     solvers: Vec<SolverEngine>,
     liquidity: LiquidityProvider,
-    quote_using_limit_orders: bool,
     config_override: Option<&str>,
 ) -> JoinHandle<()> {
     let base_tokens: HashSet<_> = solvers
@@ -157,34 +145,42 @@ pub fn start_driver_with_config_override(
         .collect();
     let solvers = solvers
         .iter()
-        .map(
-            |SolverEngine {
-                 name,
-                 account,
-                 endpoint,
-                 base_tokens: _,
-                 merge_solutions,
-                 haircut_bps,
-             }| {
-                let account = account.signer.to_bytes();
-                format!(
-                    r#"
+        .map(|solver| {
+            let SolverEngine {
+                name,
+                account,
+                endpoint,
+                merge_solutions,
+                solver_fee_bps,
+                ..
+            } = solver;
+            let account = account.signer.to_bytes();
+            let submission_accounts_line = if solver.submission_keys.is_empty() {
+                String::new()
+            } else {
+                let keys: Vec<String> = solver
+                    .submission_keys
+                    .iter()
+                    .map(|k| format!("\"{}\"", k.signer.to_bytes()))
+                    .collect();
+                format!("submission-accounts = [{}]\n", keys.join(", "))
+            };
+            format!(
+                r#"
 [[solver]]
 name = "{name}"
 endpoint = "{endpoint}"
 relative-slippage = "0.1"
 account = "{account}"
 merge-solutions = {merge_solutions}
-quote-using-limit-orders = {quote_using_limit_orders}
-enable-simulation-bad-token-detection = true
+fast-path-enabled = true
 enable-metrics-bad-order-detection = true
-http-time-buffer = "100ms"
+http-time-buffer = "25ms"
 solving-share-of-deadline = 1.0
-haircut-bps = {haircut_bps}
-"#
-                )
-            },
-        )
+solver-fee-bps = {solver_fee_bps}
+{submission_accounts_line}"#
+            )
+        })
         .collect::<Vec<String>>()
         .join("\n");
     let liquidity = liquidity.to_string(contracts);
@@ -211,25 +207,31 @@ gp-v2-settlement = "{:?}"
 weth = "{:?}"
 balances = "{:?}"
 signatures = "{:?}"
+deadline-check = "{:?}"
 {flashloan_router_config}
 
 {solvers}
 
 [liquidity]
 base-tokens = [{encoded_base_tokens}]
+refresh-cooldown = "0s"
 
 {liquidity}
 
 [submission]
 gas-price-cap = "1000000000000"
 
-[[submission.mempool]]
-url = "{NODE_HOST}"
+[submission.public-mempool]
+urls = ["{NODE_HOST}"]
+
+[balance-cache]
+refresh-cooldown = "0s"
 "#,
         contracts.gp_settlement.address(),
         contracts.weth.address(),
         contracts.balances.address(),
         contracts.signatures.address(),
+        contracts.deadline_check.address(),
     );
 
     let final_config = if let Some(override_str) = config_override {

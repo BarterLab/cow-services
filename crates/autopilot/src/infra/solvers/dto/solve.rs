@@ -1,23 +1,28 @@
 use {
     crate::{
         boundary,
-        domain::{self, eth},
+        domain,
         infra::{
             persistence::dto::{self, order::Order},
             solvers::InjectIntoHttpRequest,
         },
     },
     alloy::primitives::{Address, U256},
+    brotli::enc::writer::CompressorWriter,
     bytes::Bytes,
     chrono::{DateTime, Utc},
+    eth_domain_types as eth,
     itertools::Itertools,
     number::serialization::HexOrDecimalU256,
-    reqwest::RequestBuilder,
+    observe::http_body::Measured,
+    reqwest::{RequestBuilder, header::HeaderValue},
     serde::{Deserialize, Serialize},
-    serde_with::{DisplayFromStr, serde_as},
+    serde_with::{DisplayFromStr, MapPreventDuplicates, serde_as},
     std::{
         borrow::Cow,
         collections::{HashMap, HashSet},
+        convert::Infallible,
+        io::Write,
         time::Duration,
     },
 };
@@ -30,59 +35,228 @@ use {
 pub struct Request {
     auction_id: i64,
     body: bytes::Bytes,
+    content_encoding: Option<HeaderValue>,
+    deadline: chrono::DateTime<chrono::Utc>,
+    /// Whether to log how long the body takes to upload.
+    measure_upload: bool,
 }
 
 impl Request {
     pub async fn new(
         auction: &domain::Auction,
         trusted_tokens: &HashSet<Address>,
-        time_limit: Duration,
+        deadline: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        let _timer =
-            observe::metrics::metrics().on_auction_overhead_start("autopilot", "serialize_request");
-        let helper = RequestHelper {
+        let helper = FullRequestHelper {
             id: auction.id,
-            orders: auction
-                .orders
-                .clone()
-                .into_iter()
-                .map(dto::order::from_domain)
-                .collect(),
-            tokens: auction
-                .prices
-                .iter()
-                .map(|(address, price)| Token {
-                    address: address.to_owned().0,
-                    price: Some(price.get().0),
-                    trusted: trusted_tokens.contains(&(address.0)),
-                })
-                .chain(trusted_tokens.iter().map(|&address| Token {
-                    address,
-                    price: None,
-                    trusted: true,
-                }))
-                .unique_by(|token| token.address)
-                .collect(),
-            deadline: Utc::now() + chrono::Duration::from_std(time_limit).unwrap(),
+            orders: auction.orders.iter().map(dto::order::from_domain).collect(),
+            tokens: tokens(auction, trusted_tokens),
+            deadline,
             surplus_capturing_jit_order_owners: auction.surplus_capturing_jit_order_owners.to_vec(),
         };
-        let auction_id = auction.id;
+        Self::from_body(RequestBody::Full(helper)).await
+    }
+
+    /// Builds a request containing the delta to the previously sent auction.
+    pub async fn new_delta(
+        previous: &domain::Auction,
+        current: &domain::Auction,
+        trusted_tokens: &HashSet<Address>,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let helper = DeltaRequestHelper {
+            id: current.id,
+            tokens: tokens(current, trusted_tokens),
+            orders: OrderDelta::compute(&previous.orders, &current.orders),
+            deadline,
+            surplus_capturing_jit_order_owners: current.surplus_capturing_jit_order_owners.to_vec(),
+        };
+
+        Self::from_body(RequestBody::Delta(helper)).await
+    }
+
+    async fn from_body(body: RequestBody) -> Self {
+        let _timer =
+            observe::metrics::metrics().on_auction_overhead_start("autopilot", "serialize_request");
+        let (auction_id, deadline) = (body.id(), body.deadline());
 
         let body = tokio::task::spawn_blocking(move || {
-            let serialized = serde_json::to_vec(&helper).expect("type should be JSON serializable");
-            Bytes::from(serialized)
+            Bytes::from(serde_json::to_vec(&body).expect("auction is JSON serializable"))
         })
         .await
         .expect("inner task should not panic as serialization should work for the given type");
 
-        Self { body, auction_id }
+        Self {
+            body,
+            auction_id,
+            content_encoding: None,
+            deadline,
+            measure_upload: true,
+        }
     }
+
+    /// Returns a compressed copy of this request, or `None` if
+    /// compression failed.
+    async fn compressed(&self) -> Option<Self> {
+        let _timer =
+            observe::metrics::metrics().on_auction_overhead_start("autopilot", "compress_request");
+        let json = self.body.clone();
+
+        let body = tokio::task::spawn_blocking(move || compress(&json))
+            .await
+            .expect("inner task should not panic")?;
+
+        Some(Self {
+            body,
+            content_encoding: Some(HeaderValue::from_static("br")),
+            ..self.clone()
+        })
+    }
+
+    pub fn body_size(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Sets whether to log how long the body takes to upload.
+    pub fn measure_upload(self, measure_upload: bool) -> Self {
+        Self {
+            measure_upload,
+            ..self
+        }
+    }
+
+    pub fn time_until_deadline(&self) -> Duration {
+        self.deadline
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+/// A [`Request`] in the encodings the drivers receiving it accept. Each
+/// encoding is built once and shared by all those drivers.
+#[derive(Clone, Debug)]
+pub struct EncodedRequests {
+    plain: Request,
+    /// Compressed copy of `plain`. Only built if some driver accepts
+    /// compression and compression succeeded.
+    compressed: Option<Request>,
+}
+
+impl EncodedRequests {
+    pub async fn new(plain: Request, compress: bool) -> Self {
+        let compressed = if compress {
+            plain.compressed().await
+        } else {
+            None
+        };
+        Self { plain, compressed }
+    }
+
+    /// The request to send to a driver: compressed if the driver accepts
+    /// compression and a compressed copy exists, plain JSON otherwise.
+    pub fn for_driver(&self, accepts_compression: bool) -> Request {
+        accepts_compression
+            .then_some(self.compressed.as_ref())
+            .flatten()
+            .unwrap_or(&self.plain)
+            .clone()
+    }
+
+    pub fn body_size(&self) -> usize {
+        self.plain.body_size()
+    }
+
+    pub fn compressed_body_size(&self) -> Option<usize> {
+        self.compressed.as_ref().map(Request::body_size)
+    }
+}
+
+/// Compresses a serialized request body with brotli. Returns `None` if
+/// compression fails, in which case the plain body is sent instead.
+fn compress(json: &[u8]) -> Option<Bytes> {
+    // quality 1: fastest brotli level. Already beats gzip-3 on both
+    // ratio and speed for our JSON payloads.
+    //
+    // lgwin 22: LZ77 window = 2^22 - 16 ≈ 4 MB. How far back the
+    // compressor looks for repeated patterns. The decompressor must
+    // allocate up to this much memory, regardless of the body size.
+    //
+    // 4096: internal I/O buffer for flushing to the output Vec.
+    // Doesn't affect compression ratio. Tested 512 B to 256 KB with
+    // no meaningful difference; 4 KB is a standard default.
+    let mut encoder = CompressorWriter::new(Vec::new(), 4096, 1, 22);
+    match encoder.write_all(json).and_then(|_| encoder.flush()) {
+        Ok(()) => Some(Bytes::from(encoder.into_inner())),
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                "brotli compression failed, falling back to uncompressed"
+            );
+            None
+        }
+    }
+}
+
+/// The two kinds of `/solve` request bodies, distinguished by an internal
+/// `kind` tag: the full auction or - for drivers that opted in - only the
+/// difference to a previously sent auction.
+///
+/// The tag is also set on full auctions. That is a purely additive change for
+/// drivers that predate delta requests: they ignore the unknown field.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum RequestBody {
+    Full(FullRequestHelper),
+    Delta(DeltaRequestHelper),
+}
+
+impl RequestBody {
+    fn id(&self) -> i64 {
+        match self {
+            RequestBody::Full(FullRequestHelper { id, .. }) => *id,
+            RequestBody::Delta(DeltaRequestHelper { id, .. }) => *id,
+        }
+    }
+
+    fn deadline(&self) -> DateTime<Utc> {
+        match self {
+            RequestBody::Full(FullRequestHelper { deadline, .. }) => *deadline,
+            RequestBody::Delta(DeltaRequestHelper { deadline, .. }) => *deadline,
+        }
+    }
+}
+
+/// Builds the token list of an auction: all tokens with a known price plus
+/// all trusted tokens.
+fn tokens(auction: &domain::Auction, trusted_tokens: &HashSet<Address>) -> Vec<Token> {
+    auction
+        .prices
+        .iter()
+        .map(|(address, price)| Token {
+            address: *address.to_owned(),
+            price: Some(price.get().0),
+            trusted: trusted_tokens.contains(&Address::from(*address)),
+        })
+        .chain(trusted_tokens.iter().map(|&address| Token {
+            address,
+            price: None,
+            trusted: true,
+        }))
+        .unique_by(|token| token.address)
+        .collect()
 }
 
 impl InjectIntoHttpRequest for Request {
     fn inject(&self, request: RequestBuilder) -> RequestBuilder {
-        request
-            .body(self.body.clone())
+        let body = futures::stream::iter([Ok::<_, Infallible>(self.body.clone())]);
+        let body = if self.measure_upload {
+            reqwest::Body::wrap_stream(Measured::new(body))
+        } else {
+            reqwest::Body::wrap_stream(body)
+        };
+        let request = request
+            .body(body)
             // announce which auction this request is for in the
             // headers to help the driver detect duplicated
             // `/solve` requests before streaming the body
@@ -91,20 +265,33 @@ impl InjectIntoHttpRequest for Request {
             // we can't use `request.json(self)`
             .header(
                 reqwest::header::CONTENT_TYPE,
-                reqwest::header::HeaderValue::from_static("application/json")
-            )
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+        if let Some(encoding) = &self.content_encoding {
+            request.header(reqwest::header::CONTENT_ENCODING, encoding)
+        } else {
+            request
+        }
     }
 
     fn body_to_string(&self) -> Cow<'_, str> {
+        if self.content_encoding.is_some() {
+            return Cow::Borrowed("<compressed>");
+        }
         let string = str::from_utf8(self.body.as_ref()).unwrap();
         Cow::Borrowed(string)
     }
 }
 
 impl Response {
-    pub fn into_domain(
-        self,
-    ) -> Vec<Result<domain::competition::Solution, domain::competition::SolutionError>> {
+    pub fn into_domain(self) -> Vec<domain::competition::Solution> {
+        if self
+            .solutions
+            .iter()
+            .any(|solution| !solution.clearing_prices.is_empty())
+        {
+            tracing::debug!("driver sent deprecated clearingPrices field");
+        }
         self.solutions
             .into_iter()
             .map(Solution::into_domain)
@@ -115,13 +302,71 @@ impl Response {
 #[serde_as]
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RequestHelper {
+struct FullRequestHelper {
     #[serde_as(as = "DisplayFromStr")]
     pub id: i64,
     pub tokens: Vec<Token>,
     pub orders: Vec<Order>,
     pub deadline: DateTime<Utc>,
     pub surplus_capturing_jit_order_owners: Vec<Address>,
+}
+
+/// Difference of an auction relative to the previous (i.e. `id - 1`).
+/// Only orders are diffed; tokens and all scalar fields are sent whole.
+#[serde_as]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeltaRequestHelper {
+    #[serde_as(as = "DisplayFromStr")]
+    id: i64,
+    tokens: Vec<Token>,
+    #[serde(flatten)]
+    orders: OrderDelta,
+    deadline: DateTime<Utc>,
+    surplus_capturing_jit_order_owners: Vec<Address>,
+}
+
+/// The orders of an auction expressed as the difference to a previous auction.
+/// Flattened into [`DeltaHelper`], so the two fields sit next to `tokens` and
+/// friends on the wire.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrderDelta {
+    /// Orders that were added or modified since the base auction.
+    updated_orders: Vec<Order>,
+    /// Uids of orders that were removed since the base auction.
+    removed_orders: Vec<boundary::OrderUid>,
+}
+
+impl OrderDelta {
+    /// Diffs the orders of two auctions, matching them by uid. An order counts
+    /// as updated when it is new or when any of its fields changed.
+    fn compute(previous: &[domain::Order], current: &[domain::Order]) -> Self {
+        // Matched orders are taken out of the map, so whatever is left at the
+        // end is exactly the set of removed orders. That saves both a second
+        // hash set holding the uids of `current` and a second pass over
+        // `previous`.
+        let mut unmatched: HashMap<_, _> =
+            previous.iter().map(|order| (order.uid, order)).collect();
+
+        let mut updated_orders = Vec::new();
+        for order in current {
+            let changed = unmatched
+                .remove(&order.uid)
+                .is_none_or(|previous| previous != order);
+            if changed {
+                updated_orders.push(dto::order::from_domain(order));
+            }
+        }
+
+        let removed_orders: Vec<boundary::OrderUid> =
+            unmatched.into_keys().map(Into::into).collect();
+
+        Self {
+            updated_orders,
+            removed_orders,
+        }
+    }
 }
 
 #[serde_as]
@@ -135,23 +380,15 @@ pub struct Token {
 }
 
 impl Solution {
-    pub fn into_domain(
-        self,
-    ) -> Result<domain::competition::Solution, domain::competition::SolutionError> {
-        Ok(domain::competition::Solution::new(
+    pub fn into_domain(self) -> domain::competition::Solution {
+        domain::competition::Solution::new(
             self.solution_id,
             self.submission_address,
             self.orders
                 .into_iter()
                 .map(|(o, amounts)| (o.into(), amounts.into_domain()))
                 .collect(),
-            self.clearing_prices
-                .into_iter()
-                .map(|(token, price)| {
-                    domain::auction::Price::try_new(price.into()).map(|price| (token.into(), price))
-                })
-                .collect::<Result<_, _>>()?,
-        ))
+        )
     }
 }
 
@@ -218,7 +455,15 @@ pub struct Solution {
     pub solution_id: u64,
     /// Address used by the driver to submit the settlement onchain.
     pub submission_address: Address,
+    /// A partially fillable order may be split across several solutions, but
+    /// a single solution settles each order exactly once.
+    #[serde_as(as = "MapPreventDuplicates<_, _>")]
     pub orders: HashMap<boundary::OrderUid, TradedOrder>,
+    /// Deprecated: uniform clearing prices are no longer used by the
+    /// autopilot. Kept here purely so we can detect and log drivers that
+    /// still send them, in order to chase them down before the field is
+    /// removed entirely.
+    #[serde(default)]
     #[serde_as(as = "HashMap<_, HexOrDecimalU256>")]
     pub clearing_prices: HashMap<Address, U256>,
     pub gas: Option<u64>,
@@ -228,4 +473,279 @@ pub struct Solution {
 #[serde(rename_all = "camelCase")]
 pub struct Response {
     pub solutions: Vec<Solution>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_json() -> Vec<u8> {
+        let json_value = serde_json::json!({
+            "id": "1",
+            "tokens": (0..100).map(|i| {
+                serde_json::json!({
+                    "address": format!("0x{:040x}", i),
+                    "price": format!("{}", i * 1000),
+                    "trusted": i % 2 == 0
+                })
+            }).collect::<Vec<_>>(),
+            "orders": [],
+            "deadline": "2025-01-01T00:00:00Z",
+            "surplusCapturingJitOrderOwners": []
+        });
+        serde_json::to_vec(&json_value).unwrap()
+    }
+
+    fn order_uid(byte: u8) -> String {
+        const_hex::encode_prefixed([byte; 56])
+    }
+
+    fn traded_order() -> serde_json::Value {
+        serde_json::json!({
+            "side": "sell",
+            "sellToken": format!("0x{:040x}", 1),
+            "buyToken": format!("0x{:040x}", 2),
+            "limitSell": "1000",
+            "limitBuy": "900",
+            "executedSell": "500",
+            "executedBuy": "450",
+        })
+    }
+
+    fn response_with_orders(orders: &[String]) -> String {
+        let orders = orders
+            .iter()
+            .map(|uid| format!("\"{uid}\": {}", traded_order()))
+            .join(",");
+        format!(
+            r#"{{"solutions": [{{
+                "solutionId": 1,
+                "submissionAddress": "0x{:040x}",
+                "orders": {{{orders}}}
+            }}]}}"#,
+            3
+        )
+    }
+
+    #[test]
+    fn rejects_solutions_settling_the_same_order_twice() {
+        let uid = order_uid(1);
+        let response = response_with_orders(&[uid.clone(), uid.clone()]);
+
+        let err = serde_json::from_str::<Response>(&response).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid entry: found duplicate key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_one_entry_per_order() {
+        let response = response_with_orders(&[order_uid(1), order_uid(2)]);
+
+        let response = serde_json::from_str::<Response>(&response).unwrap();
+        assert_eq!(response.solutions[0].orders.len(), 2);
+    }
+
+    #[test]
+    fn compression_round_trips() {
+        let json = make_test_json();
+
+        let compressed = compress(&json).unwrap();
+        assert!(
+            compressed.len() < json.len(),
+            "compressed body {} should be smaller than original {}",
+            compressed.len(),
+            json.len(),
+        );
+
+        let mut decompressed = Vec::new();
+        brotli::BrotliDecompress(&mut compressed.as_ref(), &mut decompressed).unwrap();
+        assert_eq!(decompressed, json);
+    }
+
+    /// The `content-encoding` header a driver receives for this request.
+    fn content_encoding(request: &Request) -> Option<String> {
+        let request = request
+            .inject(reqwest::Client::new().post("http://localhost"))
+            .build()
+            .unwrap();
+        request
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .map(|value| value.to_str().unwrap().to_owned())
+    }
+
+    #[tokio::test]
+    async fn encoding_is_chosen_per_driver() {
+        let auction = test_auction(1, vec![test_order(0x11, 0)]);
+        let plain = Request::new(&auction, &HashSet::new(), test_deadline()).await;
+        let requests = EncodedRequests::new(plain.clone(), true).await;
+
+        let request = requests.for_driver(false);
+        assert_eq!(content_encoding(&request), None);
+        assert_eq!(request.body, plain.body);
+
+        let request = requests.for_driver(true);
+        assert_eq!(content_encoding(&request), Some("br".to_owned()));
+        assert_eq!(request.body_to_string(), "<compressed>");
+        let mut decompressed = Vec::new();
+        brotli::BrotliDecompress(&mut request.body.as_ref(), &mut decompressed).unwrap();
+        assert_eq!(decompressed, plain.body);
+    }
+
+    #[tokio::test]
+    async fn compressed_request_is_only_built_when_asked_for() {
+        let auction = test_auction(1, vec![test_order(0x11, 0)]);
+        let plain = Request::new(&auction, &HashSet::new(), test_deadline()).await;
+        let requests = EncodedRequests::new(plain, false).await;
+
+        assert_eq!(requests.compressed_body_size(), None);
+        assert_eq!(content_encoding(&requests.for_driver(true)), None);
+    }
+
+    /// Uid with all 56 bytes set to `uid_byte`.
+    fn uid(uid_byte: u8) -> boundary::OrderUid {
+        boundary::OrderUid([uid_byte; 56])
+    }
+
+    fn uid_json(uid_byte: u8) -> String {
+        format!("0x{}", format!("{uid_byte:02x}").repeat(56))
+    }
+
+    /// JSON of a minimal order as serialized by [`RequestHelper`], with all
+    /// bytes of the uid set to `uid_byte`.
+    fn order_json(uid_byte: u8, executed: u64) -> serde_json::Value {
+        serde_json::json!({
+            "uid": uid_json(uid_byte),
+            "sellToken": "0x2222222222222222222222222222222222222222",
+            "buyToken": "0x3333333333333333333333333333333333333333",
+            "sellAmount": "1000",
+            "buyAmount": "2000",
+            "protocolFees": [],
+            "created": 1,
+            "validTo": 2,
+            "kind": "sell",
+            "receiver": "0x0000000000000000000000000000000000000000",
+            "owner": "0x4444444444444444444444444444444444444444",
+            "partiallyFillable": true,
+            "executed": executed.to_string(),
+            "preInteractions": [],
+            "postInteractions": [],
+            "sellTokenBalance": "erc20",
+            "buyTokenBalance": "erc20",
+            "class": "limit",
+            "appData": format!("0x{}", "00".repeat(32)),
+            "signingScheme": "eip712",
+            "signature": format!("0x{}1c", "01".repeat(64)),
+            "quote": null,
+        })
+    }
+
+    fn test_order(uid_byte: u8, executed: u64) -> domain::Order {
+        dto::order::to_domain(serde_json::from_value(order_json(uid_byte, executed)).unwrap())
+    }
+
+    #[test]
+    fn order_penalty_cap_round_trips() {
+        let mut json = order_json(0x11, 0);
+        json.as_object_mut()
+            .unwrap()
+            .insert("penaltyCapNative".into(), serde_json::json!("1234"));
+        let order = dto::order::to_domain(serde_json::from_value(json.clone()).unwrap());
+        let serialized = serde_json::to_value(dto::order::from_domain(&order)).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    fn test_auction(id: i64, orders: Vec<domain::Order>) -> domain::Auction {
+        domain::Auction {
+            id,
+            block: 1,
+            orders,
+            prices: Default::default(),
+            surplus_capturing_jit_order_owners: vec![],
+        }
+    }
+
+    fn test_deadline() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_request_is_tagged() {
+        let auction = test_auction(1, vec![test_order(0x11, 0)]);
+        let request = Request::new(&auction, &HashSet::new(), test_deadline()).await;
+        let body: serde_json::Value = serde_json::from_str(&request.body_to_string()).unwrap();
+
+        // The `kind` tag is the only addition compared to the body drivers
+        // received before delta requests existed; every other field keeps its
+        // name and place, so drivers that ignore unknown fields are unaffected.
+        assert_eq!(body.get("kind"), Some(&serde_json::json!("full")));
+        assert_eq!(body.get("id"), Some(&serde_json::json!("1")));
+        assert_eq!(
+            body.get("orders"),
+            Some(&serde_json::json!([order_json(0x11, 0)]))
+        );
+    }
+
+    /// The wire shape of a delta body, mirrored in the driver's tests
+    /// (crates/driver/src/infra/api/routes/solve/dto/solve_request.rs) to
+    /// pin the format both sides agree on. Note that the two [`OrderDelta`]
+    /// fields are flattened into the body instead of nested.
+    #[tokio::test]
+    async fn delta_request_wire_format() {
+        let previous = test_auction(1, vec![test_order(0x33, 0)]);
+        let current = test_auction(2, vec![test_order(0x44, 0)]);
+        let request =
+            Request::new_delta(&previous, &current, &HashSet::new(), test_deadline()).await;
+
+        let actual: serde_json::Value = serde_json::from_str(&request.body_to_string()).unwrap();
+        let expected = serde_json::json!({
+            "kind": "delta",
+            "id": "2",
+            "tokens": [],
+            "updatedOrders": [order_json(0x44, 0)],
+            "removedOrders": [uid_json(0x33)],
+            "deadline": "2023-11-14T22:13:20Z",
+            "surplusCapturingJitOrderOwners": [],
+        });
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn order_delta_splits_updated_from_removed() {
+        let unchanged = test_order(0x11, 0);
+        let previous = [unchanged.clone(), test_order(0x22, 0), test_order(0x33, 0)];
+        let current = [
+            unchanged,
+            // same uid, but partially filled by now
+            test_order(0x22, 100),
+            // brand new order
+            test_order(0x44, 0),
+        ];
+
+        let delta = OrderDelta::compute(&previous, &current);
+
+        let updated: Vec<_> = delta
+            .updated_orders
+            .iter()
+            .map(|order| (order.uid, order.executed))
+            .collect();
+        assert_eq!(
+            updated,
+            [(uid(0x22), U256::from(100)), (uid(0x44), U256::ZERO)]
+        );
+        assert_eq!(delta.removed_orders, [uid(0x33)]);
+    }
+
+    #[test]
+    fn order_delta_is_empty_for_identical_orders() {
+        let orders = [test_order(0x11, 0), test_order(0x22, 0)];
+
+        let delta = OrderDelta::compute(&orders, &orders);
+
+        assert!(delta.updated_orders.is_empty());
+        assert!(delta.removed_orders.is_empty());
+    }
 }
