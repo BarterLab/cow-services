@@ -664,7 +664,21 @@ impl Solution {
         simulator: &Simulator,
         solver_native_token: ManageNativeToken,
     ) -> Result<Settlement, Error> {
-        Settlement::encode(self, auction, eth, simulator, solver_native_token).await
+        let sender = self.solver().address();
+        self.encode_from(auction, eth, simulator, solver_native_token, sender).await
+    }
+
+    /// Encode and validate using the actual funded transaction sender, without
+    /// changing the solver identity, prices, trades or interactions.
+    pub async fn encode_from(
+        self,
+        auction: &competition::Auction,
+        eth: &Ethereum,
+        simulator: &Simulator,
+        solver_native_token: ManageNativeToken,
+        sender: eth::Address,
+    ) -> Result<Settlement, Error> {
+        Settlement::encode(self, auction, eth, simulator, solver_native_token, sender).await
     }
 
     /// Token prices settled by this solution, expressed using an arbitrary

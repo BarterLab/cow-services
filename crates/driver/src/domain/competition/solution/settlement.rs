@@ -80,6 +80,7 @@ impl Settlement {
         eth: &Ethereum,
         simulator: &Simulator,
         solver_native_token: ManageNativeToken,
+        sender: eth::Address,
     ) -> Result<Self, Error> {
         // For a settlement to be valid, the solution has to respect some rules which
         // would otherwise lead to slashing. Check those rules first.
@@ -105,7 +106,7 @@ impl Settlement {
         }
 
         // Encode the solution into a settlement.
-        let tx = SettlementTx {
+        let mut tx = SettlementTx {
             internalized: encoding::tx(
                 auction,
                 &solution,
@@ -124,6 +125,8 @@ impl Settlement {
             )?,
             may_revert: solution.revertable(),
         };
+        tx.internalized.from = sender;
+        tx.uninternalized.from = sender;
         Self::new(auction.id().unwrap(), solution, tx, eth, simulator).await
     }
 
@@ -160,7 +163,7 @@ impl Settlement {
                 return Ok(Default::default());
             }
             let tx = eth::Tx {
-                from: solution.solver().address(),
+                from: transaction.internalized.from,
                 to: trade.order().receiver(),
                 value: 1.into(),
                 input: Default::default(),
@@ -193,12 +196,11 @@ impl Settlement {
         let gas = Gas::new(gas, eth.block_gas_limit())?;
         tracing::info!("Creating new settlement with gas {} with limit {}", gas.estimate, gas.limit);
 
-        // Ensure that the solver has sufficient balance for the settlement to be mined
-        // even if the gas price keeps climbing during the tx submission.
-        let required_eth_balance =
-            // Converting to U256 first avoids possible overflow
-            gas.required_balance(U256::from(price.max_fee_per_gas).saturating_mul(U256::from(2)));
-        if eth.balance(solution.solver().address()).await? < required_eth_balance {
+        // Check the transaction's upfront cost. Submission must check again with
+        // its final fees; an extra fee multiplier here rejects funded senders.
+        let required_eth_balance = eth::Ether(gas.required_balance(U256::from(price.max_fee_per_gas)).0
+            .saturating_add(transaction.internalized.value.0));
+        if eth.balance(transaction.internalized.from).await? < required_eth_balance {
             return Err(Error::SolverAccountInsufficientBalance(
                 required_eth_balance,
             ));
@@ -280,6 +282,24 @@ impl Settlement {
             Internalization::Enable => &self.transaction.internalized,
             Internalization::Disable => &self.transaction.uninternalized,
         }
+    }
+
+    /// Revalidate the exact prepared calldata for another signer. This does not
+    /// re-encode trades, prices, fees or interactions. Both internalized and full
+    /// execution are checked using the same simulation context as the original.
+    pub async fn for_sender(
+        &self,
+        sender: eth::Address,
+        eth: &Ethereum,
+        simulator: &Simulator,
+    ) -> Result<Self, Error> {
+        if self.transaction.internalized.from == sender {
+            return Ok(self.clone());
+        }
+        let mut transaction = self.transaction.clone();
+        transaction.internalized.from = sender;
+        transaction.uninternalized.from = sender;
+        Self::new(self.auction_id, self.solution.clone(), transaction, eth, simulator).await
     }
 
     /// Whether the settlement contains interactions that could possibly revert
