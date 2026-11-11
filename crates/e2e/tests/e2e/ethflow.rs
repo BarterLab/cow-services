@@ -1,11 +1,26 @@
 use {
     alloy::{
         primitives::{Address, B256, Bytes, U256},
+        providers::Provider,
         rpc::types::TransactionReceipt,
     },
     anyhow::bail,
     autopilot::database::onchain_order_events::ethflow_events::WRAP_ALL_SELECTOR,
-    contracts::alloy::{CoWSwapEthFlow, ERC20Mintable, WETH9},
+    configs::{
+        autopilot::{
+            Configuration,
+            fee_policy::{
+                FeePoliciesConfig,
+                FeePolicy as ConfigFeePolicy,
+                FeePolicyKind as ConfigFeePolicyKind,
+                FeePolicyOrderClass as ConfigFeePolicyOrderClass,
+            },
+        },
+        fee_factor::FeeFactor,
+        orderbook::order_validation::OrderValidationConfig,
+        test_util::TestDefault,
+    },
+    contracts::{CoWSwapEthFlow, ERC20Mintable, WETH9},
     database::{byte_array::ByteArray, order_events::OrderEventLabel},
     e2e::setup::{
         ACCOUNT_ENDPOINT,
@@ -19,16 +34,18 @@ use {
         run_test,
         wait_for_condition,
     },
+    eth_domain_types::Receiver,
     ethrpc::{Web3, alloy::CallBuilderExt, block_stream::timestamp_of_current_block_in_seconds},
     model::{
         DomainSeparator,
         order::{
+            BUY_ETH_ADDRESS,
             BuyTokenDestination,
             EthflowData,
             OnchainOrderData,
+            OnchainOrderPlacementError,
             Order,
             OrderBuilder,
-            OrderClass,
             OrderCreationAppData,
             OrderKind,
             OrderUid,
@@ -48,7 +65,8 @@ use {
     number::{nonzero::NonZeroU256, units::EthUnit},
     refunder::RefundStatus,
     reqwest::Client,
-    shared::signature_validator::check_erc1271_result,
+    serde_json::json,
+    signature_validator::check_erc1271_result,
     std::ops::DerefMut,
 };
 
@@ -66,6 +84,15 @@ async fn local_node_eth_flow_without_quote() {
     run_test(eth_flow_without_quote).await;
 }
 
+/// Native "bridging" round-trip: an ethflow order that sells native ETH and
+/// buys native ETH (`BUY_ETH_ADDRESS`), carrying a custom post-hook that stands
+/// in for the bridge call.
+#[tokio::test]
+#[ignore]
+async fn local_node_eth_flow_native_bridge_post_hook() {
+    run_test(eth_flow_native_bridge_post_hook).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn local_node_eth_flow_indexing_after_refund() {
@@ -78,6 +105,12 @@ async fn local_node_eth_flow_indexing_after_refund() {
 #[ignore]
 async fn local_node_eth_flow_zero_buy_amount() {
     run_test(eth_flow_zero_buy_amount).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn local_node_eth_flow_invalid_wrapper() {
+    run_test(eth_flow_invalid_wrapper).await;
 }
 
 async fn eth_flow_tx(web3: Web3) {
@@ -93,7 +126,7 @@ async fn eth_flow_tx(web3: Web3) {
 
     // Get a quote from the services
     let buy_token = *dai.address();
-    let receiver = Address::repeat_byte(0x42);
+    let receiver = Receiver::new(Address::repeat_byte(0x42));
     let sell_amount = 1u64.eth();
     let intent = EthFlowTradeIntent {
         sell_amount,
@@ -268,6 +301,197 @@ async fn eth_flow_tx(web3: Web3) {
     );
 }
 
+/// Proves the full pipeline a native-bridge integration would rely on:
+///
+/// 1. The post-hook (here, the bridge action) is published as an app-data
+///    document via `PUT /app_data`.
+/// 2. An ethflow order is created on-chain referencing that app-data hash and
+///    buying native ETH (`BUY_ETH_ADDRESS`) — a same sell/buy token order in
+///    the native-equivalent sense (sell WETH, buy native ETH).
+/// 3. The autopilot indexes the on-chain order and resolves the published
+///    app-data, attaching the post-hook.
+/// 4. The settlement wraps the user's ETH into WETH (ethflow's default
+///    `WRAP_ALL` pre-interaction), settles the same-token swap delivering
+///    native ETH to the receiver, and finally runs the post-hook.
+/// 5. No volume fee is charged: WETH -> native ETH is a same-token trade, so
+///    the configured volume fee is dropped on both quote and settlement.
+///
+/// The "bridge" is represented by a `Counter` contract whose `incrementCounter`
+/// we assert ran exactly once — the same hook-proving approach used in
+/// `hooks.rs` and `submission.rs`.
+///
+/// Note: on-chain ethflow orders are not subject to the orderbook's
+/// `SameTokensPolicy` during indexing, but the *quote* request is, so the
+/// orderbook must run with at least `AllowSell` for this flow to work.
+async fn eth_flow_native_bridge_post_hook(web3: Web3) {
+    let mut onchain = OnchainComponents::deploy(web3.clone()).await;
+
+    let [solver] = onchain.make_solvers(2u64.eth()).await;
+    let [trader] = onchain.make_accounts(2u64.eth()).await;
+
+    // Stand-in for the bridge call the post-hook would perform.
+    let counter = contracts::test::Counter::Instance::deploy(web3.provider.clone())
+        .await
+        .unwrap();
+    let increment = counter.incrementCounter("post".to_string());
+    let post_call_data = const_hex::encode_prefixed(increment.calldata());
+
+    let services = Services::new(&onchain).await;
+    let volume_fee = ConfigFeePolicy {
+        kind: ConfigFeePolicyKind::Volume {
+            factor: 0.01.try_into().unwrap(),
+        },
+        order_class: ConfigFeePolicyOrderClass::Any,
+    };
+    // `AllowSell` is required for the same-token (WETH -> native ETH) quote
+    // below.
+    services
+        .start_protocol_with_args(
+            Configuration {
+                fee_policies: FeePoliciesConfig {
+                    policies: vec![volume_fee],
+                    ..Default::default()
+                },
+                ..Configuration::test("test_solver", solver.address())
+            },
+            configs::orderbook::Configuration {
+                order_validation: OrderValidationConfig {
+                    same_tokens_policy: shared::order_validation::SameTokensPolicy::AllowSell,
+                    ..Default::default()
+                },
+                volume_fee: Some(configs::orderbook::VolumeFeeConfig {
+                    factor: Some(FeeFactor::new(0.01)),
+                    effective_from_timestamp: None,
+                }),
+                ..configs::orderbook::Configuration::test_default()
+            },
+            solver.clone(),
+        )
+        .await;
+
+    // Publish the app-data carrying the bridge post-hook so both the quote and
+    // the autopilot can resolve it by hash.
+    let hash = services
+        .put_app_data(
+            None,
+            &format!(
+                r#"{{
+    "metadata": {{
+         "hooks": {{
+             "post": [
+                 {{
+                     "target": "{:?}",
+                     "callData": "{}",
+                     "gasLimit": "100000"
+                 }}
+             ]
+         }}
+    }}
+}}"#,
+                counter.address(),
+                post_call_data,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let receiver = Receiver::new(Address::repeat_byte(0x42));
+    let sell_amount = 1u64.eth();
+    let quote_request = OrderQuoteRequest {
+        app_data: OrderCreationAppData::Hash {
+            hash: app_data::AppDataHash(const_hex::decode(&hash[2..]).unwrap().try_into().unwrap()),
+        },
+        ..EthFlowTradeIntent {
+            sell_amount,
+            buy_token: BUY_ETH_ADDRESS,
+            receiver,
+        }
+        .to_quote_request(trader.address(), &onchain.contracts().weth)
+    };
+    let quote = services.submit_quote(&quote_request).await.unwrap();
+    assert!(quote.id.is_some());
+    assert!(quote.verified);
+    assert!(
+        quote.protocol_fee_bps.is_none(),
+        "WETH->ETH ethflow quote must not carry a volume fee, got {:?}",
+        quote.protocol_fee_bps
+    );
+
+    let valid_to = chrono::offset::Utc::now().timestamp() as u32
+        + timestamp_of_current_block_in_seconds(&web3.provider)
+            .await
+            .unwrap()
+        + 3600;
+    let ethflow_order =
+        ExtendedEthFlowOrder::from_quote(&quote, valid_to).include_slippage_bps(300);
+    assert_eq!(ethflow_order.0.buyToken, BUY_ETH_ADDRESS);
+
+    let ethflow_contract = onchain.contracts().ethflows.first().unwrap();
+    submit_order(
+        &ethflow_order,
+        trader.address(),
+        onchain.contracts(),
+        ethflow_contract,
+    )
+    .await;
+
+    // The bridge hook must not have run before settlement.
+    assert_eq!(
+        counter.counters("post".to_string()).call().await.unwrap(),
+        U256::ZERO,
+    );
+
+    tracing::info!("waiting for trade");
+    // The buy side is native ETH (not an ERC20), so we check the native
+    // balance. The order being settled at all proves the autopilot indexed
+    // it. We require the receiver to get back roughly the full sell amount
+    // to prove the native value actually round-tripped out, not just dust.
+    //
+    // 95% floor = the order's 3% slippage tolerance
+    // (`include_slippage_bps(300)` above) plus a small safety margin. It's
+    // a "real value vs. dust" floor, not a tight bound; lower it if the
+    // slippage bps grow.
+    let min_delivered = sell_amount * U256::from(95) / U256::from(100);
+    wait_for_condition(TIMEOUT, || async {
+        onchain.mint_block().await;
+        web3.provider
+            .get_balance(receiver.as_custom().unwrap())
+            .await
+            .unwrap()
+            >= min_delivered
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        counter.counters("post".to_string()).call().await.unwrap(),
+        U256::from(1),
+        "bridge post-hook must have run exactly once as part of the settlement"
+    );
+
+    // Wait for the `order_execution` row (written shortly after settlement) so
+    // the protocol fees we assert on exist.
+    let uid = ethflow_order
+        .uid(onchain.contracts(), ethflow_contract)
+        .await;
+    wait_for_condition(TIMEOUT, || async {
+        onchain.mint_block().await;
+        services
+            .get_order(&uid)
+            .await
+            .is_ok_and(|order| !order.metadata.executed_fee.is_zero())
+    })
+    .await
+    .unwrap();
+
+    let trade = &services.get_trades(&uid).await.unwrap()[0];
+    assert!(
+        trade.executed_protocol_fees.is_empty(),
+        "WETH->ETH ethflow trade must not be charged a volume fee, got {:?}",
+        trade.executed_protocol_fees
+    );
+}
+
 async fn eth_flow_without_quote(web3: Web3) {
     let mut onchain = OnchainComponents::deploy(web3.clone()).await;
 
@@ -333,7 +557,8 @@ async fn eth_flow_indexing_after_refund(web3: Web3) {
     let services = Services::new(&onchain).await;
     services.start_protocol(solver).await;
 
-    // Create an order that only exists to be cancelled.
+    // Create an order that only exists to be cancelled. It still needs a
+    // realistic amount: solvers don't quote dust that can't cover the gas fee.
     let valid_to = timestamp_of_current_block_in_seconds(&web3.provider)
         .await
         .unwrap()
@@ -342,9 +567,9 @@ async fn eth_flow_indexing_after_refund(web3: Web3) {
         &test_submit_quote(
             &services,
             &(EthFlowTradeIntent {
-                sell_amount: alloy::primitives::U256::from(42),
+                sell_amount: 1u64.eth(),
                 buy_token: *dai.address(),
-                receiver: Address::repeat_byte(42),
+                receiver: Receiver::new(Address::repeat_byte(42)),
             })
             .to_quote_request(dummy_trader.address(), &onchain.contracts().weth),
         )
@@ -366,9 +591,10 @@ async fn eth_flow_indexing_after_refund(web3: Web3) {
         .mine_order_invalidation(dummy_trader.address(), ethflow_contract)
         .await;
 
-    // Create the actual order that should be picked up by the services and matched.
+    // Create the actual order that should be picked up by the services and
+    // matched.
     let buy_token = *dai.address();
-    let receiver = Address::repeat_byte(0x42);
+    let receiver = Receiver::new(Address::repeat_byte(0x42));
     let sell_amount = 1u64.eth();
     let valid_to = chrono::offset::Utc::now().timestamp() as u32
         + timestamp_of_current_block_in_seconds(&web3.provider)
@@ -626,7 +852,6 @@ async fn test_order_parameters(
             placement_error: None,
         })
     );
-    assert_eq!(response.metadata.class, OrderClass::Limit);
     assert!(
         order
             .is_valid_cowswap_signature(&response.signature, contracts, ethflow_contract)
@@ -650,7 +875,7 @@ impl ExtendedEthFlowOrder {
         let quote = &quote_response.quote;
         ExtendedEthFlowOrder(CoWSwapEthFlow::EthFlowOrder::Data {
             buyToken: quote.buy_token,
-            receiver: quote.receiver.expect("eth-flow order without receiver"),
+            receiver: Address::from(*quote.receiver.raw_bytes()),
             sellAmount: quote.sell_amount,
             buyAmount: quote.buy_amount,
             appData: quote.app_data.hash().0.into(),
@@ -673,12 +898,11 @@ impl ExtendedEthFlowOrder {
             .with_sell_token(*weth.address())
             .with_sell_amount(self.0.sellAmount)
             .with_fee_amount(self.0.feeAmount)
-            .with_receiver(Some(self.0.receiver))
+            .with_receiver(self.0.receiver.into())
             .with_buy_token(self.0.buyToken)
             .with_buy_amount(self.0.buyAmount)
             .with_valid_to(u32::MAX)
             .with_app_data(self.0.appData.0)
-            .with_class(OrderClass::Market) // Eth-flow orders only support market orders at this point in time
             .with_eip1271(*ethflow_contract.address(), vec![])
             .build()
     }
@@ -812,7 +1036,7 @@ impl ExtendedEthFlowOrder {
 pub struct EthFlowTradeIntent {
     pub sell_amount: alloy::primitives::U256,
     pub buy_token: Address,
-    pub receiver: Address,
+    pub receiver: Receiver,
 }
 
 impl EthFlowTradeIntent {
@@ -823,7 +1047,7 @@ impl EthFlowTradeIntent {
             // Even if the user sells ETH, we request a quote for WETH
             sell_token: *weth.address(),
             buy_token: self.buy_token,
-            receiver: Some(self.receiver),
+            receiver: self.receiver,
             validity: Validity::For(3600),
             app_data: OrderCreationAppData::default(),
             signing_scheme: QuoteSigningScheme::Eip1271 {
@@ -906,4 +1130,72 @@ async fn eth_flow_zero_buy_amount(web3: Web3) {
     // still settle good orders.
     tracing::info!("waiting for trade");
     test_order_was_settled(&order_b, &onchain).await;
+}
+
+/// On-chain orders can't be rejected when they get placed, so an ethflow order
+/// whose app-data names a wrapper that can't be trusted to settle it has to be
+/// indexed as invalid instead.
+async fn eth_flow_invalid_wrapper(web3: Web3) {
+    let mut onchain = OnchainComponents::deploy(web3.clone()).await;
+
+    let [solver] = onchain.make_solvers(2u64.eth()).await;
+    let [trader] = onchain.make_accounts(2u64.eth()).await;
+    let [dai] = onchain
+        .deploy_tokens_with_weth_uni_v2_pools((DAI_PER_ETH * 1_000).eth(), 1_000u64.eth())
+        .await;
+
+    // The solver is authorized to call `settle()` but isn't a wrapper contract.
+    let wrapper = solver.address();
+    let services = Services::new(&onchain).await;
+    services.start_protocol(solver).await;
+
+    let app_data = services
+        .put_app_data(
+            None,
+            &json!({
+                "metadata": {
+                    "wrappers": [{"address": wrapper, "data": "0x"}],
+                },
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+    let valid_to = chrono::offset::Utc::now().timestamp() as u32
+        + timestamp_of_current_block_in_seconds(&web3.provider)
+            .await
+            .unwrap()
+        + 3600;
+    let ethflow_order = ExtendedEthFlowOrder(CoWSwapEthFlow::EthFlowOrder::Data {
+        buyToken: *dai.address(),
+        sellAmount: 1u64.eth(),
+        buyAmount: U256::ONE,
+        validTo: valid_to,
+        partiallyFillable: false,
+        quoteId: 0,
+        feeAmount: U256::ZERO,
+        receiver: trader.address(),
+        appData: app_data.parse().unwrap(),
+    });
+    let ethflow_contract = onchain.contracts().ethflows.first().unwrap();
+    submit_order(
+        &ethflow_order,
+        trader.address(),
+        onchain.contracts(),
+        ethflow_contract,
+    )
+    .await;
+
+    let uid = ethflow_order
+        .uid(onchain.contracts(), ethflow_contract)
+        .await;
+    wait_for_condition(TIMEOUT, || async { services.get_order(&uid).await.is_ok() })
+        .await
+        .unwrap();
+    let order = services.get_order(&uid).await.unwrap();
+    assert_eq!(
+        order.metadata.onchain_order_data.unwrap().placement_error,
+        Some(OnchainOrderPlacementError::InvalidOrderData),
+    );
 }

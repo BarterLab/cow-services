@@ -1,22 +1,24 @@
 use {
     alloy::{
-        primitives::{Address, B256, U256},
+        primitives::{Address, B256, U256, keccak256},
         providers::Provider,
+        sol_types::SolCall,
     },
-    contracts::alloy::{
+    contracts::{
         BalancerV2Authorizer,
         BalancerV2Vault,
         CoWSwapEthFlow,
         FlashLoanRouter,
         GPv2AllowListAuthentication,
         GPv2Settlement,
+        HoneyswapRouter,
         HooksTrampoline,
         UniswapV2Factory,
         UniswapV2Router02,
         WETH9,
-        support::{Balances, Signatures},
+        support::{Balances, DeadlineCheck, Signatures},
     },
-    ethrpc::alloy::CallBuilderExt,
+    ethrpc::alloy::{CallBuilderExt, ProviderExt},
     model::DomainSeparator,
     shared::web3::Web3,
 };
@@ -25,6 +27,7 @@ use {
 pub struct DeployedContracts {
     pub balances: Option<Address>,
     pub signatures: Option<Address>,
+    pub deadline_check: Option<Address>,
 }
 
 pub struct Contracts {
@@ -34,6 +37,7 @@ pub struct Contracts {
     pub signatures: Signatures::Instance,
     pub gp_authenticator: GPv2AllowListAuthentication::Instance,
     pub balances: Balances::Instance,
+    pub deadline_check: DeadlineCheck::Instance,
     pub uniswap_v2_factory: UniswapV2Factory::Instance,
     pub uniswap_v2_router: UniswapV2Router02::Instance,
     pub weth: WETH9::Instance,
@@ -69,6 +73,12 @@ impl Contracts {
                 .await
                 .expect("failed to find signatures contract"),
         };
+        let deadline_check = match deployed.deadline_check {
+            Some(address) => DeadlineCheck::Instance::new(address, web3.provider.clone()),
+            None => DeadlineCheck::Instance::deployed(&web3.provider)
+                .await
+                .expect("failed to find deadline_check contract"),
+        };
 
         let flashloan_router = FlashLoanRouter::Instance::deployed(&web3.provider)
             .await
@@ -87,9 +97,7 @@ impl Contracts {
             uniswap_v2_factory: UniswapV2Factory::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
-            uniswap_v2_router: UniswapV2Router02::Instance::deployed(&web3.provider)
-                .await
-                .unwrap(),
+            uniswap_v2_router: uniswap_v2_router_for_chain(web3).await,
             weth: WETH9::Instance::deployed(&web3.provider).await.unwrap(),
             allowance: gp_settlement
                 .vaultRelayer()
@@ -115,6 +123,7 @@ impl Contracts {
             gp_settlement,
             balances,
             signatures,
+            deadline_check,
             flashloan_router,
         }
     }
@@ -127,6 +136,8 @@ impl Contracts {
             .expect("get network ID failed")
             .to_string();
         tracing::info!("connected to test network {}", network_id);
+
+        web3.provider.deploy_multicall3().await.unwrap();
 
         let accounts = web3
             .provider
@@ -185,8 +196,11 @@ impl Contracts {
         let signatures = Signatures::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
+        let deadline_check = DeadlineCheck::Instance::deploy(web3.provider.clone())
+            .await
+            .unwrap();
 
-        contracts::vault::grant_required_roles(
+        grant_required_roles(
             &balancer_authorizer,
             *balancer_vault.address(),
             gp_settlement
@@ -195,8 +209,7 @@ impl Contracts {
                 .await
                 .expect("failed to retrieve Vault relayer contract address"),
         )
-        .await
-        .expect("failed to authorize Vault relayer");
+        .await;
 
         let allowance = gp_settlement
             .vaultRelayer()
@@ -244,6 +257,7 @@ impl Contracts {
             gp_authenticator,
             balances,
             signatures,
+            deadline_check,
             uniswap_v2_factory,
             uniswap_v2_router,
             weth,
@@ -258,8 +272,60 @@ impl Contracts {
 
     pub fn default_pool_code(&self) -> B256 {
         match self.chain_id {
-            100 => B256::new(shared::sources::uniswap_v2::HONEYSWAP_INIT),
-            _ => B256::new(shared::sources::uniswap_v2::UNISWAP_INIT),
+            100 => B256::new(liquidity_sources::uniswap_v2::HONEYSWAP_INIT),
+            _ => B256::new(liquidity_sources::uniswap_v2::UNISWAP_INIT),
         }
     }
+}
+
+/// Resolve a router with the canonical UniswapV2 ABI for the current chain.
+async fn uniswap_v2_router_for_chain(web3: &Web3) -> UniswapV2Router02::Instance {
+    const GNOSIS_CHAIN_ID: u64 = 100;
+    let chain_id = web3
+        .provider
+        .get_chain_id()
+        .await
+        .expect("get chain id failed");
+    let address = match chain_id {
+        // Gnosis: no official Uniswap V2 deployment; use Honeyswap's router,
+        // which is what xdai's `honeyswap` preset binds in the driver.
+        GNOSIS_CHAIN_ID => HoneyswapRouter::deployment_address(&chain_id)
+            .expect("HoneyswapRouter deployment address registered for Gnosis"),
+        _ => {
+            return UniswapV2Router02::Instance::deployed(&web3.provider)
+                .await
+                .expect("UniswapV2Router02 deployment address registered for this chain");
+        }
+    };
+    UniswapV2Router02::Instance::new(address, web3.provider.clone())
+}
+
+fn role_id<Call: SolCall>(vault: Address) -> B256 {
+    let mut data = [0u8; 36];
+    data[12..32].copy_from_slice(vault.as_slice());
+    data[32..36].copy_from_slice(&Call::SELECTOR);
+    keccak256(data)
+}
+
+async fn grant_required_roles(
+    authorizer: &BalancerV2Authorizer::Instance,
+    vault: Address,
+    vault_relayer: Address,
+) {
+    use contracts::BalancerV2Vault::BalancerV2Vault::{batchSwapCall, manageUserBalanceCall};
+
+    authorizer
+        .grantRoles(
+            vec![
+                role_id::<manageUserBalanceCall>(vault).0.into(),
+                role_id::<batchSwapCall>(vault).0.into(),
+            ],
+            vault_relayer,
+        )
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
 }

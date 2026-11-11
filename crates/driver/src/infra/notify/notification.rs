@@ -1,8 +1,6 @@
 use {
-    crate::domain::{
-        competition::{auction, solution},
-        eth::{self, Ether, TokenAddress},
-    },
+    crate::domain::competition::{auction, solution},
+    eth_domain_types::{self as eth, Ether, TokenAddress},
     std::collections::BTreeSet,
 };
 
@@ -38,9 +36,11 @@ pub enum Kind {
     NonBufferableTokensUsed(TokensUsed),
     /// Solver don't have enough balance to submit the solution onchain.
     SolverAccountInsufficientBalance(RequiredEther),
+    /// Solver won, driver is trying to  settle the transaction onchain.
+    SettlementStarted,
     /// Result of winning solver trying to settle the transaction onchain.
     Settled(Settlement),
-    ///
+    /// Legacy notification used by external settlement submitters.
     Settling,
     /// Some aspect of the driver logic failed preventing the solution from
     /// participating in the auction.

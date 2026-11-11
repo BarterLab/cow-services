@@ -1,19 +1,17 @@
 use {
-    crate::{
-        domain::eth,
-        infra::{Ethereum, blockchain},
-    },
+    crate::infra::{Ethereum, blockchain},
     anyhow::Result,
+    eth_domain_types as eth,
     ethrpc::block_stream::{self, CurrentBlockWatcher},
     futures::{FutureExt, StreamExt},
     itertools::Itertools,
     model::order::BUY_ETH_ADDRESS,
-    shared::request_sharing::BoxRequestSharing,
+    request_sharing::BoxRequestSharing,
     std::{
         collections::HashMap,
         sync::{Arc, RwLock},
     },
-    tracing::Instrument,
+    tracing::instrument,
 };
 
 #[derive(Clone, Debug)]
@@ -22,6 +20,9 @@ pub struct Metadata {
     pub symbol: Option<String>,
     /// Current balance of the smart contract.
     pub balance: eth::TokenAmount,
+    /// If this flag is true a background task will continuously
+    /// update this token's [`Metadata::balance`] field.
+    pub monitor_balance: bool,
 }
 
 #[derive(Clone)]
@@ -36,10 +37,7 @@ impl Fetcher {
             cache: RwLock::new(HashMap::new()),
             requests: BoxRequestSharing::labelled("token_info".into()),
         });
-        tokio::task::spawn(
-            update_task(block_stream, Arc::downgrade(&inner))
-                .instrument(tracing::info_span!("token_fetcher")),
-        );
+        tokio::task::spawn(update_task(block_stream, Arc::downgrade(&inner)));
         Self(inner)
     }
 
@@ -51,6 +49,34 @@ impl Fetcher {
         addresses: &[eth::TokenAddress],
     ) -> HashMap<eth::TokenAddress, Metadata> {
         self.0.get(addresses).await
+    }
+
+    /// Tells the cache to continuously update the settlement contract balance
+    /// of the given tokens if they are already present in the cache. That only
+    /// really makes sense for tokens where internal buffer trading is allowed.
+    pub fn keep_track_of_balances<'a>(&self, tokens: impl IntoIterator<Item = &'a eth::Address>) {
+        // most of the time no updates are needed so we first take a read lock
+        // to check if we even have to take a write lock for updating
+        // the tokens at all
+        let tokens_to_update: Vec<_> = {
+            let cache = self.0.cache.read().unwrap();
+            tokens
+                .into_iter()
+                .filter(|token| {
+                    cache
+                        .get(&((**token).into()))
+                        .is_some_and(|entry| !entry.monitor_balance)
+                })
+                .collect()
+        };
+        if !tokens_to_update.is_empty() {
+            let mut cache = self.0.cache.write().unwrap();
+            tokens_to_update.into_iter().for_each(|token| {
+                if let Some(entry) = cache.get_mut(&((*token).into())) {
+                    entry.monitor_balance = true;
+                }
+            })
+        }
     }
 }
 
@@ -71,20 +97,19 @@ async fn update_task(blocks: CurrentBlockWatcher, inner: std::sync::Weak<Inner>)
 }
 
 /// Updates the settlement contract's balance for every cached token.
+#[instrument(skip_all)]
 async fn update_balances(inner: Arc<Inner>) -> Result<(), blockchain::Error> {
     let settlement = *inner.eth.contracts().orig_settlement().address();
-    let futures = {
+    let futures: Vec<_> = {
         let cache = inner.cache.read().unwrap();
-        let tokens = cache.keys().cloned().collect::<Vec<_>>();
-        tokens.into_iter().map(|token| {
-            let erc20 = inner.eth.erc20(token);
-            async move {
-                Ok::<(eth::TokenAddress, eth::TokenAmount), blockchain::Error>((
-                    token,
-                    erc20.balance(settlement).await?,
-                ))
-            }
-        })
+        cache
+            .iter()
+            .filter(|(_token, info)| info.monitor_balance)
+            .map(|(token, _info)| {
+                let erc20 = inner.eth.erc20(*token);
+                async move { (erc20.address(), erc20.balance(settlement).await) }
+            })
+            .collect()
     };
 
     tracing::debug!(
@@ -95,25 +120,25 @@ async fn update_balances(inner: Arc<Inner>) -> Result<(), blockchain::Error> {
     // Don't hold on to the lock while fetching balances to allow concurrent
     // updates. This may lead to new entries arriving in the meantime, however
     // their balances should already be up-to-date.
-    let mut balances = futures::future::try_join_all(futures)
-        .await?
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+    let balances = futures::future::join_all(futures).await;
 
-    let mut keys_without_balances = vec![];
+    let mut failed_updates = vec![];
     {
         let mut cache = inner.cache.write().unwrap();
-        for (key, entry) in cache.iter_mut() {
-            if let Some(balance) = balances.remove(key) {
+        for (token, balance_result) in balances {
+            let Ok(balance) = balance_result else {
+                failed_updates.push(token);
+                continue;
+            };
+
+            if let Some(entry) = cache.get_mut(&token) {
                 entry.balance = balance;
-            } else {
-                // Avoid logging while holding the exclusive lock.
-                keys_without_balances.push(*key);
             }
         }
     }
-    if !keys_without_balances.is_empty() {
-        tracing::info!(keys = ?keys_without_balances, "updated keys without balance");
+
+    if !failed_updates.is_empty() {
+        tracing::info!(tokens = ?failed_updates, "failed to update token balance");
     }
 
     Ok(())
@@ -137,9 +162,10 @@ impl Inner {
             let build_request = |token: &eth::TokenAddress| {
                 let token = self.eth.erc20(*token);
                 async move {
-                    // Use `try_join` because these calls get batched under the hood
-                    // so if one of them fails the others will as well.
-                    // Also this way we won't get incomplete data for a token.
+                    // Use `try_join` because these calls get batched under the
+                    // hood so if one of them fails the
+                    // others will as well. Also this way we
+                    // won't get incomplete data for a token.
                     let (decimals, symbol, balance) = futures::future::try_join3(
                         token.decimals(),
                         token.symbol(),
@@ -154,6 +180,7 @@ impl Inner {
                             decimals,
                             symbol,
                             balance,
+                            monitor_balance: false,
                         },
                     ))
                 }
@@ -178,8 +205,8 @@ impl Inner {
             let cache = self.cache.read().unwrap();
             if tokens.iter().all(|token| cache.contains_key(token)) {
                 // Often multiple callers are racing to fetch the same Metadata.
-                // If somebody else already cached the data we don't want to take an
-                // exclusive lock for nothing.
+                // If somebody else already cached the data we don't want to
+                // take an exclusive lock for nothing.
                 return;
             }
         }

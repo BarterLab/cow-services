@@ -11,14 +11,24 @@ name = "ethrpc"
 path = "src/lib.rs"
 
 [dependencies]
-alloy = { workspace = true, default-features = false, features = ["json-rpc", "providers", "rpc-client", "rpc-types", "rpc-types-trace", "transports", "transport-ws", "provider-ws", "provider-debug-api", "reqwest", "signers", "signer-aws", "signer-local", "eips", "reqwest-default-tls", "pubsub", "contract"] }
+alloy-consensus = { workspace = true }
+alloy-contract = { workspace = true }
+alloy-eips = { workspace = true }
+alloy-json-rpc = { workspace = true }
+alloy-network = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-provider = { workspace = true, features = ["reqwest-default-tls", "reqwest", "ws"] }
+alloy-rpc-client = { workspace = true, features = ["reqwest"] }
+alloy-rpc-types = { workspace = true, features = ["eth"] }
+alloy-signer = { workspace = true }
+alloy-transport = { workspace = true }
+alloy-transport-ws = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 const-hex = { workspace = true }
+contracts = { workspace = true, optional = true }
 futures = { workspace = true }
 itertools = { workspace = true }
-jsonrpc-core.workspace = true
-mockall = { workspace = true, optional = true }
 observe = { workspace = true }
 prometheus = { workspace = true }
 prometheus-metric-storage = { workspace = true }
@@ -33,11 +43,8 @@ tower = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 
-[dev-dependencies]
-mockall = { workspace = true }
-
 [features]
-test-util = ["dep:mockall"]
+test-util = ["alloy-provider/anvil-api", "dep:contracts"]
 
 [lints]
 workspace = true

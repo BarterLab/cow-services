@@ -1,0 +1,337 @@
+//! Configuration of infrastructural components.
+
+use {
+    crate::infra::api::ValidationParameters,
+    configs::{
+        database::DatabasePoolConfig,
+        orderbook::VolumeFeeConfig,
+        price_estimation::QuoteVerificationMode,
+        shared::LoggingConfig,
+    },
+    serde::Deserialize,
+    serde_ext::{deserialize_solana_pubkey_b58, deserialize_url_with_trailing_slash},
+    solana_sdk::pubkey::Pubkey,
+    std::{fmt, net::SocketAddr, num::NonZero, path::Path, time::Duration},
+    tokio::fs,
+    url::Url,
+};
+
+/// Load the orderbook configuration from a TOML file.
+///
+/// # Panics
+///
+/// This method panics if the config is invalid or on I/O errors.
+pub async fn load(path: &Path) -> Config {
+    let data = fs::read_to_string(path)
+        .await
+        .unwrap_or_else(|e| panic!("I/O error while reading {path:?}: {e:?}"));
+
+    toml::de::from_str(&data).unwrap_or_else(|err| {
+        if std::env::var("TOML_TRACE_ERROR").is_ok_and(|v| v == "1") {
+            panic!("failed to parse TOML config at {path:?}: {err:#?}")
+        } else {
+            panic!(
+                "failed to parse TOML config at: {path:?}. Set TOML_TRACE_ERROR=1 to print \
+                 parsing error but this may leak secrets."
+            )
+        }
+    })
+}
+
+/// Configuration of infrastructural components.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Config {
+    /// Connection configuration for the database the indexer writes to. The
+    /// orderbook only reads, so the read URL wins when configured.
+    #[serde(default)]
+    pub database: DatabasePoolConfig,
+    /// HTTP API server configuration.
+    pub http: Http,
+    /// Quote endpoint configuration.
+    pub quoting: Quoting,
+    /// The volume protocol fee netted out of quotes, the factor the
+    /// autopilot's volume policy charges. Absent, quotes carry no protocol
+    /// fee.
+    pub volume_fee: Option<VolumeFeeConfig>,
+    /// The Solana JSON-RPC node. Required by sponsored order placement.
+    pub rpc: Option<Rpc>,
+    /// Sponsored order placement. Absent disables `POST /api/v1/orders`.
+    pub sponsoring: Option<Sponsoring>,
+    /// Quote verification. Absent, every quote is unverified.
+    pub quote_verification: Option<QuoteVerification>,
+    /// Most bytes an app data document may have.
+    #[serde(default = "default_app_data_size_limit")]
+    pub app_data_size_limit: usize,
+    /// Logging configuration.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+impl Config {
+    /// Build the `observe::Config` for the tracing framework from the logging
+    /// configuration.
+    pub fn observe_config(&self) -> observe::Config {
+        observe::Config::new(
+            &self.logging.filter,
+            self.logging.stderr_threshold,
+            self.logging.use_json,
+            None,
+        )
+    }
+}
+
+/// Quote endpoint configuration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Quoting {
+    /// Base URLs of the drivers asked to quote orders. A missing trailing
+    /// slash is added: routes resolve relative to these, so without it the
+    /// last path segment would be replaced rather than extended.
+    #[serde(deserialize_with = "deserialize_urls_with_trailing_slash")]
+    pub drivers: Vec<Url>,
+    /// Base URL of the autopilot, whose native price cache gates quotes: a
+    /// pair with a token no estimator prices answers `NoLiquidity`.
+    #[serde(deserialize_with = "deserialize_url_with_trailing_slash")]
+    pub autopilot: Url,
+    /// How long the driver has to answer before the quote fails.
+    #[serde(with = "humantime_serde", default = "default_quote_timeout")]
+    pub timeout: Duration,
+    /// Least far in the future an order's `validTo` may lie, for quotes and
+    /// sponsored placement alike.
+    #[serde(with = "humantime_serde", default = "default_min_validity")]
+    pub min_validity: Duration,
+    /// Furthest in the future an order's `validTo` may lie, for quotes and
+    /// sponsored placement alike.
+    #[serde(with = "humantime_serde", default = "default_max_validity")]
+    pub max_validity: Duration,
+    /// How long the quoted amounts are honored.
+    #[serde(with = "humantime_serde", default = "default_quote_expiry")]
+    pub quote_expiry: Duration,
+    /// How many drivers a `priceQuality: fast` quote waits for before it
+    /// answers with the best of them. As this grows, a fast quote approaches
+    /// an `optimal` one. More than the configured drivers waits for all.
+    #[serde(default = "default_fast_results_required")]
+    pub fast_results_required: NonZero<usize>,
+}
+
+impl Quoting {
+    /// The `validTo` bounds as the API consumes them.
+    pub fn validation(&self) -> ValidationParameters {
+        ValidationParameters {
+            min_validity: self.min_validity,
+            max_validity: self.max_validity,
+        }
+    }
+}
+
+/// Solana JSON-RPC node configuration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Rpc {
+    /// HTTP endpoint of the Solana JSON-RPC node.
+    pub endpoint: Url,
+    /// Ceiling on one RPC request.
+    #[serde(with = "humantime_serde", default = "default_rpc_timeout")]
+    pub request_timeout: Duration,
+}
+
+/// Sponsored order placement configuration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Sponsoring {
+    /// The funding account a sponsored creation transaction must name as its
+    /// fee payer and rent payer. The autopilot countersigns with its key.
+    #[serde(deserialize_with = "deserialize_solana_pubkey_b58")]
+    pub funder: Pubkey,
+    /// The settlement program a creation transaction must target. Defaults
+    /// to the official deployment the interface crate exports.
+    #[serde(
+        default = "default_settlement_program_id",
+        deserialize_with = "deserialize_solana_pubkey_b58"
+    )]
+    pub settlement_program: Pubkey,
+    /// The most the funder will pay in priority fee for one creation, in
+    /// lamports. The client sets the compute unit price and limit whose
+    /// product this bounds, so it caps what a placement can spend.
+    #[serde(default = "default_max_priority_fee_lamports")]
+    pub max_priority_fee_lamports: u64,
+}
+
+/// Quote verification configuration: each driver's quoted settlement is
+/// simulated behind the quoted order's creation. Requires the `[rpc]`
+/// section, which reads the mints and their holders.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct QuoteVerification {
+    /// Whether a verified quote outranks an unverified one. Every quote is
+    /// verified and reported either way.
+    #[serde(default)]
+    pub mode: QuoteVerificationMode,
+    /// HTTP endpoint of a node with the Jito `simulateBundle` extension.
+    pub bundle_endpoint: Url,
+    /// HTTP endpoint of a node serving `getTokenLargestAccounts`, which needs
+    /// the `spl-token-mint` account index. Absent, quotes selling a mint
+    /// without a mint authority stay unverified.
+    pub holders_endpoint: Option<Url>,
+    /// How inaccurate a quote must be before it is dropped, as the share of
+    /// the sell or buy amount the settlement program's buffers may pay.
+    /// Defaults to 1.
+    #[serde(default = "default_quote_inaccuracy_limit")]
+    pub quote_inaccuracy_limit: f64,
+    /// The settlement program the quoted settlements target. Defaults to the
+    /// official deployment the interface crate exports.
+    #[serde(
+        default = "default_settlement_program_id",
+        deserialize_with = "deserialize_solana_pubkey_b58"
+    )]
+    pub settlement_program: Pubkey,
+}
+
+impl fmt::Debug for QuoteVerification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuoteVerification")
+            .field("mode", &self.mode)
+            .field("bundle_endpoint", &self.bundle_endpoint)
+            // Providers like Alchemy put the API key in the path.
+            .field(
+                "holders_endpoint",
+                &self.holders_endpoint.as_ref().map(|_| "<REDACTED>"),
+            )
+            .field("quote_inaccuracy_limit", &self.quote_inaccuracy_limit)
+            .field("settlement_program", &self.settlement_program)
+            .finish()
+    }
+}
+
+/// The EVM orderbook's default.
+fn default_quote_inaccuracy_limit() -> f64 {
+    1.0
+}
+
+/// Wallets commonly ask 75,000 to 100,000 lamports for a creation, so a
+/// deployment raises this in config. The fallback errs towards refusing a
+/// placement over burning funder lamports.
+fn default_max_priority_fee_lamports() -> u64 {
+    100_000
+}
+
+fn default_settlement_program_id() -> Pubkey {
+    cow_settlement_interface::ID
+}
+
+fn default_rpc_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+/// The EVM orderbook's default.
+fn default_app_data_size_limit() -> usize {
+    8192
+}
+
+/// Appends the trailing slash `Url::join` needs to every URL in the list.
+fn deserialize_urls_with_trailing_slash<'de, D>(deserializer: D) -> Result<Vec<Url>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let urls = Vec::<Url>::deserialize(deserializer)?;
+    Ok(urls
+        .into_iter()
+        .map(|mut url| {
+            if !url.path().ends_with('/') {
+                url.set_path(&format!("{}/", url.path()));
+            }
+            url
+        })
+        .collect())
+}
+
+fn default_quote_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_min_validity() -> Duration {
+    ValidationParameters::default().min_validity
+}
+
+fn default_max_validity() -> Duration {
+    ValidationParameters::default().max_validity
+}
+
+fn default_quote_expiry() -> Duration {
+    Duration::from_secs(60)
+}
+
+/// The EVM orderbook's default.
+fn default_fast_results_required() -> NonZero<usize> {
+    NonZero::new(2).expect("two is not zero")
+}
+
+/// HTTP API server configuration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Http {
+    /// Address the HTTP API server binds to and listens on.
+    pub bind_address: SocketAddr,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn loads_the_example_config() {
+        let config = load(Path::new("example.toml")).await;
+        assert_eq!(config.database.write_url.as_str(), "postgresql://");
+        assert!(config.database.read_url.is_none());
+        assert_eq!(config.http.bind_address, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(config.logging.filter, "info,solana_orderbook=debug");
+        assert_eq!(config.quoting.drivers[0].as_str(), "http://localhost:8000/");
+        assert_eq!(config.quoting.autopilot.as_str(), "http://localhost:12088/");
+        assert_eq!(config.quoting.timeout, Duration::from_secs(5));
+        assert_eq!(config.quoting.min_validity, Duration::from_secs(60));
+        assert_eq!(config.quoting.max_validity, Duration::from_secs(31_536_000));
+        assert_eq!(config.quoting.quote_expiry, Duration::from_secs(60));
+        assert_eq!(config.quoting.fast_results_required.get(), 2);
+        assert_eq!(config.app_data_size_limit, 8192);
+    }
+
+    #[test]
+    fn debug_redacts_the_holders_endpoint() {
+        let config: QuoteVerification = toml::from_str(
+            r#"
+            bundle-endpoint = "https://bundles.example.com"
+            holders-endpoint = "https://solana-mainnet.g.alchemy.com/v2/secret"
+            "#,
+        )
+        .unwrap();
+        assert!(!format!("{config:?}").contains("secret"));
+    }
+
+    /// Routes resolve relative to the driver and autopilot URLs, so a base
+    /// URL with a path keeps it instead of having its last segment replaced.
+    #[test]
+    fn urls_get_a_trailing_slash() {
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            quoting: Quoting,
+        }
+        let wrapper: Wrapper = toml::de::from_str(
+            r#"
+            [quoting]
+            drivers = ["http://driver/baseline"]
+            autopilot = "http://autopilot/base"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            wrapper.quoting.drivers[0].as_str(),
+            "http://driver/baseline/"
+        );
+        assert_eq!(
+            wrapper.quoting.drivers[0].join("quote").unwrap().as_str(),
+            "http://driver/baseline/quote"
+        );
+        assert_eq!(wrapper.quoting.autopilot.as_str(), "http://autopilot/base/");
+    }
+}

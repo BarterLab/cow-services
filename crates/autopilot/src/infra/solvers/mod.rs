@@ -1,14 +1,17 @@
 use {
-    self::dto::{reveal, settle, solve},
-    crate::{config::solver::Account, domain::eth, util},
+    self::dto::{reveal, settle, settle_fast_path, solve},
+    crate::util,
     alloy::signers::{Signer, aws::AwsSigner},
     anyhow::{Context, Result, anyhow},
-    observe::tracing::tracing_headers,
+    configs::autopilot::solver::{Account, Solver},
+    eth_domain_types as eth,
+    itertools::Itertools,
+    observe::tracing::{distributed::headers::tracing_headers, lazy::Lazy},
     reqwest::{Client, RequestBuilder, StatusCode},
-    std::{borrow::Cow, time::Duration},
+    std::{borrow::Cow, collections::HashSet, time::Duration},
     thiserror::Error,
     tracing::instrument,
-    url::Url,
+    url::{Origin, Url},
 };
 
 pub mod dto;
@@ -20,7 +23,37 @@ pub struct Driver {
     pub name: String,
     pub url: Url,
     pub submission_address: eth::Address,
+    pub extensions: SupportedExtensions,
+    /// Whether to log how long `/solve` bodies take to upload. Off when another
+    /// driver has the same origin: the server behind it reads only the first
+    /// `/solve` body per auction, so the other uploads end with the response,
+    /// not when the body is sent.
+    measure_upload: bool,
     client: Client,
+}
+
+/// Origins that more than one of the URLs point at.
+pub fn shared_origins<'a>(urls: impl IntoIterator<Item = &'a Url>) -> HashSet<Origin> {
+    urls.into_iter().map(Url::origin).duplicates().collect()
+}
+
+/// Optional `/solve` request features a driver opted into.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SupportedExtensions {
+    /// Between checkpoints, receive only the difference to the previously
+    /// sent auction instead of the full auction.
+    pub auction_deltas: bool,
+    /// Receive compressed request bodies.
+    pub compression: bool,
+}
+
+impl From<&Solver> for SupportedExtensions {
+    fn from(driver: &Solver) -> Self {
+        Self {
+            auction_deltas: driver.supports_auction_deltas,
+            compression: driver.supports_compression,
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -37,6 +70,8 @@ impl Driver {
         url: Url,
         name: String,
         submission_account: Account,
+        extensions: SupportedExtensions,
+        measure_upload: bool,
     ) -> Result<Self, Error> {
         let submission_address = match submission_account {
             Account::Kms(key_id) => {
@@ -52,7 +87,13 @@ impl Driver {
             }
             Account::Address(address) => address,
         };
-        tracing::info!(?name, ?url, ?submission_address, "Creating solver");
+        tracing::info!(
+            ?name,
+            ?url,
+            ?submission_address,
+            ?extensions,
+            "creating solver"
+        );
 
         Ok(Self {
             name,
@@ -63,10 +104,13 @@ impl Driver {
                 .build()
                 .map_err(Error::FailedToBuildClient)?,
             submission_address,
+            extensions,
+            measure_upload,
         })
     }
 
     pub async fn solve(&self, request: solve::Request) -> Result<solve::Response> {
+        let request = request.measure_upload(self.measure_upload);
         self.request_response("solve", request).await
     }
 
@@ -79,7 +123,29 @@ impl Driver {
         request: &settle::Request,
         timeout: std::time::Duration,
     ) -> Result<()> {
-        let url = util::join(&self.url, "settle");
+        self.post_settle("settle", request, request.auction_id, timeout)
+            .await
+    }
+
+    pub async fn settle_fast_path(
+        &self,
+        request: &settle_fast_path::Request,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        self.post_settle("settle_fast_path", request, request.auction_id, timeout)
+            .await
+    }
+
+    /// Posts a settle request and waits for the driver to acknowledge it. The
+    /// endpoints return no body, so only the status is inspected.
+    async fn post_settle<Request: serde::Serialize>(
+        &self,
+        path: &str,
+        request: &Request,
+        auction_id: i64,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let url = util::join(&self.url, path);
         tracing::trace!(
             path=&url.path(),
             body=%serde_json::to_string_pretty(request).unwrap(),
@@ -91,7 +157,7 @@ impl Driver {
             .post(url)
             .json(request)
             .timeout(timeout)
-            .header("X-REQUEST-ID", request.auction_id.to_string())
+            .header("X-REQUEST-ID", auction_id.to_string())
             .headers(tracing_headers())
             .send()
             .await
@@ -120,14 +186,14 @@ impl Driver {
 
         tracing::trace!(
             path = &url.path(),
-            body = %payload.body_to_string(),
+            body = %Lazy(|| payload.body_to_string()),
             "solver request",
         );
 
         let request = self.client.post(url.clone()).headers(tracing_headers());
         let mut request = payload.inject(request);
 
-        if let Some(request_id) = observe::distributed_tracing::request_id::from_current_span() {
+        if let Some(request_id) = observe::tracing::distributed::request_id::from_current_span() {
             request = request.header("X-REQUEST-ID", request_id);
         }
 
@@ -139,7 +205,7 @@ impl Driver {
         let text = String::from_utf8_lossy(&body);
         tracing::trace!(%status, body=%text, "solver response");
         let context = || format!("url {url}, body {text:?}");
-        if status != 200 {
+        if status != StatusCode::OK.as_u16() {
             return Err(anyhow!("bad status {status}, {}", context()));
         }
         serde_json::from_slice(&body).with_context(|| format!("bad json {}", context()))
@@ -180,5 +246,130 @@ where
     fn body_to_string(&self) -> Cow<'_, str> {
         let serialized = serde_json::to_string(&self).expect("type should be JSON serializable");
         Cow::Owned(serialized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::domain,
+        alloy::primitives::Address,
+        axum::{body::Bytes, http::HeaderMap},
+        std::{
+            collections::HashSet,
+            sync::{Arc, Mutex},
+        },
+    };
+
+    #[test]
+    fn extensions_are_taken_from_the_driver_config() {
+        let extensions = SupportedExtensions::from(&Solver::test("solver", Address::ZERO));
+        assert!(!extensions.auction_deltas);
+        assert!(!extensions.compression);
+
+        let extensions = SupportedExtensions::from(&Solver {
+            supports_auction_deltas: true,
+            supports_compression: true,
+            ..Solver::test("solver", Address::ZERO)
+        });
+        assert!(extensions.auction_deltas);
+        assert!(extensions.compression);
+    }
+
+    #[test]
+    fn finds_origins_shared_by_several_urls() {
+        let urls = [
+            "http://driver/baseline",
+            "http://driver/solver",
+            "http://driver:8080/solver",
+            "https://user:password@solver.example.com/",
+        ]
+        .map(|url| Url::parse(url).unwrap());
+
+        assert_eq!(shared_origins(&urls), HashSet::from([urls[0].origin()]));
+    }
+
+    /// The `content-encoding` header and raw body of a `/solve` request.
+    type Received = Arc<Mutex<Option<(Option<String>, Bytes)>>>;
+
+    /// Serves `/solve` on a local port, recording the request it receives.
+    async fn mock_driver() -> (Url, Received) {
+        let received = Received::default();
+        let app = axum::Router::new().route(
+            "/solve",
+            axum::routing::post({
+                let received = Arc::clone(&received);
+                move |headers: HeaderMap, body: Bytes| async move {
+                    let encoding = headers
+                        .get(reqwest::header::CONTENT_ENCODING)
+                        .map(|value| value.to_str().unwrap().to_owned());
+                    *received.lock().unwrap() = Some((encoding, body));
+                    r#"{"solutions": []}"#
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, received)
+    }
+
+    async fn solve_requests() -> solve::EncodedRequests {
+        let auction = domain::Auction {
+            id: 1,
+            block: 1,
+            orders: vec![],
+            prices: Default::default(),
+            surplus_capturing_jit_order_owners: vec![],
+        };
+        let plain = solve::Request::new(&auction, &HashSet::new(), chrono::Utc::now()).await;
+        solve::EncodedRequests::new(plain, true).await
+    }
+
+    /// Sends a `/solve` request to a driver that does or doesn't accept
+    /// compression and returns what the driver received.
+    async fn send(compression: bool) -> (Option<String>, Bytes) {
+        let (url, received) = mock_driver().await;
+        let driver = Driver::try_new(
+            url,
+            "solver".to_owned(),
+            Account::Address(Address::ZERO),
+            SupportedExtensions {
+                auction_deltas: false,
+                compression,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        let request = solve_requests()
+            .await
+            .for_driver(driver.extensions.compression);
+        driver.solve(request).await.unwrap();
+        received.lock().unwrap().take().unwrap()
+    }
+
+    #[tokio::test]
+    async fn opted_in_driver_receives_compressed_body() {
+        let (encoding, body) = send(true).await;
+
+        assert_eq!(encoding.as_deref(), Some("br"));
+        let mut decompressed = Vec::new();
+        brotli::BrotliDecompress(&mut body.as_ref(), &mut decompressed).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&decompressed).unwrap();
+        assert_eq!(json["kind"], "full");
+    }
+
+    #[tokio::test]
+    async fn other_drivers_receive_plain_json() {
+        let (encoding, body) = send(false).await;
+
+        assert_eq!(encoding, None);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "full");
     }
 }

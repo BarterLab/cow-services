@@ -43,5 +43,64 @@ pub enum FeePolicy {
         /// Percentage of the order's volume should be taken as a protocol
         /// fee.
         factor: f64,
+        /// Whether the fee this policy takes counts towards the solution's
+        /// score. True for protocol fees, which the protocol captures, and
+        /// false for a fee the solver charges for itself.
+        contributes_to_score: bool,
     },
+}
+
+impl FeePolicy {
+    /// Whether the fee this policy takes counts towards the solution's score.
+    /// Policies that do not still have to be unwound when reconstructing the
+    /// prices earlier policies were applied at.
+    pub fn contributes_to_score(&self) -> bool {
+        match self {
+            Self::Volume {
+                contributes_to_score,
+                ..
+            } => *contributes_to_score,
+            Self::Surplus { .. } | Self::PriceImprovement { .. } => true,
+        }
+    }
+}
+
+/// The policy as the generic fee math sees it. The score flag of a volume
+/// fee is read by the driver's scoring, not by the fee math.
+impl From<&FeePolicy> for protocol_fees::FeePolicy {
+    fn from(policy: &FeePolicy) -> Self {
+        match policy {
+            FeePolicy::Surplus {
+                factor,
+                max_volume_factor,
+            } => Self::Surplus {
+                factor: *factor,
+                max_volume_factor: *max_volume_factor,
+            },
+            FeePolicy::PriceImprovement {
+                factor,
+                max_volume_factor,
+                quote,
+            } => Self::PriceImprovement {
+                factor: *factor,
+                max_volume_factor: *max_volume_factor,
+                quote: protocol_fees::Quote {
+                    sell_amount: quote.sell.amount.0,
+                    buy_amount: quote.buy.amount.0,
+                    fee: quote.fee.amount.0,
+                    solver: quote.solver,
+                },
+            },
+            FeePolicy::Volume { factor, .. } => Self::Volume { factor: *factor },
+        }
+    }
+}
+
+impl From<order::Side> for protocol_fees::Side {
+    fn from(side: order::Side) -> Self {
+        match side {
+            order::Side::Sell => Self::Sell,
+            order::Side::Buy => Self::Buy,
+        }
+    }
 }

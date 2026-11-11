@@ -4,11 +4,12 @@ use {
         signature::SigningScheme,
         time,
     },
-    alloy::primitives::{Address, U256},
+    alloy_primitives::{Address, U256},
     anyhow::bail,
-    app_data::AppDataHash,
+    app_data::deserialize_optional_app_data,
     bigdecimal::BigDecimal,
     chrono::{DateTime, Utc},
+    eth_domain_types::Receiver,
     number::{nonzero::NonZeroU256, serialization::HexOrDecimalU256},
     serde::{
         Deserialize,
@@ -22,15 +23,17 @@ use {
     std::time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceQuality {
     /// We pick the best quote of the fastest `n` price estimators.
     Fast,
-    #[default]
-    /// We pick the best quote of all price estimators.
+    /// We pick the best quote of all price estimators, ranked purely by the
+    /// promised price without verifying quotes by simulation.
     Optimal,
-    /// Quotes may by discarde when they failed to be verified by simulation.
+    #[default]
+    /// Quotes get verified by simulation whenever possible and verified
+    /// quotes are preferred over unverified ones, even at a worse price.
     Verified,
 }
 
@@ -124,8 +127,8 @@ pub struct OrderQuoteRequest {
     pub from: Address,
     pub sell_token: Address,
     pub buy_token: Address,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receiver: Option<Address>,
+    #[serde(default)]
+    pub receiver: Receiver,
     #[serde(flatten)]
     pub side: OrderQuoteSide,
     #[serde(flatten)]
@@ -164,6 +167,22 @@ impl Default for OrderQuoteSide {
     fn default() -> Self {
         Self::Buy {
             buy_amount_after_fee: NonZeroU256::ONE,
+        }
+    }
+}
+
+impl OrderQuoteSide {
+    /// Returns the order kind together with the corresponding input amount: the
+    /// sell amount (before or after fee) for sell orders, and the buy amount
+    /// after fee for buy orders.
+    pub fn kind_and_amount(&self) -> (OrderKind, NonZeroU256) {
+        match self {
+            OrderQuoteSide::Sell {
+                sell_amount: SellAmount::BeforeFee { value } | SellAmount::AfterFee { value },
+            } => (OrderKind::Sell, *value),
+            OrderQuoteSide::Buy {
+                buy_amount_after_fee,
+            } => (OrderKind::Buy, *buy_amount_after_fee),
         }
     }
 }
@@ -232,35 +251,6 @@ impl Serialize for Validity {
     }
 }
 
-/// Manual `Deserialize` implementation for OrderCreationAppData that allows for
-/// `appData` to be omitted. This is needed because `#[serde(default, flatten)]`
-/// does not work as expected and will generate errors for quotes without
-/// `appData` specified.
-fn deserialize_optional_app_data<'de, D>(deserializer: D) -> Result<OrderCreationAppData, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(rename = "appData", rename_all = "camelCase")]
-    struct Helper {
-        app_data: Option<String>,
-        app_data_hash: Option<AppDataHash>,
-    }
-
-    let data = Helper::deserialize(deserializer)?;
-    let result = match (data.app_data, data.app_data_hash) {
-        (Some(app_data), None) => match app_data.parse() {
-            Ok(hash) => OrderCreationAppData::Hash { hash },
-            Err(_) => OrderCreationAppData::Full { full: app_data },
-        },
-        (Some(full), Some(expected)) => OrderCreationAppData::Both { full, expected },
-        (None, None) => OrderCreationAppData::default(),
-        _ => return Err(de::Error::custom("invalid app data")),
-    };
-
-    Ok(result)
-}
-
 fn serialize_timeout<S>(timeout: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -306,7 +296,7 @@ pub enum SellAmount {
 pub struct OrderQuote {
     pub sell_token: Address,
     pub buy_token: Address,
-    pub receiver: Option<Address>,
+    pub receiver: Receiver,
     #[serde_as(as = "HexOrDecimalU256")]
     pub sell_amount: U256,
     #[serde_as(as = "HexOrDecimalU256")]
@@ -355,7 +345,7 @@ pub struct NativeTokenPrice {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, serde_json::json, testlib::assert_json_matches};
+    use {super::*, app_data::AppDataHash, serde_json::json, testlib::assert_json_matches};
 
     #[test]
     fn serialize_defaults() {
@@ -365,6 +355,7 @@ mod tests {
                 "from": "0x0000000000000000000000000000000000000000",
                 "sellToken": "0x0000000000000000000000000000000000000000",
                 "buyToken": "0x0000000000000000000000000000000000000000",
+                "receiver": "0x0000000000000000000000000000000000000000",
                 "kind": "buy",
                 "buyAmountAfterFee": "1",
                 "validFor": 1800,
@@ -373,9 +364,34 @@ mod tests {
                 "buyTokenBalance": "erc20",
                 "signingScheme": "eip712",
                 "timeout": null,
-                "priceQuality": "optimal",
+                "priceQuality": "verified",
             })
         );
+    }
+
+    #[test]
+    fn quote_request_tolerates_null_receiver() {
+        let base = json!({
+            "from": "0x0000000000000000000000000000000000000000",
+            "sellToken": "0x0000000000000000000000000000000000000001",
+            "buyToken": "0x0000000000000000000000000000000000000002",
+            "kind": "buy",
+            "buyAmountAfterFee": "1",
+        });
+
+        for receiver in [
+            serde_json::Value::Null,
+            json!("0x0000000000000000000000000000000000000000"),
+        ] {
+            let mut body = base.clone();
+            body["receiver"] = receiver;
+            let parsed: OrderQuoteRequest = serde_json::from_value(body).unwrap();
+            assert_eq!(parsed.receiver, Receiver::OWNER);
+        }
+
+        // Missing field → still zero.
+        let parsed: OrderQuoteRequest = serde_json::from_value(base).unwrap();
+        assert_eq!(parsed.receiver, Receiver::OWNER);
     }
 
     #[test]

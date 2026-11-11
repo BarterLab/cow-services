@@ -9,14 +9,18 @@ license = "MIT OR Apache-2.0"
 doctest = false
 
 [dependencies]
-alloy = { workspace = true, features = ["sol-types", "signers", "signer-local", "rand"] }
+alloy-primitives = { workspace = true, features = ["rand"] }
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
+alloy-sol-types = { workspace = true }
 anyhow = { workspace = true }
 app-data = { workspace = true }
 bigdecimal = { workspace = true }
 bytes-hex = { workspace = true }
-chrono = { workspace = true, features = ["serde", "clock"] }
+chrono = { workspace = true, features = ["clock", "serde"] }
 const-hex = { workspace = true }
 derive_more = { workspace = true }
+eth-domain-types = { workspace = true }
 hex-literal = { workspace = true }
 num = { workspace = true }
 number = { workspace = true }

@@ -1,17 +1,14 @@
 use {
-    crate::{
-        domain::eth,
-        infra::{
-            blockchain,
-            config::file::{AppDataFetching, GasEstimatorType, OrderPriorityStrategy},
-            liquidity,
-            mempool,
-            notify,
-            simulator,
-            solver,
-        },
+    crate::infra::{
+        blockchain::{self, gas::GasPriceParameters},
+        builders,
+        config::file::{AppDataFetching, GasEstimatorType, OrderPriorityStrategy},
+        liquidity,
+        mempool,
+        notify,
+        solver,
     },
-    std::time::Duration,
+    eth_domain_types as eth,
 };
 
 pub mod file;
@@ -24,12 +21,23 @@ pub struct Config {
     pub solvers: Vec<solver::Config>,
     pub liquidity: liquidity::Config,
     pub liquidity_sources_notifier: Option<notify::liquidity_sources::Config>,
-    pub simulator: Option<simulator::Config>,
+    pub simulator: configs::simulator::Config,
     pub gas_estimator: GasEstimatorType,
-    pub mempools: Vec<mempool::Config>,
+    pub gas_price_parameters: GasPriceParameters,
+    pub receiver: Receiver,
     pub contracts: blockchain::contracts::Addresses,
     pub order_priority_strategies: Vec<OrderPriorityStrategy>,
-    pub simulation_bad_token_max_age: Duration,
     pub app_data_fetching: AppDataFetching,
     pub tx_gas_limit: eth::U256,
+    pub http: configs::http_client::HttpClient,
+    pub balance_cache: configs::balance_cache::BalanceCacheConfig,
+}
+
+/// Where settlements get submitted to.
+#[derive(Debug)]
+pub enum Receiver {
+    /// Nodes or a private relay, as plain transactions.
+    Mempools(Vec<mempool::Config>),
+    /// Block builders, as bundles.
+    Builders(Vec<builders::Config>),
 }

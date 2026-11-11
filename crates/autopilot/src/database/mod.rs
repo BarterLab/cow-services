@@ -6,12 +6,10 @@ use {
         num::{NonZeroU32, NonZeroUsize},
         time::Duration,
     },
-    tracing::Instrument,
+    tracing::instrument,
 };
 
 mod auction;
-pub mod auction_prices;
-pub mod competition;
 pub mod ethflow_events;
 pub mod events;
 pub mod fee_policies;
@@ -76,6 +74,7 @@ impl Postgres {
         Self::new("postgresql://", Default::default()).await
     }
 
+    #[instrument(skip_all)]
     pub async fn update_database_metrics(&self) -> sqlx::Result<()> {
         let metrics = Metrics::get();
 
@@ -96,6 +95,7 @@ impl Postgres {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     pub async fn update_large_tables_stats(&self) -> sqlx::Result<()> {
         let mut ex = self.pool.acquire().await?;
         for &table in database::LARGE_TABLES {
@@ -103,6 +103,23 @@ impl Postgres {
         }
 
         Ok(())
+    }
+
+    /// Cleans the pending lists of all GIN indexes on `competition_auctions`.
+    /// An index left out here gets flushed inline by whichever insert pushes
+    /// its pending list past `gin_pending_list_limit`.
+    pub async fn gin_clean_pending_list(&self) -> std::result::Result<(), sqlx::Error> {
+        let _timer = Metrics::get()
+            .database_queries
+            .with_label_values(&["gin_clean_pending_competition_auctions"])
+            .start_timer();
+        let mut ex = self.pool.acquire().await?;
+        ex.execute(
+            "SELECT gin_clean_pending_list('competition_auctions_order_uids_gin'), \
+             gin_clean_pending_list('competition_auctions_price_tokens_gin')",
+        )
+        .await
+        .map(|_| ())
     }
 }
 
@@ -154,11 +171,10 @@ impl Metrics {
 }
 
 pub fn run_database_metrics_work(db: Postgres) {
-    let span = tracing::info_span!("database_metrics");
     // Spawn the task for updating large table statistics
-    tokio::spawn(update_large_tables_stats(db.clone()).instrument(span.clone()));
+    tokio::spawn(update_large_tables_stats(db.clone()));
     // Spawn the task for database metrics
-    tokio::task::spawn(database_metrics(db).instrument(span));
+    tokio::task::spawn(database_metrics(db));
 }
 
 async fn database_metrics(db: Postgres) -> ! {

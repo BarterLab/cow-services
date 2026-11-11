@@ -1,0 +1,235 @@
+pub mod encoding;
+pub mod ethereum;
+pub mod report;
+pub mod simulation_builder;
+pub mod state_override_stream;
+pub mod tenderly;
+mod utils;
+
+use {
+    crate::state_override_stream::SimulationOverrides,
+    alloy_eips::BlockId,
+    alloy_primitives::Address,
+    eth_domain_types::{self as eth, AccessList, Tx},
+    http_client::HttpClientFactory,
+    observe::future::Measure,
+};
+pub use {ethereum::Ethereum, tenderly::Tenderly};
+
+#[derive(Debug, Clone)]
+pub struct Simulator {
+    inner: Inner,
+    eth: Ethereum,
+    disable_access_lists: bool,
+    disable_gas: Option<eth::Gas>,
+    simulation_overrides: Option<SimulationOverrides>,
+}
+
+#[derive(Debug, Clone)]
+enum Inner {
+    Tenderly(Box<tenderly::Tenderly>),
+    Ethereum,
+    EthereumTrace,
+}
+
+impl Simulator {
+    pub fn tenderly(
+        config: &configs::simulator::TenderlyConfig,
+        eth: Ethereum,
+        http_factory: &HttpClientFactory,
+    ) -> Self {
+        let eth = eth.with_metric_label("tenderlySimulator".into());
+        Self {
+            inner: Inner::Tenderly(Box::new(tenderly::Tenderly::new(
+                config,
+                eth.clone(),
+                http_factory,
+            ))),
+            eth,
+            disable_access_lists: false,
+            disable_gas: None,
+            simulation_overrides: None,
+        }
+    }
+
+    pub fn ethereum(eth: impl Into<Ethereum>) -> Self {
+        let eth = eth.into().with_metric_label("web3Simulator".into());
+        Self {
+            inner: Inner::Ethereum,
+            eth,
+            disable_access_lists: false,
+            disable_gas: None,
+            simulation_overrides: None,
+        }
+    }
+
+    pub fn ethereum_trace(eth: impl Into<Ethereum>) -> Self {
+        let mut simulator = Self::ethereum(eth);
+        simulator.eth = simulator.eth.with_metric_label("web3TraceSimulator".into());
+        simulator.inner = Inner::EthereumTrace;
+        simulator
+    }
+
+    /// Disable access list simulation. Some environments, such as less popular
+    /// blockchains, don't support access list simulation.
+    pub fn disable_access_lists(&mut self) {
+        self.disable_access_lists = true;
+    }
+
+    /// Disable gas simulation. Useful for testing, but shouldn't be used in
+    /// production since it will cause the driver to return invalid scores.
+    pub fn disable_gas(&mut self, fixed_gas: eth::Gas) {
+        self.disable_gas = Some(fixed_gas);
+    }
+
+    pub fn access_lists_disabled(&self) -> bool {
+        self.disable_access_lists
+    }
+
+    pub fn fixed_gas(&self) -> Option<eth::Gas> {
+        self.disable_gas
+    }
+
+    pub fn set_simulation_overrides(&mut self, overrides: SimulationOverrides) {
+        self.simulation_overrides = Some(overrides);
+    }
+
+    /// Computes access list for sending native eth to the given receiver.
+    /// This access list may be needed to make sending ETH to smart contract
+    /// wallets possible.
+    pub async fn access_list_for_eth_transfer(
+        &self,
+        from: Address,
+        to: Address,
+    ) -> Result<AccessList, Error> {
+        let tx = eth::Tx {
+            from,
+            to,
+            value: 1.into(),
+            input: Default::default(),
+            access_list: Default::default(),
+        };
+        if self.disable_access_lists {
+            return Ok(Default::default());
+        }
+        let block = self.eth.current_block().borrow().number.into();
+        let access_list = match &self.inner {
+            Inner::Tenderly(tenderly) => {
+                // function assumes `from` has the needed ETH so no state
+                // overrides are needed
+                tenderly
+                    .simulate(tx.clone(), block, None, tenderly::GenerateAccessList::Yes)
+                    .await
+                    .map_err(with(tx.clone(), block))?
+                    .access_list
+            }
+            Inner::Ethereum | Inner::EthereumTrace => self
+                .eth
+                .create_access_list(tx.clone())
+                .await
+                .map_err(with(tx.clone(), block))?,
+        };
+        Ok(tx.access_list.clone().merge(access_list))
+    }
+
+    /// Simulate the gas needed by a transaction.
+    pub async fn gas(&self, tx: eth::Tx) -> Result<eth::Gas, Error> {
+        if let Some(gas) = self.disable_gas {
+            return Ok(gas);
+        }
+        let (block_number, block_timestamp) = {
+            let block = self.eth.current_block().borrow();
+            (block.number, block.timestamp)
+        };
+        let block = eth::BlockNo::from(block_number);
+        let state_overrides = self
+            .simulation_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.overrides_for(block_number, block_timestamp));
+        // The overrides are stamped for `block_number`, so the estimate has to
+        // run against that block. `pending` can't carry them: its timestamp is
+        // the node's wall clock, which is unknowable when the request is built
+        // and moves between calls. Without overrides nothing changes.
+        let block_id = match state_overrides {
+            Some(_) => BlockId::number(block_number),
+            None => BlockId::latest(),
+        };
+        Ok(match &self.inner {
+            Inner::Tenderly(tenderly) => {
+                tenderly
+                    .simulate(
+                        tx.clone(),
+                        block,
+                        state_overrides,
+                        tenderly::GenerateAccessList::No,
+                    )
+                    .measure("tenderly_simulate_gas")
+                    .await
+                    .map_err(with(tx, block))?
+                    .gas
+            }
+            Inner::EthereumTrace if state_overrides.is_none() => {
+                self.eth.trace(tx.clone()).await.map_err(with(tx, block))?
+            }
+            Inner::Ethereum | Inner::EthereumTrace => self
+                .eth
+                .estimate_gas(tx.clone(), state_overrides, block_id)
+                .await
+                .map_err(with(tx, block))?,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SimulatorError {
+    #[error("tenderly error: {0:?}")]
+    Tenderly(#[from] tenderly::Error),
+    #[error("ethereum error: {0:?}")]
+    Ethereum(#[from] ethereum::Error),
+    #[error("the simulated gas {0} exceeded the gas limit {1} provided in the solution")]
+    GasExceeded(eth::Gas, eth::Gas),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("block: {block},  err: {err:?}, tx: {tx:?}")]
+pub struct RevertError {
+    pub err: SimulatorError,
+    pub tx: Tx,
+    pub block: eth::BlockNo,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// If a transaction reverted, forward that transaction together with the
+    /// error.
+    #[error(transparent)]
+    Revert(#[from] Box<RevertError>),
+    /// Any other error that is not related to the underlying transaction
+    /// failing.
+    #[error(transparent)]
+    Other(#[from] SimulatorError),
+}
+
+fn with<E>(tx: Tx, block: eth::BlockNo) -> impl FnOnce(E) -> Error
+where
+    E: Into<SimulatorError>,
+{
+    move |err| {
+        let err: SimulatorError = err.into();
+        let tx = match &err {
+            SimulatorError::Tenderly(tenderly::Error::Http(_)) => None,
+            SimulatorError::Tenderly(tenderly::Error::Revert(_)) => Some(tx.clone()),
+            SimulatorError::Tenderly(tenderly::Error::Other(_)) => None,
+            SimulatorError::Ethereum(_) => Some(tx.clone()),
+            SimulatorError::GasExceeded(..) => Some(tx.clone()),
+        };
+        match tx {
+            Some(tx) => Error::Revert(Box::new(RevertError {
+                err,
+                tx: tx.clone(),
+                block,
+            })),
+            None => Error::Other(err),
+        }
+    }
+}

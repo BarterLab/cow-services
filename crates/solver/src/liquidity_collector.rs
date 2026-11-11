@@ -1,8 +1,8 @@
 use {
     crate::liquidity::Liquidity,
     anyhow::Result,
+    liquidity_sources::{base_tokens::BaseTokens, recent_block_cache::Block},
     model::TokenPair,
-    shared::{baseline_solver::BaseTokens, recent_block_cache::Block},
     std::{collections::HashSet, future::Future, sync::Arc, time::Duration},
     tokio::sync::RwLock,
     tracing::{Instrument, instrument},
@@ -146,7 +146,7 @@ mod test {
     use {
         super::*,
         futures::FutureExt,
-        shared::recent_block_cache::Block,
+        liquidity_sources::recent_block_cache::Block,
         std::sync::atomic::{AtomicUsize, Ordering},
     };
 
@@ -158,8 +158,8 @@ mod test {
             _pairs: HashSet<TokenPair>,
             _at_block: Block,
         ) -> Result<Vec<Liquidity>> {
-            // Yield here to verify that fetching liquidity in uninitialised state
-            // will never yield.
+            // Yield here to verify that fetching liquidity in uninitialised
+            // state will never yield.
             tokio::task::yield_now().await;
             // Use specific error message to verify initialisation
             Err(anyhow::anyhow!("I am initialised"))
@@ -196,10 +196,15 @@ mod test {
         assert_eq!(gauge.get(), 0);
 
         let liquidity = source
-            .get_liquidity(Default::default(), Block::Recent)
+            .get_liquidity(
+                Default::default(),
+                Block::Recent {
+                    schedule_update: false,
+                },
+            )
             .now_or_never();
-        // As long as the liquidity source is not initialised `get_liquidity` returns
-        // immediately with 0 liquidity.
+        // As long as the liquidity source is not initialised `get_liquidity`
+        // returns immediately with 0 liquidity.
         assert!(liquidity.unwrap().unwrap().is_empty());
 
         // wait until initialisation is finished
@@ -208,13 +213,18 @@ mod test {
         // init loop ran expected number of times
         assert_eq!(counter.load(Ordering::SeqCst), ATTEMPTS);
         let liquidity = source
-            .get_liquidity(Default::default(), Block::Recent)
+            .get_liquidity(
+                Default::default(),
+                Block::Recent {
+                    schedule_update: false,
+                },
+            )
             .await;
         assert_eq!(liquidity.unwrap_err().to_string(), "I am initialised");
         assert_eq!(gauge.get(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reinit() {
         let counter = Arc::new(AtomicUsize::new(0));
 
@@ -243,7 +253,12 @@ mod test {
         // variance due to our very short timeouts here).
         assert!((5..=6).contains(&counter.load(Ordering::SeqCst)));
         let liquidity = source
-            .get_liquidity(Default::default(), Block::Recent)
+            .get_liquidity(
+                Default::default(),
+                Block::Recent {
+                    schedule_update: false,
+                },
+            )
             .await;
         assert_eq!(liquidity.unwrap_err().to_string(), "I am initialised");
 

@@ -11,12 +11,12 @@ use {
         signers::local::PrivateKeySigner,
     },
     app_data::Hook,
-    contracts::alloy::{
+    contracts::{
         ERC20Mintable,
         GPv2AllowListAuthentication::GPv2AllowListAuthentication,
         test::CowProtocolToken,
     },
-    ethrpc::alloy::{CallBuilderExt, ProviderSignerExt},
+    ethrpc::alloy::{CallBuilderExt, EvmProviderExt, ProviderSignerExt},
     hex_literal::hex,
     model::{
         DomainSeparator,
@@ -67,9 +67,9 @@ struct AccountGenerator {
 
 impl Default for AccountGenerator {
     fn default() -> Self {
-        // Start from a high number to avoid conflicts with existing accounts which may
-        // have clowny delegation contracts deployed (e.g. preventing to send ETH to
-        // that address)
+        // Start from a high number to avoid conflicts with existing accounts
+        // which may have clowny delegation contracts deployed (e.g.
+        // preventing to send ETH to that address)
         AccountGenerator { id: 100500 }
     }
 }
@@ -339,12 +339,14 @@ impl OnchainComponents {
         let mut res = Vec::with_capacity(N);
 
         for _ in 0..N {
-            let contract_address = ERC20Mintable::Instance::deploy_builder(self.web3.provider.clone())
-                // We can't escape the .from here because we need to ensure Minter permissions later on
-                .from(minter)
-                .deploy()
-                .await
-                .expect("ERC20Mintable deployment failed");
+            let contract_address =
+                ERC20Mintable::Instance::deploy_builder(self.web3.provider.clone())
+                    // We can't escape the .from here because we need to ensure Minter permissions
+                    // later on
+                    .from(minter)
+                    .deploy()
+                    .await
+                    .expect("ERC20Mintable deployment failed");
             let contract =
                 ERC20Mintable::Instance::new(contract_address, self.web3.provider.clone());
 
@@ -491,7 +493,10 @@ impl OnchainComponents {
     ///
     /// This can be used to modify the pool reserves during a test.
     pub async fn mint_token_to_weth_uni_v2_pool(&self, token: &MintableToken, amount: U256) {
-        let pair = contracts::alloy::IUniswapLikePair::Instance::new(
+        // disable auto-mine to ensure we update the pool within 1 block
+        self.web3().provider.evm_set_automine(false).await.unwrap();
+
+        let pair = contracts::IUniswapLikePair::Instance::new(
             self.contracts
                 .uniswap_v2_factory
                 .getPair(*self.contracts.weth.address(), *token.address())
@@ -504,22 +509,32 @@ impl OnchainComponents {
 
         // Mint amount + 1 to the pool, and then swap out 1 of the minted token
         // in order to force it to update its K-value.
-        token.mint(*pair.address(), amount + U256::ONE).await;
+        let mint_tx = token
+            .contract
+            .mint(*pair.address(), amount + U256::ONE)
+            .from(token.minter)
+            .send()
+            .await
+            .unwrap();
+
         let (out0, out1) = if self.contracts.weth.address() < token.address() {
             (1, 0)
         } else {
             (0, 1)
         };
-        pair.swap(
-            U256::from(out0),
-            U256::from(out1),
-            token.minter,
-            Default::default(),
-        )
-        .from(token.minter)
-        .send_and_watch()
-        .await
-        .expect("Uniswap V2 pair couldn't mint");
+        let swap_tx = pair
+            .swap(
+                U256::from(out0),
+                U256::from(out1),
+                token.minter,
+                Default::default(),
+            )
+            .from(token.minter)
+            .send()
+            .await
+            .expect("Uniswap V2 pair couldn't mint");
+        self.web3().provider.evm_set_automine(true).await.unwrap();
+        tokio::try_join!(mint_tx.watch(), swap_tx.watch()).unwrap();
     }
 
     pub async fn deploy_cow_token(&self, supply: U256) -> CowToken {

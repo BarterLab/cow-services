@@ -38,15 +38,16 @@ mod tests {
     #[ignore]
     fn manual_thread() {
         let obs_config = Config::new("info", None, false, None);
-        crate::tracing::initialize(&obs_config);
+        crate::tracing::init::initialize(&obs_config);
 
         // Should print panic trace log but not kill the process.
         let handle = std::thread::spawn(|| panic!("you should see this message"));
         assert!(handle.join().is_err());
 
         install();
-        // Should print panic trace log because we call the previous panic handler
-        // installed by tracing::initialize, and kill the process.
+        // Should print panic trace log because we call the previous panic
+        // handler installed by tracing::initialize, and kill the
+        // process.
         let handle = std::thread::spawn(|| panic!("you should see this message"));
         let _ = handle.join();
         unreachable!("you should NOT see this message");
@@ -57,7 +58,7 @@ mod tests {
     #[ignore]
     async fn manual_tokio() {
         let obs_config = Config::new("info", None, false, None);
-        crate::tracing::initialize(&obs_config);
+        crate::tracing::init::initialize(&obs_config);
 
         let handle = tokio::task::spawn(async { panic!("you should see this message") });
         assert!(handle.await.is_err());

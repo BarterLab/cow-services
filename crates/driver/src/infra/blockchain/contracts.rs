@@ -1,15 +1,8 @@
 use {
-    crate::domain::eth,
     chain::Chain,
-    contracts::alloy::{
-        BalancerV2Vault,
-        FlashLoanRouter,
-        GPv2Settlement,
-        WETH9,
-        support::Balances,
-    },
+    contracts::{BalancerV2Vault, FlashLoanRouter, GPv2Settlement, WETH9, support::Balances},
+    eth_domain_types as eth,
     ethrpc::Web3,
-    std::collections::HashMap,
 };
 
 #[derive(Debug, Clone)]
@@ -18,7 +11,7 @@ pub struct Contracts {
     settlement: GPv2Settlement::Instance,
     vault_relayer: eth::ContractAddress,
     vault: BalancerV2Vault::Instance,
-    signatures: contracts::alloy::support::Signatures::Instance,
+    signatures: contracts::support::Signatures::Instance,
     weth: WETH9::Instance,
 
     /// The domain separator for settlement contract used for signing orders.
@@ -30,9 +23,11 @@ pub struct Contracts {
     // everywhere
     flashloan_router: Option<FlashLoanRouter::Instance>,
     balance_helper: Balances::Instance,
-    /// Mapping from CoW AMM factory address to the corresponding CoW AMM
-    /// helper.
-    cow_amm_helper_by_factory: HashMap<eth::ContractAddress, eth::ContractAddress>,
+
+    /// Contract that reverts when the current block exceeds a deadline.
+    /// Used to guarantee on-chain that a settlement cannot be included
+    /// after its submission deadline.
+    deadline_check: contracts::support::DeadlineCheck::Instance,
     web3: Web3,
 }
 
@@ -43,8 +38,8 @@ pub struct Addresses {
     pub signatures: Option<eth::ContractAddress>,
     pub weth: Option<eth::ContractAddress>,
     pub balances: Option<eth::ContractAddress>,
-    pub cow_amm_helper_by_factory: HashMap<eth::ContractAddress, eth::ContractAddress>,
     pub flashloan_router: Option<eth::ContractAddress>,
+    pub deadline_check: Option<eth::ContractAddress>,
 }
 
 impl Contracts {
@@ -78,10 +73,15 @@ impl Contracts {
         };
 
         let vault = match from_address {
-            Some(address) => BalancerV2Vault::Instance::new(settlement.vault().from(address).call().await?, web3.provider.clone()),
-            None => BalancerV2Vault::Instance::new(settlement.vault().call().await?, web3.provider.clone()),
+            Some(address) => BalancerV2Vault::Instance::new(
+                settlement.vault().from(address).call().await?,
+                web3.provider.clone(),
+            ),
+            None => BalancerV2Vault::Instance::new(
+                settlement.vault().call().await?,
+                web3.provider.clone(),
+            ),
         };
-
         let balance_helper = Balances::Instance::new(
             addresses
                 .balances
@@ -90,11 +90,11 @@ impl Contracts {
                 .unwrap(),
             web3.provider.clone(),
         );
-        let signatures = contracts::alloy::support::Signatures::Instance::new(
+        let signatures = contracts::support::Signatures::Instance::new(
             addresses
                 .signatures
                 .map(Into::into)
-                .or_else(|| contracts::alloy::support::Signatures::deployment_address(&chain.id()))
+                .or_else(|| contracts::support::Signatures::deployment_address(&chain.id()))
                 .unwrap(),
             web3.provider.clone(),
         );
@@ -131,8 +131,19 @@ impl Contracts {
         // TODO: use `address_for()` once contracts are deployed
         let flashloan_router = addresses
             .flashloan_router
-            .or_else(|| FlashLoanRouter::deployment_address(&chain.id()).map(eth::ContractAddress))
-            .map(|address| FlashLoanRouter::Instance::new(address.0, web3.provider.clone()));
+            .or_else(|| {
+                FlashLoanRouter::deployment_address(&chain.id()).map(eth::ContractAddress::from)
+            })
+            .map(|address| FlashLoanRouter::Instance::new(*address, web3.provider.clone()));
+
+        let deadline_check = contracts::support::DeadlineCheck::Instance::new(
+            addresses
+                .deadline_check
+                .map(Into::into)
+                .or_else(|| contracts::support::DeadlineCheck::deployment_address(&chain.id()))
+                .unwrap(),
+            web3.provider.clone(),
+        );
 
         Ok(Self {
             orig_settlement,
@@ -144,7 +155,7 @@ impl Contracts {
             settlement_domain_separator,
             flashloan_router,
             balance_helper,
-            cow_amm_helper_by_factory: addresses.cow_amm_helper_by_factory,
+            deadline_check,
             web3: web3.clone(),
         })
     }
@@ -157,7 +168,7 @@ impl Contracts {
         &self.orig_settlement
     }
 
-    pub fn signatures(&self) -> &contracts::alloy::support::Signatures::Instance {
+    pub fn signatures(&self) -> &contracts::support::Signatures::Instance {
         &self.signatures
     }
 
@@ -173,7 +184,7 @@ impl Contracts {
         &self.weth
     }
 
-    pub fn weth_address(&self) -> eth::WethAddress {
+    pub fn weth_address(&self) -> eth::WrappedNativeToken {
         (*self.weth.address()).into()
     }
 
@@ -189,13 +200,11 @@ impl Contracts {
         &self.balance_helper
     }
 
-    pub fn web3(&self) -> &Web3 {
-        &self.web3
+    pub fn deadline_check(&self) -> &contracts::support::DeadlineCheck::Instance {
+        &self.deadline_check
     }
 
-    pub fn cow_amm_helper_by_factory(
-        &self,
-    ) -> &HashMap<eth::ContractAddress, eth::ContractAddress> {
-        &self.cow_amm_helper_by_factory
+    pub fn web3(&self) -> &Web3 {
+        &self.web3
     }
 }

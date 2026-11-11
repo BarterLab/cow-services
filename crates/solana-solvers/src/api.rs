@@ -1,0 +1,71 @@
+//! HTTP API for the solver engine.
+//!
+//! Serves the `/solve` contract the driver calls.
+
+use {
+    crate::{dex::Dex, domain::solver::Solver, dto::auction::Auction, extract::LoggingJson},
+    axum::{
+        Json,
+        Router,
+        extract::State,
+        routing::{get, post},
+    },
+    serde_json::{Value, json},
+    std::{future::Future, net::SocketAddr, sync::Arc},
+    tower_http::limit::RequestBodyLimitLayer,
+};
+
+const REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
+
+pub struct Api {
+    pub addr: SocketAddr,
+    pub solver: Arc<Solver<Dex>>,
+}
+
+impl Api {
+    /// Bind to the configured address, returning the listener and the actual
+    /// bound address (which differs from `addr` when binding to port 0).
+    pub async fn bind(&self) -> std::io::Result<(tokio::net::TcpListener, SocketAddr)> {
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        let local_addr = listener.local_addr()?;
+        tracing::info!(addr = %local_addr, "solana-solvers listening");
+        Ok((listener, local_addr))
+    }
+
+    /// Serve the API on the given listener until `shutdown` resolves.
+    pub async fn serve(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/metrics", get(metrics))
+            .route("/solve", post(solve))
+            .with_state(self.solver)
+            .layer(RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT))
+            .layer(axum::extract::DefaultBodyLimit::disable());
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+    }
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+async fn metrics() -> String {
+    observe::metrics::encode(observe::metrics::get_registry())
+}
+
+/// Quote the auction's orders and return one solution per side and directed
+/// mint pair, batched where the swap clears several orders.
+async fn solve(
+    State(solver): State<Arc<Solver<Dex>>>,
+    LoggingJson(auction): LoggingJson<Auction>,
+) -> Json<Value> {
+    let solutions = solver.solve(&auction).await;
+    Json(json!({ "solutions": solutions }))
+}

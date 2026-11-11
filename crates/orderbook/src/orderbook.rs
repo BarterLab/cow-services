@@ -4,11 +4,11 @@ use {
             orders::{InsertionError, OrderStoring},
             trades::{TradeFilter, TradeRetrieving},
         },
-        dto,
-        solver_competition::{Identifier, LoadSolverCompetitionError, SolverCompetitionStoring},
+        dto::{self, OrderSimulationRequest, OrderSimulationResult},
+        solver_competition::LoadSolverCompetitionError,
     },
-    alloy::primitives::{Address, B256},
-    anyhow::{Context, Result},
+    alloy::primitives::{Address, B256, keccak256},
+    anyhow::{Context, Result, anyhow},
     app_data::{AppDataHash, Validator},
     bigdecimal::ToPrimitive,
     chrono::Utc,
@@ -20,13 +20,14 @@ use {
             OrderCancellation,
             OrderCreation,
             OrderCreationAppData,
+            OrderData,
             OrderStatus,
             OrderUid,
             SignedOrderCancellations,
         },
         quote::QuoteId,
-        solver_competition::{self, SolverCompetitionAPI},
     },
+    num::BigUint,
     observe::metrics::LivenessChecking,
     shared::{
         fee::FeeParameters,
@@ -38,8 +39,8 @@ use {
             is_order_outside_market_price,
         },
     },
+    simulator::simulation_builder::{self, SettlementSimulator},
     std::{borrow::Cow, sync::Arc},
-    strum::Display,
     thiserror::Error,
     tracing::instrument,
 };
@@ -52,18 +53,34 @@ struct Metrics {
     orders: prometheus::IntCounterVec,
 }
 
-#[derive(Display)]
-#[strum(serialize_all = "snake_case")]
 enum OrderOperation {
     Created,
     Cancelled,
 }
 
-#[derive(Display)]
-#[strum(serialize_all = "snake_case")]
-enum OrderClass {
-    Market,
-    Limit,
+impl OrderOperation {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Whether an order's limit price was within the quote when it was submitted.
+enum MarketPosition {
+    InMarket,
+    OutOfMarket,
+}
+
+impl MarketPosition {
+    /// The metric label values keep the historic `market`/`limit` naming.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::InMarket => "market",
+            Self::OutOfMarket => "limit",
+        }
+    }
 }
 
 impl Metrics {
@@ -73,7 +90,7 @@ impl Metrics {
     }
 
     fn on_order_operation(order: &Order, operation: OrderOperation) {
-        let class = if order.metadata.quote.as_ref().is_some_and(|quote| {
+        let position = if order.metadata.quote.as_ref().is_some_and(|quote| {
             // Check if the order at the submission time was "in market"
             !is_order_outside_market_price(
                 &Amounts {
@@ -85,7 +102,8 @@ impl Metrics {
                     sell: quote.sell_amount,
                     buy: quote.buy_amount,
                     fee: FeeParameters {
-                        // safe to unwrap as these values were converted from f64 previously
+                        // safe to unwrap as these values were converted from
+                        // f64 previously
                         gas_amount: quote.gas_amount.to_f64().unwrap(),
                         gas_price: quote.gas_price.to_f64().unwrap(),
                         sell_token_price: quote.sell_token_price.to_f64().unwrap(),
@@ -95,24 +113,25 @@ impl Metrics {
                 order.data.kind,
             )
         }) {
-            OrderClass::Market
+            MarketPosition::InMarket
         } else {
-            OrderClass::Limit
+            MarketPosition::OutOfMarket
         };
         Self::get()
             .orders
-            .with_label_values(&[&class.to_string(), &operation.to_string()])
+            .with_label_values(&[position.as_str(), operation.as_str()])
             .inc();
     }
 
-    // Resets all the counters to 0 so we can always use them in Grafana queries.
+    // Resets all the counters to 0 so we can always use them in Grafana
+    // queries.
     fn initialize() {
         let metrics = Self::get();
         for op in &[OrderOperation::Created, OrderOperation::Cancelled] {
-            for class in &[OrderClass::Market, OrderClass::Limit] {
+            for position in &[MarketPosition::InMarket, MarketPosition::OutOfMarket] {
                 metrics
                     .orders
-                    .with_label_values(&[&class.to_string(), &op.to_string()])
+                    .with_label_values(&[position.as_str(), op.as_str()])
                     .reset();
             }
         }
@@ -153,7 +172,8 @@ impl AddOrderError {
             InsertionError::DbError(err) => AddOrderError::Database(err.into()),
             InsertionError::AppDataMismatch(existing) => AddOrderError::AppDataMismatch {
                 contract_app_data: order.data.app_data,
-                // Unwrap because this error can only occur if full app data was set.
+                // Unwrap because this error can only occur if full app data was
+                // set.
                 provided: order.metadata.full_app_data.clone().unwrap(),
                 // Unwrap because we only store utf-8 full app data.
                 existing: {
@@ -235,9 +255,11 @@ pub struct Orderbook {
     order_validator: Arc<dyn OrderValidating>,
     app_data: Arc<crate::app_data::Registry>,
     active_order_competition_threshold: u32,
+    order_simulator: Option<SettlementSimulator>,
 }
 
 impl Orderbook {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         domain_separator: DomainSeparator,
         settlement_contract: Address,
@@ -246,6 +268,7 @@ impl Orderbook {
         order_validator: Arc<dyn OrderValidating>,
         app_data: Arc<crate::app_data::Registry>,
         active_order_competition_threshold: u32,
+        order_simulator: Option<SettlementSimulator>,
     ) -> Self {
         Metrics::initialize();
         Self {
@@ -256,6 +279,7 @@ impl Orderbook {
             order_validator,
             app_data,
             active_order_competition_threshold,
+            order_simulator,
         }
     }
 
@@ -291,13 +315,14 @@ impl Orderbook {
             .await?;
 
         let order_uid = order.metadata.uid;
+        let quote_id = quote.as_ref().and_then(|q| q.id);
 
         // Check if it has to replace an existing order
         if let Some(old_order) = replaced_order {
-            self.replace_order(order, old_order).await?
+            self.replace_order(order, old_order, quote_id).await?
         } else {
             self.database
-                .insert_order(&order)
+                .insert_order(&order, quote_id)
                 .await
                 .map_err(|err| AddOrderError::from_insertion(err, &order))?;
             Metrics::on_order_operation(&order, OrderOperation::Created);
@@ -437,6 +462,7 @@ impl Orderbook {
         &self,
         validated_new_order: Order,
         old_order: Order,
+        quote_id: Option<QuoteId>,
     ) -> Result<(), AddOrderError> {
         validated_new_order
             .signature
@@ -453,7 +479,11 @@ impl Orderbook {
         }
 
         if self
-            .order_is_actively_bid_on(old_order.metadata.uid)
+            .database
+            .order_is_actively_bid_on(
+                &old_order.metadata.uid,
+                self.active_order_competition_threshold,
+            )
             .await?
         {
             return Err(AddOrderError::InvalidReplacement(
@@ -462,7 +492,7 @@ impl Orderbook {
         }
 
         self.database
-            .replace_order(&old_order.metadata.uid, &validated_new_order)
+            .replace_order(&old_order.metadata.uid, &validated_new_order, quote_id)
             .await
             .map_err(|err| AddOrderError::from_insertion(err, &validated_new_order))?;
         Metrics::on_order_operation(&old_order, OrderOperation::Cancelled);
@@ -471,31 +501,32 @@ impl Orderbook {
         Ok(())
     }
 
-    async fn order_is_actively_bid_on(&self, order_uid: OrderUid) -> Result<bool> {
-        let latest_competitions = self
-            .database
-            .load_latest_competitions(self.active_order_competition_threshold)
-            .await?;
-
-        let order_is_bid_on = latest_competitions
-            .into_iter()
-            .flat_map(|competition| competition.common.solutions)
-            .flat_map(|solution| solution.orders)
-            .map(|order| match order {
-                solver_competition::Order::Colocated { id, .. } => id,
-                solver_competition::Order::Legacy { id, .. } => id,
-            })
-            .any(|uid| uid == order_uid);
-
-        Ok(order_is_bid_on)
+    pub async fn get_order(&self, uid: &OrderUid) -> Result<Option<Order>> {
+        Ok(self
+            .database_replica
+            .single_order(uid)
+            .await?
+            .map(hide_quote_until_filled))
     }
 
-    pub async fn get_order(&self, uid: &OrderUid) -> Result<Option<Order>> {
-        self.database_replica.single_order(uid).await
+    pub async fn get_orders(&self, uids: &[OrderUid]) -> Result<Vec<(OrderUid, Result<Order>)>> {
+        Ok(self
+            .database_replica
+            .many_orders(uids)
+            .await?
+            .into_iter()
+            .map(|(uid, order)| (uid, order.map(hide_quote_until_filled)))
+            .collect())
     }
 
     pub async fn get_orders_for_tx(&self, hash: &B256) -> Result<Vec<Order>> {
-        self.database_replica.orders_for_tx(hash).await
+        Ok(self
+            .database_replica
+            .orders_for_tx(hash)
+            .await?
+            .into_iter()
+            .map(hide_quote_until_filled)
+            .collect())
     }
 
     pub async fn get_auction(&self) -> Result<Option<dto::AuctionWithId>> {
@@ -515,35 +546,33 @@ impl Orderbook {
         offset: u64,
         limit: u64,
     ) -> Result<Vec<Order>> {
-        self.database_replica
+        Ok(self
+            .database_replica
             .user_orders(owner, offset, Some(limit))
             .await
-            .context("get_user_orders error")
+            .context("get_user_orders error")?
+            .into_iter()
+            .map(hide_quote_until_filled)
+            .collect())
     }
 
     pub async fn get_order_status(
         &self,
         uid: &OrderUid,
     ) -> Result<dto::order::Status, OrderStatusError> {
-        let solutions = |competition: SolverCompetitionAPI| {
-            competition
-                .common
+        let solutions = |response: model::solver_competition_v2::Response| {
+            response
                 .solutions
                 .into_iter()
                 .map(|solution| {
-                    let executed_amounts = solution.orders.iter().find_map(|o| match o {
-                        solver_competition::Order::Legacy { .. } => None,
-                        solver_competition::Order::Colocated {
-                            id,
-                            sell_amount,
-                            buy_amount,
-                        } => (id == uid).then_some(dto::order::ExecutedAmounts {
-                            sell: *sell_amount,
-                            buy: *buy_amount,
-                        }),
+                    let executed_amounts = solution.orders.iter().find_map(|order| {
+                        (order.id == *uid).then_some(dto::order::ExecutedAmounts {
+                            sell: order.sell_amount,
+                            buy: order.buy_amount,
+                        })
                     });
                     dto::order::SolutionInclusion {
-                        solver: solution.solver,
+                        solver: solution.solver_address,
                         executed_amounts,
                     }
                 })
@@ -551,30 +580,27 @@ impl Orderbook {
         };
 
         let latest_competition = async {
-            let competition = SolverCompetitionStoring::load_latest_competition(&self.database)
+            let competition = self
+                .database
+                .load_latest_competition(None)
                 .await
                 .map_err(Into::<OrderStatusError>::into)?;
             Ok::<_, OrderStatusError>(solutions(competition))
         };
 
         // Once an order was executed we always want to return `Traded` with the
-        // competition data of the **first** time it was traded for a stable result.
-        // Under some circumstances it can happen that the latest state of an already
-        // executed order is not `Traded`. To detect that we first check the trades
-        // table and return the appropriate competition data.
-        let trades = self
-            .database
-            .trades(&TradeFilter {
-                owner: None,
-                order_uid: Some(*uid),
-            })
-            .await?;
+        // competition data of the **first** time it was traded for a stable
+        // result. Under some circumstances it can happen that the
+        // latest state of an already executed order is not `Traded`. To
+        // detect that we first check the trades table and return the
+        // appropriate competition data.
+        let trades = self.database.trades(&TradeFilter::OrderUid(*uid)).await?;
 
         match trades.first().map(|trade| trade.tx_hash) {
             Some(Some(tx_hash)) => {
                 let competition = self
                     .database
-                    .load_competition(Identifier::Transaction(tx_hash))
+                    .load_competition_by_tx_hash(tx_hash, None)
                     .await?;
                 return Ok(dto::order::Status::Traded(solutions(competition)));
             }
@@ -599,6 +625,135 @@ impl Orderbook {
         };
         Ok(status)
     }
+
+    /// Simulates an order based on its Uid using the OrderSimulator.
+    ///
+    /// The returned value contains the simulation result and tenderly API
+    /// request object that can be used to debug it.
+    pub async fn simulate_order(
+        &self,
+        uid: &OrderUid,
+        block_number: Option<u64>,
+    ) -> Result<Option<OrderSimulationResult>, OrderSimulationError> {
+        let Some(order_simulator) = &self.order_simulator else {
+            return Err(OrderSimulationError::NotEnabled);
+        };
+        let Some(order) = self
+            .get_order(uid)
+            .await
+            .map_err(OrderSimulationError::Other)?
+        else {
+            return Ok(None);
+        };
+
+        let full_app_data = order.metadata.full_app_data.clone().ok_or_else(|| {
+            OrderSimulationError::Other(anyhow!(
+                "can't find the full app data for this order in the database, can't simulate the \
+                 order correctly without that"
+            ))
+        })?;
+
+        let sim = order_simulator
+            .new_simulation_builder()
+            .with_orders([simulation_builder::Order::new(order.data)
+                .with_signature(order.metadata.owner, order.signature)
+                .fill_at(
+                    simulation_builder::ExecutionAmount::Remaining,
+                    simulation_builder::PriceEncoding::LimitPrice,
+                )])
+            .parameters_from_app_data(&full_app_data)
+            .map_err(|err| {
+                OrderSimulationError::MalformedInput(anyhow!("app_data `{}`: {err}", full_app_data))
+            })?
+            .at_block(
+                block_number
+                    .map(simulation_builder::Block::Number)
+                    .unwrap_or(simulation_builder::Block::Latest),
+            )
+            .provide_sufficient_buy_tokens()
+            .from_solver(simulation_builder::Solver::Fake(None))
+            .build()
+            .await
+            .context("failed to finalize simulation")
+            .map_err(OrderSimulationError::Other)?;
+
+        let simulation_result = sim
+            .simulate_with_tenderly_report()
+            .await
+            .context("failed to execute simulation")
+            .map_err(OrderSimulationError::Other)?;
+
+        Ok(Some(OrderSimulationResult {
+            tenderly_url: simulation_result.tenderly_url,
+            tenderly_request: simulation_result.tenderly_request,
+            error: simulation_result.error,
+        }))
+    }
+
+    /// Simulates an arbitrary order without requiring it to exist in the
+    /// database.
+    pub async fn simulate_custom_order(
+        &self,
+        request: OrderSimulationRequest,
+    ) -> Result<OrderSimulationResult, OrderSimulationError> {
+        let Some(order_simulator) = &self.order_simulator else {
+            return Err(OrderSimulationError::NotEnabled);
+        };
+        let app_data_hash = keccak256(&request.app_data);
+
+        let sim = order_simulator
+            .new_simulation_builder()
+            .with_orders([simulation_builder::Order::new(OrderData {
+                sell_token: request.sell_token,
+                buy_token: request.buy_token,
+                sell_amount: request.sell_amount.into(),
+                buy_amount: request.buy_amount,
+                kind: request.kind,
+                receiver: request.receiver,
+                sell_token_balance: request.sell_token_balance,
+                buy_token_balance: request.buy_token_balance,
+                fee_amount: request.fee_amount,
+                valid_to: request.valid_to,
+                app_data: AppDataHash(app_data_hash.into()),
+                partially_fillable: request.partially_fillable,
+            })
+            .with_signature(request.owner, request.signature)
+            .fill_at(
+                simulation_builder::ExecutionAmount::Full,
+                simulation_builder::PriceEncoding::LimitPrice,
+            )])
+            .parameters_from_app_data(&request.app_data)
+            .map_err(|err| {
+                OrderSimulationError::MalformedInput(anyhow!(
+                    "app_data `{}`: {err}",
+                    request.app_data
+                ))
+            })?
+            .at_block(
+                request
+                    .block_number
+                    .map(simulation_builder::Block::Number)
+                    .unwrap_or(simulation_builder::Block::Latest),
+            )
+            .provide_sufficient_buy_tokens()
+            .from_solver(simulation_builder::Solver::Fake(None))
+            .build()
+            .await
+            .context("failed to finalize simulation")
+            .map_err(OrderSimulationError::Other)?;
+
+        let simulation_result = sim
+            .simulate_with_tenderly_report()
+            .await
+            .context("failed to execute simulation")
+            .map_err(OrderSimulationError::Other)?;
+
+        Ok(OrderSimulationResult {
+            tenderly_url: simulation_result.tenderly_url,
+            tenderly_request: simulation_result.tenderly_request,
+            error: simulation_result.error,
+        })
+    }
 }
 
 #[derive(Error, Debug)]
@@ -618,11 +773,35 @@ impl From<LoadSolverCompetitionError> for OrderStatusError {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum OrderSimulationError {
+    #[error("order simulation is not enabled")]
+    NotEnabled,
+    #[error("malformed input")]
+    MalformedInput(anyhow::Error),
+    #[error("simulation could not be created for order")]
+    Other(anyhow::Error),
+}
+
 #[async_trait::async_trait]
 impl LivenessChecking for Orderbook {
     async fn is_alive(&self) -> bool {
         self.get_auction().await.is_ok()
     }
+}
+
+/// Only reveals the quote of orders that have been at least partially filled.
+/// That is enough for solvers to audit quote rewards but prevents them from
+/// placing and cancelling orders just to study other solvers' quotes.
+/// Apply this to every order returned via the API, even if the underlying
+/// query currently doesn't load the quote.
+fn hide_quote_until_filled(mut order: Order) -> Order {
+    if order.metadata.executed_buy_amount == BigUint::ZERO
+        && order.metadata.executed_sell_amount == BigUint::ZERO
+    {
+        order.metadata.quote = None;
+    }
+    order
 }
 
 #[cfg(test)]
@@ -632,11 +811,42 @@ mod tests {
         crate::database::orders::MockOrderStoring,
         mockall::predicate::eq,
         model::{
-            order::{OrderData, OrderMetadata},
+            order::{OrderData, OrderMetadata, OrderQuote},
             signature::Signature,
         },
         shared::order_validation::MockOrderValidating,
     };
+
+    #[test]
+    fn quote_only_revealed_after_fill() {
+        let quote = OrderQuote {
+            metadata: serde_json::json!({ "interactions": [] }),
+            ..Default::default()
+        };
+        let order = Order {
+            metadata: OrderMetadata {
+                quote: Some(quote.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(hide_quote_until_filled(order.clone()).metadata.quote, None);
+
+        // Either side being executed is enough to reveal the quote.
+        let mut only_buy_executed = order.clone();
+        only_buy_executed.metadata.executed_buy_amount = BigUint::from(1u8);
+        let only_buy_executed = hide_quote_until_filled(only_buy_executed);
+        assert_eq!(only_buy_executed.metadata.quote, Some(quote.clone()));
+
+        let mut partially_filled = order;
+        partially_filled.metadata.executed_sell_amount = BigUint::from(1u8);
+        let partially_filled = hide_quote_until_filled(partially_filled);
+        assert_eq!(partially_filled.metadata.quote, Some(quote));
+
+        // The quote's execution plan must never be exposed via the API.
+        let json = serde_json::to_value(&partially_filled).unwrap();
+        assert!(!json["quote"].as_object().unwrap().contains_key("metadata"));
+    }
 
     #[tokio::test]
     #[ignore]
@@ -663,7 +873,7 @@ mod tests {
                 let old_order = old_order.clone();
                 move |_| Ok(Some(old_order.clone()))
             });
-        database.expect_replace_order().returning(|_, _| Ok(()));
+        database.expect_replace_order().returning(|_, _, _| Ok(()));
 
         let mut order_validator = MockOrderValidating::new();
         order_validator
@@ -687,13 +897,14 @@ mod tests {
         let database =
             crate::database::Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&database.pool).await.unwrap();
-        database.insert_order(&old_order).await.unwrap();
+        database.insert_order(&old_order, None).await.unwrap();
 
         let database_replica = database.clone();
         let app_data = Arc::new(crate::app_data::Registry::new(
             Validator::new(8192),
             database.clone(),
             None,
+            1024,
         ));
         let orderbook = Orderbook {
             database,
@@ -703,6 +914,7 @@ mod tests {
             settlement_contract: Address::repeat_byte(0xba),
             app_data,
             active_order_competition_threshold: Default::default(),
+            order_simulator: None,
         };
 
         // Different owner

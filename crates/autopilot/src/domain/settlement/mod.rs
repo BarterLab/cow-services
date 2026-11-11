@@ -5,20 +5,15 @@
 
 use {
     crate::{
-        domain::{
-            self,
-            Metrics,
-            OrderUid,
-            auction::order,
-            eth,
-            settlement::transaction::EncodedTrade,
-        },
+        domain::{self, Metrics, OrderUid, auction::order, settlement::transaction::EncodedTrade},
         infra::{self, persistence::dto::AuctionId},
     },
     chain::Chain,
     chrono::{DateTime, Utc},
     database::{orders::OrderKind, solver_competition_v2::Solution},
+    eth_domain_types as eth,
     futures::TryFutureExt,
+    num::Zero,
     number::conversions::big_decimal_to_u256,
     std::collections::{HashMap, HashSet},
 };
@@ -30,9 +25,21 @@ pub mod transaction;
 pub use {
     auction::Auction,
     observer::Observer,
-    trade::{Trade, math},
+    trade::{Trade, TradeEvent, math},
     transaction::Transaction,
 };
+
+/// Summary of settlement metrics — used gas, gas price, surplus, fee, etc.
+#[derive(Debug)]
+pub(crate) struct SettlementMetrics<'a> {
+    pub(crate) gas: eth::Gas,
+    pub(crate) gas_price: eth::EffectiveGasPrice,
+    pub(crate) surplus: eth::Ether,
+    pub(crate) fee: eth::Ether,
+    /// Map between order and the respective fees.
+    pub(crate) fee_breakdown: HashMap<domain::OrderUid, trade::FeeBreakdown>,
+    pub(crate) jit_orders: Vec<&'a trade::Jit>,
+}
 
 /// A settled transaction together with the `Auction`, for which it was executed
 /// on-chain.
@@ -81,11 +88,22 @@ impl Settlement {
         self.solution_uid
     }
 
-    /// Total surplus for all trades in the settlement.
-    pub fn surplus_in_ether(&self) -> eth::Ether {
-        self.trades
-            .iter()
-            .map(|trade| {
+    /// The owners whose JIT orders the associated auction treats like user
+    /// orders.
+    pub fn surplus_capturing_jit_order_owners(&self) -> &HashSet<eth::Address> {
+        &self.auction.surplus_capturing_jit_order_owners
+    }
+
+    /// Summarizes settlement data required by the autopilot, see
+    /// [`SettlementMetrics`] for details.
+    pub(crate) fn summarize(&self) -> SettlementMetrics<'_> {
+        let mut surplus = eth::Ether::zero();
+        let mut fee = eth::Ether::zero();
+        let mut fee_breakdown = HashMap::with_capacity(self.trades.len());
+        let mut jit_orders = Vec::new();
+
+        for trade in &self.trades {
+            let trade_surplus =
                 trade
                     .surplus_in_ether(&self.auction.prices)
                     .unwrap_or_else(|err| {
@@ -94,62 +112,63 @@ impl Settlement {
                             trade = %trade.uid(),
                             "possible incomplete surplus calculation",
                         );
+                        Metrics::get()
+                            .settlement_math_errors
+                            .with_label_values(&["surplus"])
+                            .inc();
                         num::zero()
-                    })
-            })
-            .sum()
-    }
+                    });
+            surplus = surplus + trade_surplus;
 
-    /// Total fee taken for all the trades in the settlement.
-    pub fn fee_in_ether(&self) -> eth::Ether {
-        self.trades
-            .iter()
-            .map(|trade| {
-                trade
-                    .fee_in_ether(&self.auction.prices)
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(
-                            ?err,
-                            trade = %trade.uid(),
-                            "possible incomplete fee calculation",
-                        );
-                        num::zero()
-                    })
-            })
-            .sum()
-    }
-
-    /// Per order fees breakdown. Contains all orders from the settlement
-    pub fn fee_breakdown(&self) -> HashMap<domain::OrderUid, trade::FeeBreakdown> {
-        self.trades
-            .iter()
-            .map(|trade| {
-                let fee_breakdown = trade.fee_breakdown(&self.auction).unwrap_or_else(|err| {
+            let trade_fee = trade
+                .fee_in_ether(&self.auction.prices)
+                .unwrap_or_else(|err| {
                     tracing::warn!(
                         ?err,
                         trade = %trade.uid(),
-                        "possible incomplete fee breakdown calculation",
+                        "possible incomplete fee calculation",
                     );
-                    trade::FeeBreakdown {
-                        total: eth::Asset {
-                            // TODO surplus token
-                            token: trade.sell_token(),
-                            amount: num::zero(),
-                        },
-                        protocol: vec![],
-                    }
+                    Metrics::get()
+                        .settlement_math_errors
+                        .with_label_values(&["fee"])
+                        .inc();
+                    num::zero()
                 });
-                (*trade.uid(), fee_breakdown)
-            })
-            .collect()
-    }
+            fee = fee + trade_fee;
 
-    /// Return all trades that are classified as Just-In-Time (JIT) orders.
-    pub fn jit_orders(&self) -> Vec<&trade::Jit> {
-        self.trades
-            .iter()
-            .filter_map(|trade| trade.as_jit())
-            .collect()
+            let breakdown = trade.fee_breakdown(&self.auction).unwrap_or_else(|err| {
+                tracing::warn!(
+                    ?err,
+                    trade = %trade.uid(),
+                    "possible incomplete fee breakdown calculation",
+                );
+                Metrics::get()
+                    .settlement_math_errors
+                    .with_label_values(&["fee_breakdown"])
+                    .inc();
+                trade::FeeBreakdown {
+                    total: eth::Asset {
+                        token: trade.sell_token(),
+                        amount: num::zero(),
+                    },
+                    protocol: vec![],
+                }
+            });
+            fee_breakdown.insert(*trade.uid(), breakdown);
+
+            if let Some(jit) = trade.as_jit() {
+                jit_orders.push(jit);
+            }
+        }
+
+        SettlementMetrics {
+            gas: self.gas,
+            gas_price: self.gas_price,
+            surplus,
+            fee,
+            fee_breakdown,
+            jit_orders,
+        }
     }
 
     pub async fn new(
@@ -169,9 +188,9 @@ impl Settlement {
         if settled.block > auction.block + max_settlement_age(chain) {
             // A settled transaction references a VERY old auction.
             //
-            // A hacky way to detect processing of production settlements in the staging
-            // environment, as production is lagging with auction ids by ~270 days on
-            // Ethereum mainnet.
+            // A hacky way to detect processing of production settlements in the
+            // staging environment, as production is lagging with
+            // auction ids by ~270 days on Ethereum mainnet.
             //
             // TODO: remove once https://github.com/cowprotocol/services/issues/2848 is resolved and ~270 days are passed since bumping.
             return Err(Error::WrongEnvironment);
@@ -205,6 +224,14 @@ impl Settlement {
             auction,
         })
     }
+}
+
+/// A settlement event emitted by a settlement smart contract.
+#[derive(Debug, Clone, Copy)]
+pub struct SettlementEvent {
+    pub block: eth::BlockNo,
+    pub log_index: u64,
+    pub transaction: eth::TxId,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -351,15 +378,22 @@ mod tests {
         crate::domain::{
             self,
             auction,
-            eth,
+            blockchain,
             settlement::{OrderMatchKey, trade_to_key},
         },
         alloy::{eips::BlockId, primitives::address},
+        chain::Chain,
+        eth_domain_types::{self as eth, Address},
         hex_literal::hex,
-        number::u256_ext::U256Ext,
         std::collections::{HashMap, HashSet},
         winner_selection::{self as ws, state::RankedItem},
     };
+
+    fn wrapped_native_token(chain: Chain) -> eth::WrappedNativeToken {
+        contracts::WETH9::deployment_address(&chain.id())
+            .expect("WETH9 is deployed on all chains")
+            .into()
+    }
 
     #[derive(Clone)]
     struct MockAuthenticator;
@@ -386,7 +420,11 @@ mod tests {
                 .orders
                 .iter()
                 .map(|(uid, policies)| {
-                    let policies = policies.iter().copied().map(to_ws_fee_policy).collect();
+                    let policies = policies
+                        .iter()
+                        .copied()
+                        .map(protocol_fees::FeePolicy::from)
+                        .collect();
                     (ws::OrderUid(uid.0), policies)
                 })
                 .collect(),
@@ -397,10 +435,10 @@ mod tests {
                 .collect(),
             native_prices: prices.clone(),
         };
-        let solution = ws::Solution::new(0, ws::Address::ZERO, vec![order], prices);
+        let solution = ws::Solution::new(0, ws::Address::ZERO, vec![order]);
         let arbitrator = ws::Arbitrator {
             max_winners: 1,
-            weth: ws::Address::ZERO,
+            wrapped_native: ws::Address::ZERO,
         };
         let ranking = arbitrator.arbitrate(vec![solution], &context);
 
@@ -413,84 +451,22 @@ mod tests {
 
     fn ws_order_from_trade(trade: &super::trade::Trade) -> ws::Order {
         let trade = super::trade::math::Trade::from(trade);
-        let (executed_sell, executed_buy) = ws_executed_amounts(&trade);
-
-        ws::Order {
-            uid: ws::OrderUid(trade.uid.0),
-            sell_token: trade.sell.token.0,
-            buy_token: trade.buy.token.0,
-            sell_amount: trade.sell.amount.0,
-            buy_amount: trade.buy.amount.0,
-            executed_sell,
-            executed_buy,
-            side: match trade.side {
-                auction::order::Side::Buy => ws::Side::Buy,
-                auction::order::Side::Sell => ws::Side::Sell,
-            },
-        }
-    }
-
-    fn ws_executed_amounts(trade: &super::trade::math::Trade) -> (eth::U256, eth::U256) {
-        match trade.side {
-            auction::order::Side::Sell => {
-                let executed_sell = trade.executed.0;
-                let executed_buy = executed_sell
-                    .checked_mul(trade.prices.custom.sell)
-                    .and_then(|value| value.checked_ceil_div(&trade.prices.custom.buy))
-                    .expect("invalid sell trade executed amounts");
-                (executed_sell, executed_buy)
-            }
-            auction::order::Side::Buy => {
-                let executed_buy = trade.executed.0;
-                let executed_sell = executed_buy
-                    .checked_mul(trade.prices.custom.buy)
-                    .and_then(|value| value.checked_div(trade.prices.custom.sell))
-                    .expect("invalid buy trade executed amounts");
-                (executed_sell, executed_buy)
-            }
-        }
+        trade
+            .fill_at(&trade.prices.custom)
+            .expect("invalid trade executed amounts")
     }
 
     fn ws_prices_from_auction(auction: &super::Auction) -> HashMap<ws::Address, ws::U256> {
         auction
             .prices
             .iter()
-            .map(|(token, price)| (token.0, price.get().0))
+            .map(|(token, price)| (Address::from(*token), price.get().0))
             .collect()
     }
 
-    fn to_ws_fee_policy(policy: domain::fee::Policy) -> ws::primitives::FeePolicy {
-        match policy {
-            domain::fee::Policy::Surplus {
-                factor,
-                max_volume_factor,
-            } => ws::primitives::FeePolicy::Surplus {
-                factor: factor.get(),
-                max_volume_factor: max_volume_factor.get(),
-            },
-            domain::fee::Policy::PriceImprovement {
-                factor,
-                max_volume_factor,
-                quote,
-            } => ws::primitives::FeePolicy::PriceImprovement {
-                factor: factor.get(),
-                max_volume_factor: max_volume_factor.get(),
-                quote: ws::primitives::Quote {
-                    sell_amount: quote.sell_amount,
-                    buy_amount: quote.buy_amount,
-                    fee: quote.fee,
-                    solver: quote.solver,
-                },
-            },
-            domain::fee::Policy::Volume { factor } => ws::primitives::FeePolicy::Volume {
-                factor: factor.get(),
-            },
-        }
-    }
-
     // https://etherscan.io/tx/0x030623e438f28446329d8f4ff84db897907fcac59b9943b31b7be66f23c877af
-    // A transfer transaction that emits a settlement event, but it's not actually a
-    // swap.
+    // A transfer transaction that emits a settlement event, but it's not
+    // actually a swap.
     #[tokio::test]
     async fn not_a_swap() {
         let calldata = hex!(
@@ -702,23 +678,25 @@ mod tests {
         let settlement_contract = address!("9008d19f58aabd9ed0d60971565aa8510560ab41");
 
         let transaction = super::transaction::Transaction::try_new(
-            &domain::eth::Transaction {
-                trace_calls: domain::eth::CallFrame {
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
                     to: Some(settlement_contract),
                     input: calldata.into(),
-                    ..Default::default()
+                    from: Default::default(),
+                    calls: Default::default(),
                 },
                 ..Default::default()
             },
             &domain_separator,
             settlement_contract,
+            wrapped_native_token(Chain::Mainnet),
             &MockAuthenticator,
         )
         .await
         .unwrap_err();
 
-        // These transfer transactions don't have the auction_id attached so overall bad
-        // calldata is expected
+        // These transfer transactions don't have the auction_id attached so
+        // overall bad calldata is expected
         assert!(matches!(
             transaction,
             super::transaction::Error::Decoding(_)
@@ -809,16 +787,18 @@ mod tests {
         ));
         let settlement_contract = address!("9008d19f58aabd9ed0d60971565aa8510560ab41");
         let transaction = super::transaction::Transaction::try_new(
-            &domain::eth::Transaction {
-                trace_calls: domain::eth::CallFrame {
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
                     to: Some(settlement_contract),
                     input: calldata.into(),
-                    ..Default::default()
+                    from: Default::default(),
+                    calls: Default::default(),
                 },
                 ..Default::default()
             },
             &domain_separator,
             settlement_contract,
+            wrapped_native_token(Chain::Mainnet),
             &MockAuthenticator,
         )
         .await
@@ -831,12 +811,12 @@ mod tests {
             // prices read from https://solver-instances.s3.eu-central-1.amazonaws.com/prod/mainnet/legacy/8655372.json
             prices: auction::Prices::from([
                 (
-                    eth::TokenAddress(address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")),
+                    eth::TokenAddress::from(address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")),
                     auction::Price::try_new(eth::U256::from(1000000000000000000u128).into())
                         .unwrap(),
                 ),
                 (
-                    eth::TokenAddress(address!("c52fafdc900cb92ae01e6e4f8979af7f436e2eb2")),
+                    eth::TokenAddress::from(address!("c52fafdc900cb92ae01e6e4f8979af7f436e2eb2")),
                     auction::Price::try_new(eth::U256::from(537359915436704u128).into()).unwrap(),
                 ),
             ]),
@@ -847,14 +827,15 @@ mod tests {
 
         let trade = super::trade::Trade::new(transaction.trades[0].clone(), &auction, 0);
 
-        // surplus (score) read from https://api.cow.fi/mainnet/api/v1/solver_competition/by_tx_hash/0xc48dc0d43ffb43891d8c3ad7bcf05f11465518a2610869b20b0b4ccb61497634
+        // NOTE(historical): surplus (score) read from https://api.cow.fi/mainnet/api/v1/solver_competition/by_tx_hash/0xc48dc0d43ffb43891d8c3ad7bcf05f11465518a2610869b20b0b4ccb61497634
         assert_eq!(
             trade.surplus_in_ether(&auction.prices).unwrap().0,
             eth::U256::from(52937525819789126u128)
         );
         // fee read from "executedFee" https://api.cow.fi/mainnet/api/v1/orders/0x10dab31217bb6cc2ace0fe601c15d342f7626a1ee5ef0495449800e73156998740a50cf069e992aa4536211b23f286ef88752187ffffffff
-        // but not equal to 6890975030480504 anymore, since after this tx we switched to
-        // convert the fee from surplus token directly to ether
+        // but not equal to 6890975030480504 anymore, since after this tx we
+        // switched to convert the fee from surplus token directly to
+        // ether
         assert_eq!(
             trade.fee_in_ether(&auction.prices).unwrap().0,
             eth::U256::from(6752697350740628u128)
@@ -949,16 +930,18 @@ mod tests {
         ));
         let settlement_contract = address!("9008d19f58aabd9ed0d60971565aa8510560ab41");
         let transaction = super::transaction::Transaction::try_new(
-            &domain::eth::Transaction {
-                trace_calls: domain::eth::CallFrame {
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
                     to: Some(settlement_contract),
                     input: calldata.into(),
-                    ..Default::default()
+                    from: Default::default(),
+                    calls: Default::default(),
                 },
                 ..Default::default()
             },
             &domain_separator,
             settlement_contract,
+            wrapped_native_token(Chain::Mainnet),
             &MockAuthenticator,
         )
         .await
@@ -966,12 +949,12 @@ mod tests {
 
         let prices: auction::Prices = From::from([
             (
-                eth::TokenAddress(address!("dac17f958d2ee523a2206206994597c13d831ec7")),
+                eth::TokenAddress::from(address!("dac17f958d2ee523a2206206994597c13d831ec7")),
                 auction::Price::try_new(eth::U256::from(321341140475275961528483840u128).into())
                     .unwrap(),
             ),
             (
-                eth::TokenAddress(address!("056fd409e1d7a124bd7017459dfea2f387b6d5cd")),
+                eth::TokenAddress::from(address!("056fd409e1d7a124bd7017459dfea2f387b6d5cd")),
                 auction::Price::try_new(
                     eth::U256::from(3177764302250520038326415654912u128).into(),
                 )
@@ -1122,16 +1105,18 @@ mod tests {
         let settlement_contract =
             eth::Address::from_slice(&hex!("9008d19f58aabd9ed0d60971565aa8510560ab41"));
         let transaction = super::transaction::Transaction::try_new(
-            &domain::eth::Transaction {
-                trace_calls: domain::eth::CallFrame {
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
                     to: Some(settlement_contract),
                     input: calldata.into(),
-                    ..Default::default()
+                    from: Default::default(),
+                    calls: Default::default(),
                 },
                 ..Default::default()
             },
             &domain_separator,
             settlement_contract,
+            wrapped_native_token(Chain::Mainnet),
             &MockAuthenticator,
         )
         .await
@@ -1139,12 +1124,12 @@ mod tests {
 
         let prices: auction::Prices = From::from([
             (
-                eth::TokenAddress(address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")),
+                eth::TokenAddress::from(address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")),
                 auction::Price::try_new(eth::U256::from(374263465721452989998170112u128).into())
                     .unwrap(),
             ),
             (
-                eth::TokenAddress(address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")),
+                eth::TokenAddress::from(address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")),
                 auction::Price::try_new(eth::U256::from(1000000000000000000u128).into()).unwrap(),
             ),
         ]);
@@ -1166,10 +1151,164 @@ mod tests {
         );
     }
 
+    // https://etherscan.io/tx/0xbd5c3b33c571a948bd4d04c152024ba7c8fa2702f470e3b6131713367017f49a
+    // The user order selling CRV has no uniform price: CRV is only listed
+    // among the custom prices. The trade books no total fee but keeps its
+    // protocol fees, which only need the custom prices.
+    #[tokio::test]
+    async fn settlement_with_missing_uniform_price() {
+        let calldata = hex!(
+            "
+        13d79a0b
+        0000000000000000000000000000000000000000000000000000000000000080
+        0000000000000000000000000000000000000000000000000000000000000180
+        0000000000000000000000000000000000000000000000000000000000000280
+        00000000000000000000000000000000000000000000000000000000000006a0
+        0000000000000000000000000000000000000000000000000000000000000007
+        000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2
+        00000000000000000000000062b9c7356a2dc64a1969e19c23e4f579f9810aa7
+        000000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+        00000000000000000000000062b9c7356a2dc64a1969e19c23e4f579f9810aa7
+        000000000000000000000000eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+        000000000000000000000000d533a949740bb3306d119cc777fa900ba034cd52
+        00000000000000000000000062b9c7356a2dc64a1969e19c23e4f579f9810aa7
+        0000000000000000000000000000000000000000000000000000000000000007
+        0000000000000000000000000000000000000000000000000e2d01330d8a0422
+        000000000000000000000000000000000000000000000000000033c743c7a6b1
+        0000000000000000000000000000000000000000000000000e2d01330d8a0422
+        0000000000000000000000000000000000000000000000000610fc635b7febcb
+        0000000000000000000000000000000000000000000001a96c699d7c20055a40
+        0000000000000000000000000000000000000000000001a940cdb11b8b19882c
+        0000000000000000000000000000000000000000000000a80d10993eee1622e2
+        0000000000000000000000000000000000000000000000000000000000000002
+        0000000000000000000000000000000000000000000000000000000000000040
+        0000000000000000000000000000000000000000000000000000000000000220
+        0000000000000000000000000000000000000000000000000000000000000003
+        0000000000000000000000000000000000000000000000000000000000000004
+        000000000000000000000000f516199866cff36a03069e459827996e5cfb33f7
+        00000000000000000000000000000000000000000000152d02c7e14af6800000
+        0000000000000000000000000000000000000000000000004d4ac7a001a06789
+        000000000000000000000000000000000000000000000000000000006adce828
+        1e558dd696110d79677e96b205a9ef69a21919fdf0b3bc5e17504f9214d3978f
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000002
+        0000000000000000000000000000000000000000000001a96c699d7c20055a40
+        0000000000000000000000000000000000000000000000000000000000000160
+        0000000000000000000000000000000000000000000000000000000000000041
+        0d3c09369969b27fb741ebcbc39c8eecd4ed1cee0dba8a669ce2789318b49cfb
+        045866fb7a039f9493fef7c1a567f13716250b7ec6cbd8e88a5801375b6d2ad8
+        1b00000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000005
+        0000000000000000000000000000000000000000000000000000000000000006
+        0000000000000000000000000000000000000000000000000000000000000000
+        00000000000000000000000000000000000000000000152d02c7e14af6800000
+        000000000000000000000000000000000000000000003595dc69d316dedc4400
+        000000000000000000000000000000000000000000000000000000006ad3d239
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000002
+        0000000000000000000000000000000000000000000000a80d10993eee1622e2
+        0000000000000000000000000000000000000000000000000000000000000160
+        0000000000000000000000000000000000000000000000000000000000000041
+        77d9afa6c6df693f9cd130bdb0b9f1f49252bc06bb13e4f07bd1636ed906e52b
+        0cd6b409e0c1d2432324a133b50aeae32388f78b005b284953bd98f0e024206a
+        1b00000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000060
+        0000000000000000000000000000000000000000000000000000000000000160
+        0000000000000000000000000000000000000000000000000000000000000560
+        0000000000000000000000000000000000000000000000000000000000000001
+        0000000000000000000000000000000000000000000000000000000000000020
+        0000000000000000000000000e91b5b157e98c20b90332cc3b9cf4ae67b222ad
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000060
+        0000000000000000000000000000000000000000000000000000000000000024
+        a699094600000000000000000000000000000000000000000000000000000000
+        018ffe9900000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000002
+        0000000000000000000000000000000000000000000000000000000000000040
+        0000000000000000000000000000000000000000000000000000000000000320
+        00000000000000000000000055084ee0fef03f14a305cd24286359a35d735151
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000060
+        0000000000000000000000000000000000000000000000000000000000000244
+        c52ac72000000000000000000000000000000000000000000000000000000000
+        00000020000000000000000000000000741c939c644576433ca03c368ade3352
+        e3252b35000000000000000000000000e8736af1926e9d8f5a6602fbbb0893b2
+        6436d7100000000000000000000000009008d19f58aabd9ed0d60971565aa851
+        0560ab410000000000000000000000009008d19f58aabd9ed0d60971565aa851
+        0560ab41000000000000000000000000d533a949740bb3306d119cc777fa900b
+        a034cd52000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead908
+        3c756cc20000000000000000000000000000000000000000000000a80d10993e
+        ee1622e20000000000000000000000000000000000000000000000a80d10993e
+        ee1622e20000000000000000000000000000000000000000000000000611e5bc
+        207a270000000000000000000000000000000000000000000000000000000000
+        6ad3bcff000000000000000000000000000000000000000000000000000001a1
+        4b19b5ad1450000c8000c800000007ed92ec40ffffffffffffff0031ecb2cdb4
+        5662000000000000000000000000000000000000000000000000000000000000
+        000001a000000000000000000000000000000000000000000000000000000000
+        00000041145a95fceb2dd070624fdbe83f677005e55d715803c079a48e9d4c39
+        8e25a68c3b33bc71b5a6e0e726cb87c806a2023329aba32afff3ffb0fbc9c560
+        51c59f5f1b000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000000
+        000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000060
+        0000000000000000000000000000000000000000000000000000000000000024
+        2e1a7d4d0000000000000000000000000000000000000000000000000611bd44
+        92ad362400000000000000000000000000000000000000000000000000000000
+        0000000000000000000000000000000000000000000000000000000000000000
+        0000000000d6516e"
+        )
+        .to_vec();
+
+        let domain_separator = eth::DomainSeparator(hex!(
+            "c078f884a2676e1345748b1feace7b0abee5d00ecadb6e574dcdd109a63e8943"
+        ));
+        let settlement_contract = address!("9008d19f58aabd9ed0d60971565aa8510560ab41");
+        let transaction = super::transaction::Transaction::try_new(
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
+                    to: Some(settlement_contract),
+                    input: calldata.into(),
+                    from: Default::default(),
+                    calls: Default::default(),
+                },
+                ..Default::default()
+            },
+            &domain_separator,
+            settlement_contract,
+            wrapped_native_token(Chain::Mainnet),
+            &MockAuthenticator,
+        )
+        .await
+        .unwrap();
+
+        let encoded = transaction.trades[1].clone();
+        assert!(encoded.uniform_prices.is_none());
+        let auction = super::Auction {
+            block: eth::BlockNo(0),
+            prices: Default::default(),
+            surplus_capturing_jit_order_owners: Default::default(),
+            id: 0,
+            orders: HashMap::from([(
+                encoded.uid,
+                vec![domain::fee::Policy::Volume {
+                    factor: 0.0002.try_into().unwrap(),
+                }],
+            )]),
+        };
+        let trade = super::trade::Trade::new(encoded, &auction, 0);
+
+        let breakdown = trade.fee_breakdown(&auction).unwrap();
+        assert_eq!(breakdown.total.amount.0, eth::U256::ZERO);
+        assert_eq!(breakdown.protocol.len(), 1);
+        assert!(breakdown.protocol[0].fee.amount.0 > eth::U256::ZERO);
+    }
+
     // https://etherscan.io/tx/0x0ee0a609c54cb006d024a4d009db8751730c064b26524379793144c07c3575b3
-    // A special case where the user order and a liquidity order trade the common
-    // token, where liquidity order is supposed to be executed at its limit price
-    // and without fees.
+    // A special case where the user order and a liquidity order trade the
+    // common token, where liquidity order is supposed to be executed at its
+    // limit price and without fees.
     #[tokio::test]
     async fn settlement_with_liquidity_order_and_user_order() {
         let calldata = hex!(
@@ -1300,16 +1439,18 @@ mod tests {
         ));
         let settlement_contract = address!("9008d19f58aabd9ed0d60971565aa8510560ab41");
         let transaction = super::transaction::Transaction::try_new(
-            &domain::eth::Transaction {
-                trace_calls: domain::eth::CallFrame {
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
                     to: Some(settlement_contract),
                     input: calldata.into(),
-                    ..Default::default()
+                    from: Default::default(),
+                    calls: Default::default(),
                 },
                 ..Default::default()
             },
             &domain_separator,
             settlement_contract,
+            wrapped_native_token(Chain::Mainnet),
             &MockAuthenticator,
         )
         .await
@@ -1317,15 +1458,15 @@ mod tests {
 
         let prices: auction::Prices = From::from([
             (
-                eth::TokenAddress(address!("812Ba41e071C7b7fA4EBcFB62dF5F45f6fA853Ee")),
+                eth::TokenAddress::from(address!("812Ba41e071C7b7fA4EBcFB62dF5F45f6fA853Ee")),
                 auction::Price::try_new(eth::U256::from(400373909534592401408u128).into()).unwrap(),
             ),
             (
-                eth::TokenAddress(address!("a21Af1050F7B26e0cfF45ee51548254C41ED6b5c")),
+                eth::TokenAddress::from(address!("a21Af1050F7B26e0cfF45ee51548254C41ED6b5c")),
                 auction::Price::try_new(eth::U256::from(127910593u128).into()).unwrap(),
             ),
             (
-                eth::TokenAddress(address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")),
+                eth::TokenAddress::from(address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")),
                 auction::Price::try_new(eth::U256::from(1000000000000000000u128).into()).unwrap(),
             ),
         ]);
@@ -1366,8 +1507,8 @@ mod tests {
     }
 
     // https://gnosisscan.io/tx/0xf4556c35d421623c63571d1006fd1888932c1b78a6e0f3b9b9590bb9781b02af
-    // A special case to reproduce an issue where we don't match a settled trade due
-    // to a mismatch in executed token amounts. The smart contract, for
+    // A special case to reproduce an issue where we don't match a settled trade
+    // due to a mismatch in executed token amounts. The smart contract, for
     // non-partially-fillable orders, does force executed = sellAmount on the
     // transaction events. https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol#L385-L386
     // https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol#L407-L408
@@ -1525,16 +1666,18 @@ mod tests {
         ));
         let settlement_contract = address!("9008d19f58aabd9ed0d60971565aa8510560ab41");
         let transaction = super::transaction::Transaction::try_new(
-            &domain::eth::Transaction {
-                trace_calls: domain::eth::CallFrame {
+            &blockchain::Transaction {
+                trace_calls: blockchain::CallFrame {
                     to: Some(settlement_contract),
                     input: calldata.into(),
-                    ..Default::default()
+                    from: Default::default(),
+                    calls: Default::default(),
                 },
                 ..Default::default()
             },
             &domain_separator,
             settlement_contract,
+            wrapped_native_token(Chain::Gnosis),
             &MockAuthenticator,
         )
         .await
@@ -1544,8 +1687,9 @@ mod tests {
         let expected_key = OrderMatchKey {
             uid: transaction.trades[0].uid,
             token: transaction.trades[0].sell.token,
-            // We expect the order's sell amount instead of the faulty `executedAmount`
-            // provided by the solver because this is a fill-or-kill order.
+            // We expect the order's sell amount instead of the faulty
+            // `executedAmount` provided by the solver because this is a
+            // fill-or-kill order.
             executed: transaction.trades[0].sell.amount.into(),
         };
 

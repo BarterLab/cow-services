@@ -1,36 +1,32 @@
 use {
     crate::{
-        boundary::{self, Result},
+        boundary::Result,
         domain::{
-            eth,
+            self,
             liquidity::{self, uniswap},
         },
         infra::{self, blockchain::Ethereum},
     },
-    alloy::primitives::Address,
-    async_trait::async_trait,
-    contracts::alloy::IUniswapLikeRouter,
+    contracts::IUniswapLikeRouter,
+    eth_domain_types as eth,
     ethrpc::{Web3, block_stream::CurrentBlockWatcher},
-    shared::{
-        http_solver::model::TokenAmount,
-        sources::uniswap_v2::{
+    liquidity_sources::{
+        recent_block_cache::CacheConfig,
+        uniswap_v2::{
             pair_provider::PairProvider,
             pool_cache::PoolCache,
             pool_fetching::{DefaultPoolReader, PoolFetcher, PoolReading},
         },
     },
+    shared::http_solver::model::TokenAmount,
     solver::{
-        interactions::allowances::{AllowanceManaging, Allowances, Approval, ApprovalRequest},
         liquidity::{
             ConstantProductOrder,
             uniswap_v2::{self, UniswapLikeLiquidity},
         },
         liquidity_collector::LiquidityCollecting,
     },
-    std::{
-        collections::HashSet,
-        sync::{Arc, Mutex},
-    },
+    std::sync::Arc,
 };
 
 /// Median gas used per UniswapInteraction (v2).
@@ -93,21 +89,17 @@ pub fn to_interaction(
     input: &liquidity::MaxInput,
     output: &liquidity::ExactOutput,
     receiver: &eth::Address,
-) -> eth::Interaction {
-    let handler = uniswap_v2::Inner::new(
-        pool.router.0,
-        *receiver,
-        Mutex::new(Allowances::empty(*receiver)),
-    );
+) -> domain::Interaction {
+    let handler = uniswap_v2::Inner::new(*pool.router, *receiver);
 
-    let (_, interaction) = handler.settle(
-        TokenAmount::new(input.0.token.into(), input.0.amount),
-        TokenAmount::new(output.0.token.into(), output.0.amount),
+    let interaction = handler.settle(
+        TokenAmount::new(*input.0.token, input.0.amount),
+        TokenAmount::new(*output.0.token, output.0.amount),
     );
 
     let (target, value, call_data) = interaction.encode_swap();
 
-    eth::Interaction {
+    domain::Interaction {
         target,
         value: value.into(),
         call_data: call_data.0.to_vec().into(),
@@ -118,22 +110,24 @@ pub async fn collector(
     eth: &Ethereum,
     blocks: &CurrentBlockWatcher,
     config: &infra::liquidity::config::UniswapV2,
+    cache_config: CacheConfig,
 ) -> Result<Box<dyn LiquidityCollecting>> {
     let eth = eth.with_metric_label("uniswapV2".into());
-    collector_with_reader(&eth, blocks, config, DefaultPoolReader::new).await
+    collector_with_reader(&eth, blocks, config, cache_config, DefaultPoolReader::new).await
 }
 
 pub(in crate::boundary::liquidity) async fn collector_with_reader<R, F>(
     eth: &Ethereum,
     blocks: &CurrentBlockWatcher,
     config: &infra::liquidity::config::UniswapV2,
+    cache_config: CacheConfig,
     reader: F,
 ) -> Result<Box<dyn LiquidityCollecting>>
 where
     R: PoolReading + Send + Sync + 'static,
     F: FnOnce(Web3, PairProvider) -> R,
 {
-    let router = IUniswapLikeRouter::Instance::new(config.router.0, eth.web3().provider.clone());
+    let router = IUniswapLikeRouter::Instance::new(*config.router, eth.web3().provider.clone());
     let settlement = eth.contracts().settlement().clone();
     let pool_fetcher = {
         let factory = router.factory().call().await?;
@@ -149,36 +143,15 @@ where
         );
 
         Arc::new(PoolCache::new(
-            boundary::liquidity::cache_config(),
+            cache_config,
             Arc::new(pool_fetcher),
             blocks.clone(),
         )?)
     };
 
-    Ok(Box::new(UniswapLikeLiquidity::with_allowances(
+    Ok(Box::new(UniswapLikeLiquidity::new(
         *router.address(),
         *settlement.address(),
-        Box::new(NoAllowanceManaging),
         pool_fetcher,
     )))
-}
-
-/// An allowance manager that always reports no allowances.
-struct NoAllowanceManaging;
-
-#[async_trait]
-impl AllowanceManaging for NoAllowanceManaging {
-    async fn get_allowances(&self, _: HashSet<Address>, spender: Address) -> Result<Allowances> {
-        Ok(Allowances::empty(spender))
-    }
-
-    async fn get_approvals(&self, requests: &[ApprovalRequest]) -> Result<Vec<Approval>> {
-        Ok(requests
-            .iter()
-            .map(|request| Approval {
-                spender: request.spender,
-                token: request.token,
-            })
-            .collect())
-    }
 }

@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-alloy = { workspace = true }
-itertools = { workspace = true }
+alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
+chain-types = { workspace = true }
+itertools = { workspace = true }
+protocol-fees = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-number = { path = "../number" }

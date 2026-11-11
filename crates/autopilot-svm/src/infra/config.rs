@@ -1,0 +1,432 @@
+//! Configuration of the autopilot's endpoints and competition parameters.
+
+use {
+    configs::{
+        autopilot::fee_policy::FeePoliciesConfig,
+        database::DatabasePoolConfig,
+        deserialize_env::deserialize_string_from_env,
+        shared::LoggingConfig,
+    },
+    cow_settlement_interface::pda::state::STATE_PDA_SEEDS,
+    serde::Deserialize,
+    serde_ext::{deserialize_nonempty_vec, deserialize_solana_pubkey_b58},
+    solana_sdk::pubkey::Pubkey,
+    std::{net::SocketAddr, num::NonZero, path::Path, time::Duration},
+    tokio::fs,
+};
+
+/// Load the autopilot configuration from a TOML file.
+///
+/// # Panics
+///
+/// This function panics if the config is invalid or on I/O errors.
+pub async fn load(path: &Path) -> Config {
+    let data = fs::read_to_string(path)
+        .await
+        .unwrap_or_else(|e| panic!("I/O error while reading {path:?}: {e:?}"));
+
+    toml::de::from_str(&data).unwrap_or_else(|err| {
+        if std::env::var("TOML_TRACE_ERROR").is_ok_and(|v| v == "1") {
+            panic!("failed to parse TOML config at {path:?}: {err:#?}")
+        } else {
+            panic!(
+                "failed to parse TOML config at: {path:?}. Set TOML_TRACE_ERROR=1 to print \
+                 parsing error but this may leak secrets."
+            )
+        }
+    })
+}
+
+/// Configuration of the autopilot's endpoints and competition parameters.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Config {
+    /// Connection configuration for the database the indexer writes to.
+    #[serde(default)]
+    pub database: DatabasePoolConfig,
+    /// JSON-RPC client configuration.
+    pub rpc: Rpc,
+    /// On-chain addresses the autopilot reads.
+    pub contracts: Contracts,
+    /// Competition parameters.
+    #[serde(default)]
+    pub competition: Competition,
+    /// Protocol fee policies by order class, the EVM autopilot's section.
+    /// Without it no order carries a policy. `max-partner-fee` is read but
+    /// unused: Solana orders carry no partner fee.
+    #[serde(default)]
+    pub fee_policies: FeePoliciesConfig,
+    /// Port the metrics and probes server binds to, on every interface.
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    /// Address the HTTP API binds to. The orderbook reads native prices
+    /// from it.
+    #[serde(default = "default_api_address")]
+    pub api_address: SocketAddr,
+    /// If no cut in this time made a new auction, found no order, or waited
+    /// for a lagging indexer, the pod fails the liveness check.
+    #[serde(with = "humantime_serde", default = "default_max_auction_age")]
+    pub max_auction_age: Duration,
+    /// Minimum time between auction cycles. Zero runs a cycle every new slot.
+    #[serde(with = "humantime_serde", default = "default_min_auction_interval")]
+    pub min_auction_interval: Duration,
+    /// Slots the indexer may lag behind the tip before auction cuts are
+    /// skipped, so a stalled indexer stops feeding stale orders to solvers.
+    #[serde(default = "default_max_indexer_lag_slots")]
+    pub max_indexer_lag_slots: u64,
+    /// Take a leader lock in the database, so several instances can run and
+    /// only the one holding it cuts auctions.
+    #[serde(default)]
+    pub enable_leader_lock: bool,
+    /// The driver endpoints participating in every auction.
+    #[serde(deserialize_with = "deserialize_nonempty_vec")]
+    pub drivers: Vec<Driver>,
+    /// Sponsored order execution. Must be set when the orderbook accepts
+    /// sponsored orders: without it their winning solutions dispatch without
+    /// creations and fail at the driver.
+    pub sponsoring: Option<Sponsoring>,
+    /// Native price lookups for auction tokens. Required with no default
+    /// source: pricing through a third party is a deployment decision,
+    /// never a silent fallback.
+    pub native_prices: NativePrices,
+    /// Periodic deletion of expired quotes and old order events.
+    #[serde(default)]
+    pub db_cleanup: DbCleanup,
+    /// Logging configuration.
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+/// Periodic deletion of expired quotes and old order events.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
+pub struct DbCleanup {
+    /// Time between cleanup runs.
+    #[serde(with = "humantime_serde")]
+    pub cleanup_interval: Duration,
+    /// Age at which an order event is deleted. An expired quote is deleted
+    /// at any age.
+    #[serde(with = "humantime_serde")]
+    pub cleanup_threshold: Duration,
+}
+
+impl Default for DbCleanup {
+    fn default() -> Self {
+        Self {
+            cleanup_interval: Duration::from_hours(24),
+            cleanup_threshold: Duration::from_hours(30 * 24),
+        }
+    }
+}
+
+/// Native price lookups.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct NativePrices {
+    /// Price sources by stage. A lookup asks a stage's sources at once, adds
+    /// the next stage while fewer sources are in flight than prices are
+    /// missing, and asks later stages only for the tokens still short of
+    /// `results_required` prices. Empty, the autopilot prices every token at
+    /// the native denominator, so scores compare raw surplus. Pricing
+    /// through a third party stays a deployment decision, there is no
+    /// default source.
+    #[serde(default)]
+    pub estimators: Vec<Vec<NativePriceEstimator>>,
+    /// Prices a token needs before its lookup stops asking: the sources
+    /// still in flight are dropped and the later stages skipped. The best of
+    /// them wins.
+    #[serde(default = "default_results_required")]
+    pub results_required: NonZero<usize>,
+    /// How long a fetched price serves auctions before it is refetched.
+    #[serde(with = "humantime_serde", default = "default_prices_ttl")]
+    pub ttl: Duration,
+    /// Lamports a driver source sells per probe quote. The probe is
+    /// denominated in the native token so its economic size does not depend
+    /// on what one whole unit of the priced token is worth.
+    #[serde(default = "default_driver_probe_lamports")]
+    pub driver_probe_lamports: u64,
+    /// The CoinGecko source behind the `CoinGecko` stage entries.
+    #[serde(default)]
+    pub coin_gecko: CoinGecko,
+}
+
+/// The CoinGecko `simple/token_price` API.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
+pub struct CoinGecko {
+    /// The `simple/token_price` route, the public API by default. The chain
+    /// is appended.
+    pub url: url::Url,
+    /// API key sent with every price request as the CoinGecko Pro plan
+    /// header. Empty sends none. A value like `%COIN_GECKO_API_KEY` reads
+    /// the key from that environment variable, keeping the literal out of
+    /// the config file, and fails the load when the variable is unset.
+    #[serde(deserialize_with = "deserialize_string_from_env")]
+    pub api_key: String,
+}
+
+impl Default for CoinGecko {
+    fn default() -> Self {
+        Self {
+            url: url::Url::parse("https://api.coingecko.com/api/v3/simple/token_price")
+                .expect("valid URL"),
+            api_key: String::new(),
+        }
+    }
+}
+
+/// The default amount of wSOL used in native price requests.
+const fn default_driver_probe_lamports() -> u64 {
+    10_000_000
+}
+
+const fn default_results_required() -> NonZero<usize> {
+    NonZero::new(2).expect("two is not zero")
+}
+
+/// One native price source, in the shape of the EVM autopilot's
+/// `[native-price-estimation] estimators` entries.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum NativePriceEstimator {
+    /// The CoinGecko source configured in `[native-prices.coin-gecko]`.
+    CoinGecko,
+    /// A solver driver, quoted through its regular `/quote` route. The url
+    /// includes the solver path, like the `[[drivers]]` entries.
+    Driver { name: String, url: url::Url },
+}
+
+const fn default_prices_ttl() -> Duration {
+    Duration::from_secs(30)
+}
+
+impl Config {
+    /// Build the `observe::Config` for the tracing framework from the logging
+    /// configuration.
+    pub fn observe_config(&self) -> observe::Config {
+        observe::Config::new(
+            &self.logging.filter,
+            self.logging.stderr_threshold,
+            self.logging.use_json,
+            None,
+        )
+    }
+}
+
+const fn default_metrics_port() -> u16 {
+    observe::metrics::DEFAULT_METRICS_PORT
+}
+
+fn default_api_address() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 12088))
+}
+
+const fn default_max_auction_age() -> Duration {
+    Duration::from_mins(5)
+}
+
+const fn default_min_auction_interval() -> Duration {
+    Duration::ZERO
+}
+
+/// One blockhash lifetime: beyond it the freshest pending creations in the
+/// stale data would already be dying.
+const fn default_max_indexer_lag_slots() -> u64 {
+    150
+}
+
+/// JSON-RPC client configuration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Rpc {
+    /// HTTP endpoint of the Solana JSON-RPC node.
+    pub endpoint: url::Url,
+    /// Timeout for a single RPC request.
+    #[serde(with = "humantime_serde")]
+    pub request_timeout: Duration,
+}
+
+/// Sponsored order execution configuration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Sponsoring {
+    /// The funder countersigning sponsored creation transactions as their fee
+    /// payer. Its pubkey must match the orderbook's `sponsoring.funder`, the
+    /// fee payer pinned at placement.
+    pub funder: cow_solana_signer::Config,
+    /// Most creations sent per auction for pending sponsored orders that
+    /// appear only in losing solutions, so the orders outlive their creation
+    /// blockhash. An owner gets at most one per auction. The funder pays for
+    /// each, and its order may never fill. Zero, the default, sends none.
+    #[serde(default)]
+    pub max_displaced_creations: usize,
+}
+
+/// On-chain addresses: programs and mints.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Contracts {
+    /// The wrapped native token mint (wSOL), the unit scores are denominated
+    /// in.
+    #[serde(deserialize_with = "deserialize_solana_pubkey_b58")]
+    pub wrapped_native_mint: Pubkey,
+    /// The settlement program whose state PDA sell token accounts must
+    /// approve. Defaults to the official deployment the interface crate
+    /// exports.
+    #[serde(
+        default = "default_settlement_program_id",
+        deserialize_with = "deserialize_solana_pubkey_b58"
+    )]
+    pub settlement_program_id: Pubkey,
+}
+
+impl Contracts {
+    /// The settlement state PDA: the delegate every sell token account must
+    /// approve.
+    pub fn state_pda(&self) -> Pubkey {
+        Pubkey::find_program_address(&STATE_PDA_SEEDS, &self.settlement_program_id).0
+    }
+}
+
+fn default_settlement_program_id() -> Pubkey {
+    cow_settlement_interface::ID
+}
+
+/// Competition parameters.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, default)]
+pub struct Competition {
+    /// Maximum number of winning solutions per auction.
+    pub max_winners: NonZero<usize>,
+    /// How long drivers get to answer `/solve`.
+    #[serde(with = "humantime_serde")]
+    pub solve_deadline: Duration,
+    /// Slots a settlement may take after ranking before it counts as late.
+    pub submission_deadline_slots: NonZero<u64>,
+}
+
+impl Default for Competition {
+    fn default() -> Self {
+        Self {
+            max_winners: NonZero::new(1).expect("non-zero literal"),
+            // The EVM fast chains run 6s solve deadlines.
+            solve_deadline: Duration::from_secs(6),
+            submission_deadline_slots: NonZero::new(25).expect("non-zero literal"),
+        }
+    }
+}
+
+/// One driver endpoint.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Driver {
+    /// Name for logs and metrics.
+    pub name: String,
+    /// HTTP endpoint of the driver API.
+    pub url: url::Url,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contracts_default_to_the_interface_program_id() {
+        let contracts: Contracts = toml::de::from_str(
+            "wrapped-native-mint = \"So11111111111111111111111111111111111111112\"",
+        )
+        .unwrap();
+        assert_eq!(
+            contracts.settlement_program_id,
+            cow_settlement_interface::ID
+        );
+    }
+
+    #[tokio::test]
+    async fn loads_the_example_config() {
+        let config = load(std::path::Path::new("example.toml")).await;
+        assert_eq!(config.database.write_url.as_str(), "postgresql://");
+        assert_eq!(
+            config.contracts.wrapped_native_mint,
+            "So11111111111111111111111111111111111111112"
+                .parse()
+                .unwrap()
+        );
+        assert_eq!(config.competition.max_winners.get(), 1);
+        assert_eq!(config.competition.solve_deadline, Duration::from_secs(6));
+        assert_eq!(config.competition.submission_deadline_slots.get(), 25);
+        assert_eq!(config.fee_policies.policies.len(), 1);
+        assert!(config.fee_policies.upcoming_policies.policies.is_empty());
+        assert_eq!(config.api_address, "0.0.0.0:12088".parse().unwrap());
+        assert_eq!(config.max_auction_age, Duration::from_secs(5 * 60));
+        assert_eq!(config.min_auction_interval, Duration::from_secs(2));
+        assert_eq!(config.max_indexer_lag_slots, 150);
+        assert!(config.enable_leader_lock);
+        assert_eq!(config.db_cleanup.cleanup_interval, Duration::from_hours(24));
+        assert_eq!(
+            config.db_cleanup.cleanup_threshold,
+            Duration::from_hours(30 * 24)
+        );
+        assert_eq!(config.native_prices.ttl, Duration::from_secs(30));
+        assert_eq!(config.native_prices.driver_probe_lamports, 10_000_000);
+        assert_eq!(config.native_prices.results_required.get(), 2);
+        assert_eq!(
+            config.native_prices.coin_gecko.url.as_str(),
+            "https://api.coingecko.com/api/v3/simple/token_price"
+        );
+        assert!(config.native_prices.coin_gecko.api_key.is_empty());
+        let stages: Vec<&[NativePriceEstimator]> = config
+            .native_prices
+            .estimators
+            .iter()
+            .map(Vec::as_slice)
+            .collect();
+        assert!(matches!(
+            &stages[..],
+            [
+                [NativePriceEstimator::CoinGecko],
+                [NativePriceEstimator::Driver { name, .. }],
+            ] if name == "baseline"
+        ));
+        assert_eq!(config.drivers.len(), 1);
+        assert_eq!(config.drivers[0].name, "baseline");
+        assert_eq!(config.logging.filter, "info,autopilot_svm=debug");
+    }
+
+    #[test]
+    fn coin_gecko_api_key_reads_the_environment() {
+        let var = "TEST_SVM_COIN_GECKO_API_KEY";
+        // Safety: test-only, and the name is unique to this test.
+        unsafe { std::env::set_var(var, "secret") };
+        let prices: NativePrices = toml::de::from_str(&format!(
+            r#"
+            estimators = [[{{ type = "CoinGecko" }}]]
+            [coin-gecko]
+            api-key = "%{var}"
+            "#
+        ))
+        .unwrap();
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(prices.coin_gecko.api_key, "secret");
+        assert!(matches!(
+            &prices.estimators[0][..],
+            [NativePriceEstimator::CoinGecko]
+        ));
+    }
+
+    #[test]
+    fn coin_gecko_api_key_missing_from_the_environment_fails_the_load() {
+        let err = toml::de::from_str::<NativePrices>(
+            r#"
+            [coin-gecko]
+            api-key = "%TEST_SVM_COIN_GECKO_API_KEY_UNSET"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("TEST_SVM_COIN_GECKO_API_KEY_UNSET"),
+            "{err}"
+        );
+    }
+}

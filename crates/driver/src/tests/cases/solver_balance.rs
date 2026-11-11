@@ -1,9 +1,9 @@
-use crate::{
-    domain::eth,
-    tests::{
+use {
+    crate::tests::{
         setup,
         setup::{ab_order, ab_pool, ab_solution, test_solver},
     },
+    eth_domain_types as eth,
 };
 
 /// Test that the `/solve` request errors when solver balance is too low.
@@ -35,10 +35,10 @@ async fn test_just_enough_funded() {
         .solution(ab_solution())
         .solvers(vec![
             test_solver()
-            .name("barely_funded")
-            // The solution uses ~500k gas units
-            // With gas costs <20gwei, 0.01 ETH should suffice
-            .balance(eth::U256::from(10).pow(eth::U256::from(16))),
+                .name("barely_funded")
+                // The solution uses ~500k gas units
+                // With gas costs <20gwei, 0.01 ETH should suffice
+                .balance(eth::U256::from(10).pow(eth::U256::from(16))),
         ])
         .done()
         .await;

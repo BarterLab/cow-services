@@ -1,15 +1,20 @@
 use {
     ::alloy::primitives::U256,
-    autopilot::{config::Configuration, shutdown_controller::ShutdownController},
-    driver::domain::eth::NonZeroU256,
+    autopilot::shutdown_controller::ShutdownController,
+    configs::{
+        autopilot::Configuration,
+        order_quoting::{ExternalSolver, OrderQuoting},
+        shared::SharedConfig,
+        test_util::TestDefault,
+    },
     e2e::setup::{colocation, wait_for_condition, *},
     ethrpc::alloy::{CallBuilderExt, EvmProviderExt},
     model::{
-        order::{OrderCreation, OrderKind},
+        order::{BUY_ETH_ADDRESS, OrderCreation, OrderKind},
         quote::{OrderQuoteRequest, OrderQuoteSide, SellAmount},
         signature::EcdsaSigningScheme,
     },
-    number::units::EthUnit,
+    number::{nonzero::NonZeroU256, units::EthUnit},
     shared::web3::Web3,
     std::ops::DerefMut,
 };
@@ -152,7 +157,7 @@ async fn disabled_same_sell_and_buy_token_order_feature(web3: Web3) {
         .await
         .expect("Must be able to disable automine");
 
-    tracing::info!("Quoting");
+    tracing::info!("Quoting same sell and buy token pair");
     let quote_sell_amount = 1u64.eth();
     let quote_request = OrderQuoteRequest {
         from: trader.address(),
@@ -165,9 +170,30 @@ async fn disabled_same_sell_and_buy_token_order_feature(web3: Web3) {
         },
         ..Default::default()
     };
-    assert!(
-        matches!(services.submit_quote(&quote_request).await, Err((reqwest::StatusCode::BAD_REQUEST, response)) if response.contains("SameBuyAndSellToken"))
-    );
+    let Err((status, response)) = services.submit_quote(&quote_request).await else {
+        panic!("expected error response");
+    };
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response.contains("SameBuyAndSellToken"));
+
+    tracing::info!("Quoting selling same sell and buy token pair of native token");
+    let quote_sell_amount = 1u64.eth();
+    let quote_request = OrderQuoteRequest {
+        from: trader.address(),
+        sell_token: *onchain.contracts().weth.address(),
+        buy_token: BUY_ETH_ADDRESS,
+        side: OrderQuoteSide::Sell {
+            sell_amount: SellAmount::BeforeFee {
+                value: NonZeroU256::try_from(quote_sell_amount).unwrap(),
+            },
+        },
+        ..Default::default()
+    };
+    let Err((status, response)) = services.submit_quote(&quote_request).await else {
+        panic!("expected error response");
+    };
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert!(response.contains("SameBuyAndSellToken"));
 }
 
 async fn fallback_native_price_estimator(web3: Web3) {
@@ -214,33 +240,56 @@ async fn fallback_native_price_estimator(web3: Web3) {
             .await,
         ],
         colocation::LiquidityProvider::UniswapV2,
-        false,
     );
 
     let (manual_shutdown, control) = ShutdownController::new_manual_shutdown();
-    let (_autopilot_config_file, cli_arg) =
-        Configuration::test("test_solver", solver.address()).to_cli_args();
     let autopilot_handle = services
         .start_autopilot_with_shutdown_controller(
-            None,
-            vec![
-                cli_arg,
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-                "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-            ],
+            Configuration {
+                order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                    "test_quoter",
+                    "http://localhost:11088/test_solver",
+                )]),
+                shared: SharedConfig {
+                    gas_estimators: vec![TestDefault::test_default()],
+                    ..Default::default()
+                },
+                ..Configuration::test("test_solver", solver.address())
+            },
             control,
         )
         .await;
 
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-            "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-            "--native-price-estimators-fallback=Driver|test_quoter|http://localhost:11088/test_solver"
-                .to_string(),
-            "--native-price-cache-max-age=2s".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            native_price_estimation: configs::orderbook::native_price::NativePriceConfig {
+                fallback_estimators: Some(
+                    configs::native_price_estimators::NativePriceEstimators::new(vec![vec![
+                        configs::native_price_estimators::NativePriceEstimator::driver(
+                            "test_quoter".to_string(),
+                            "http://localhost:11088/test_solver".parse().unwrap(),
+                        ),
+                    ]]),
+                ),
+                shared: configs::native_price::NativePriceConfig {
+                    cache: configs::native_price::CacheConfig {
+                        max_age: std::time::Duration::from_secs(2),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..configs::orderbook::native_price::NativePriceConfig::test_default()
+            },
+            shared: SharedConfig {
+                gas_estimators: vec![TestDefault::test_default()],
+                ..Default::default()
+            },
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
 
     tracing::info!("Quoting with autopilot running");

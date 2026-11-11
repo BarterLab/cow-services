@@ -2,12 +2,13 @@ use {
     crate::{
         boundary,
         domain::{
-            eth,
+            self,
             liquidity::{self, InvalidSwap},
         },
     },
     derive_more::Debug,
-    std::collections::BTreeMap,
+    eth_domain_types as eth,
+    std::{collections::BTreeMap, sync::Arc},
 };
 
 /// A Uniswap V3 concentrated liquidity pool.
@@ -21,8 +22,10 @@ pub struct Pool {
     pub sqrt_price: SqrtPrice,
     pub liquidity: Liquidity,
     pub tick: Tick,
+    /// Tick index -> net liquidity, `Arc`-shared with the source `PoolInfo` to
+    /// avoid deep-copying the tick map on every `/solve`.
     #[debug(ignore)]
-    pub liquidity_net: BTreeMap<Tick, LiquidityNet>,
+    pub liquidity_net: Arc<BTreeMap<i32, i128>>,
     pub fee: Fee,
 }
 
@@ -49,11 +52,6 @@ pub struct Liquidity(pub u128);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Tick(pub i32);
 
-/// The amount of liquidity added (or, if negative, removed) when the tick is
-/// crossed going left to right.
-#[derive(Debug, Copy, Clone)]
-pub struct LiquidityNet(pub i128);
-
 #[derive(Clone, Debug)]
 pub struct Fee(pub num::rational::Ratio<u32>);
 
@@ -66,7 +64,7 @@ impl Pool {
         input: &liquidity::MaxInput,
         output: &liquidity::ExactOutput,
         receiver: &eth::Address,
-    ) -> Result<eth::Interaction, InvalidSwap> {
+    ) -> Result<domain::Interaction, InvalidSwap> {
         let tokens_match = (input.0.token == self.tokens.0 && output.0.token == self.tokens.1)
             || (input.0.token == self.tokens.1 && output.0.token == self.tokens.0);
 

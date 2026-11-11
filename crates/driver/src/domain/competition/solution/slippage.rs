@@ -1,9 +1,9 @@
 use {
     crate::domain::{
         competition::auction::Prices,
-        eth,
         liquidity::{ExactOutput, MaxInput},
     },
+    eth_domain_types as eth,
     num::{BigRational, CheckedDiv, CheckedMul},
     number::{conversions::big_rational_to_u256, u256_ext::U256Ext},
 };
@@ -33,11 +33,11 @@ impl Parameters {
         &self,
         interaction: &Interaction,
     ) -> Result<(MaxInput, ExactOutput), super::error::Math> {
-        // It is possible for liquidity to use tokens that don't have prices. In order
-        // to handle these cases, we do in order:
+        // It is possible for liquidity to use tokens that don't have prices. In
+        // order to handle these cases, we do in order:
         // 1. Compute the capped slippage using the sell token amount
-        // 2. If no sell token price is available, compute the capped slippage using the
-        //    buy token amount
+        // 2. If no sell token price is available, compute the capped slippage
+        //    using the buy token amount
         // 3. Fall back to using the default relative slippage without capping
         let slippage = if let Some(price) = self.prices.get(&interaction.input.token) {
             let amount = price.in_eth(interaction.input.amount);
@@ -111,7 +111,7 @@ impl Parameters {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::domain::eth::Asset, alloy::primitives::address, num::rational::Ratio};
+    use {super::*, alloy::primitives::address, eth_domain_types::Asset, num::rational::Ratio};
 
     const GNO: eth::Address = address!("6810e776880c02933d47db1b9fc05908e5386b96");
     const USDC: eth::Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");

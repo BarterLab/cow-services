@@ -6,32 +6,43 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-axum = { workspace = true }
+async-nats = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
+backtrace = { workspace = true, features = ["std"] }
+bytes = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 console-subscriber = { workspace = true, optional = true }
+event-bus-dto = { workspace = true }
 futures = { workspace = true }
+jemalloc_pprof = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
+opentelemetry-http = { workspace = true }
 opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
 opentelemetry_sdk = { workspace = true }
 pin-project-lite = { workspace = true }
 prometheus = { workspace = true }
+prometheus-client = { workspace = true }
 prometheus-metric-storage = { workspace = true }
 scopeguard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
 time = { workspace = true, features = ["macros"] }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "macros", "signal"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "time"] }
 tracing-serde = { workspace = true }
-jemalloc_pprof = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "time"] }
+url = { workspace = true }
 
-[lints]
-workspace = true
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [features]
 default = []
 jemalloc-pprof = ["dep:jemalloc_pprof"]
 tokio-console = ["dep:console-subscriber"]
+
+[lints]
+workspace = true

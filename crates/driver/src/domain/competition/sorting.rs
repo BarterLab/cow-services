@@ -1,12 +1,10 @@
 use {
     crate::{
-        domain::{
-            competition::{auction::Tokens, order},
-            eth,
-        },
+        domain::competition::{auction::Tokens, order},
         util,
     },
     chrono::Duration,
+    eth_domain_types as eth,
     std::{fmt::Debug, sync::Arc},
 };
 
@@ -40,9 +38,9 @@ impl SortingStrategy for ExternalPrice {
         _solver: &eth::Address,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> SortingKey {
-        // The likelihood that this order will be fulfilled, based on token prices.
-        // A larger value means that the order is more likely to be fulfilled.
-        // This is used to prioritize orders when solving.
+        // The likelihood that this order will be fulfilled, based on token
+        // prices. A larger value means that the order is more likely to
+        // be fulfilled. This is used to prioritize orders when solving.
         let chance_to_settle = match (
             tokens.get(&order.buy.token).and_then(|token| token.price),
             tokens.get(&order.sell.token).and_then(|token| token.price),

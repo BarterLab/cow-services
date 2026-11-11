@@ -2,34 +2,33 @@ use {
     crate::{
         boundary::{self, Result},
         domain::{
-            eth,
+            self,
             liquidity::{
                 self,
-                uniswap::v3::{Fee, Liquidity, LiquidityNet, Pool, SqrtPrice, Tick},
+                uniswap::v3::{Fee, Liquidity, Pool, SqrtPrice, Tick},
             },
         },
         infra::{self, blockchain::Ethereum},
     },
     anyhow::Context,
-    ethrpc::block_stream::BlockRetrieving,
-    shared::{
-        http_solver::model::TokenAmount,
-        interaction::Interaction,
-        maintenance::ServiceMaintenance,
-        sources::uniswap_v3::pool_fetching::UniswapV3PoolFetcher,
+    eth_domain_types as eth,
+    event_indexing::{
+        block_retriever::BlockRetrieving,
+        maintenance::{Maintaining, ServiceMaintenance},
     },
+    liquidity_sources::uniswap_v3::{
+        pool_fetching::UniswapV3PoolFetcher,
+        pool_indexer::PoolIndexerClient,
+    },
+    shared::{http_solver::model::TokenAmount, interaction::Interaction},
     solver::{
-        interactions::allowances::Allowances,
         liquidity::{
             ConcentratedLiquidity,
             uniswap_v3::{self, UniswapV3Liquidity, UniswapV3SettlementHandler},
         },
         liquidity_collector::{BackgroundInitLiquiditySource, LiquidityCollecting},
     },
-    std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    },
+    std::sync::Arc,
 };
 
 pub fn to_domain(id: liquidity::Id, pool: ConcentratedLiquidity) -> Result<liquidity::Liquidity> {
@@ -56,16 +55,8 @@ pub fn to_domain(id: liquidity::Id, pool: ConcentratedLiquidity) -> Result<liqui
             )?,
             sqrt_price: SqrtPrice(pool.pool.state.sqrt_price),
             liquidity: Liquidity(u128::try_from(pool.pool.state.liquidity)?),
-            tick: Tick(pool.pool.state.tick.try_into()?),
-            liquidity_net: pool
-                .pool
-                .state
-                .liquidity_net
-                .iter()
-                .map(|(key, value)| -> Result<_> {
-                    Ok((Tick(key.try_into()?), LiquidityNet(value.try_into()?)))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()?,
+            tick: Tick(pool.pool.state.tick),
+            liquidity_net: pool.pool.state.liquidity_net.clone(),
             fee: Fee(pool.pool.state.fee),
         }),
     })
@@ -76,21 +67,16 @@ pub fn to_interaction(
     input: &liquidity::MaxInput,
     output: &liquidity::ExactOutput,
     receiver: &eth::Address,
-) -> eth::Interaction {
-    let handler = UniswapV3SettlementHandler::new(
-        pool.router.into(),
-        *receiver,
-        Mutex::new(Allowances::empty(*receiver)),
-        pool.fee.0,
-    );
+) -> domain::Interaction {
+    let handler = UniswapV3SettlementHandler::new(*pool.router, *receiver, pool.fee.0);
 
-    let (_, interaction) = handler.settle(
+    let interaction = handler.settle(
         TokenAmount::new(input.0.token.into(), input.0.amount),
         TokenAmount::new(output.0.token.into(), output.0.amount),
     );
 
     let encoded = interaction.encode();
-    eth::Interaction {
+    domain::Interaction {
         target: encoded.0,
         value: encoded.1.into(),
         call_data: encoded.2,
@@ -126,28 +112,36 @@ async fn init_liquidity(
     config: &infra::liquidity::config::UniswapV3,
 ) -> anyhow::Result<impl LiquidityCollecting + use<>> {
     let web3 = eth.web3().clone();
+    let http = boundary::liquidity::http_client();
+    let indexer = &config.pool_indexer;
+    tracing::info!(url = %indexer.url, "uniswap v3: using pool-indexer as data source");
+    let source = Arc::new(PoolIndexerClient::new(
+        indexer.url.clone(),
+        eth.chain(),
+        http,
+    ));
 
     let pool_fetcher = Arc::new(
         UniswapV3PoolFetcher::new(
-            &config.graph_url,
+            source,
             web3.clone(),
-            boundary::liquidity::http_client(),
             block_retriever,
             config.max_pools_to_initialize,
-            config.max_pools_per_tick_query,
         )
         .await
         .context("failed to initialise UniswapV3 liquidity")?,
     );
 
-    let update_task = ServiceMaintenance::new(vec![pool_fetcher.clone()])
+    // only run maintenance as long as someone is using the original
+    // pool_fetcher
+    let maintenance = Arc::downgrade(&(pool_fetcher.clone() as Arc<dyn Maintaining>));
+    let update_task = ServiceMaintenance::new(vec![maintenance])
         .run_maintenance_on_new_block(eth.current_block().clone());
     tokio::task::spawn(update_task);
 
     Ok(UniswapV3Liquidity::new(
-        config.router.into(),
+        *config.router,
         *eth.contracts().settlement().address(),
-        web3,
         pool_fetcher,
     ))
 }

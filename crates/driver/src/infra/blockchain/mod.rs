@@ -1,30 +1,25 @@
-use alloy::{providers::ext::TraceApi, rpc::types::trace::parity::TraceOutput};
-
 use {
     crate::{
         boundary,
-        domain::{competition::solution::SimulationContext, eth, eth::U256},
+        domain::{blockchain::TxStatus, competition::solution::SimulationContext},
+        infra::{blockchain::gas::GasPriceParameters, config::file::GasEstimatorType},
     },
+    account_balances::{BalanceSimulator, SimulationError},
     alloy::{
-        eips::{BlockNumberOrTag, eip1559::Eip1559Estimation},
+        eips::{BlockId, BlockNumberOrTag, eip1559::Eip1559Estimation},
         network::TransactionBuilder,
         providers::Provider,
         rpc::types::{TransactionReceipt, TransactionRequest, state::StateOverride},
         transports::TransportErrorKind,
     },
     anyhow::anyhow,
+    balance_overrides::{StateOverrides, StateOverriding},
     chain::Chain,
+    eth_domain_types as eth,
     ethrpc::{Web3, alloy::ProviderLabelingExt, block_stream::CurrentBlockWatcher},
+    gas_price_estimation::{Eip1559EstimationExt, GasPriceEstimating},
+    shared::web3,
     solvers_dto::solution::StateOverrideBlock,
-    shared::{
-        account_balances::{BalanceSimulator, SimulationError},
-        gas_price_estimation::Eip1559EstimationExt,
-        price_estimation::trade_verifier::balance_overrides::{
-            BalanceOverrides,
-            BalanceOverriding,
-        },
-        web3,
-    },
     std::{
         fmt,
         sync::Arc,
@@ -41,12 +36,14 @@ pub mod token;
 pub use self::{contracts::Contracts, gas::GasPriceEstimator};
 
 /// An Ethereum RPC connection.
+#[derive(Clone)]
 pub struct Rpc {
     web3: Web3,
     chain: Chain,
     args: RpcArgs,
 }
 
+#[derive(Clone)]
 pub struct RpcArgs {
     pub url: Url,
     pub max_batch_size: usize,
@@ -90,11 +87,11 @@ pub enum RpcError {
     UnsupportedChain(#[from] chain::ChainIdNotSupported),
 }
 
-fn state_override_block_param(block: Option<StateOverrideBlock>) -> serde_json::Value {
+fn state_override_block_param(block: Option<StateOverrideBlock>) -> BlockId {
     match block {
-        Some(StateOverrideBlock::Number(number)) => format!("0x{number:x}").into(),
-        Some(StateOverrideBlock::Pending) => "pending".into(),
-        None => "latest".into(),
+        Some(StateOverrideBlock::Number(number)) => BlockId::number(number),
+        Some(StateOverrideBlock::Pending) => BlockId::pending(),
+        None => BlockId::latest(),
     }
 }
 
@@ -111,8 +108,8 @@ struct Inner {
     gas: Arc<GasPriceEstimator>,
     current_block: CurrentBlockWatcher,
     balance_simulator: BalanceSimulator,
-    balance_overrider: Arc<dyn BalanceOverriding>,
-    tx_gas_limit: U256,
+    state_overrider: Arc<dyn StateOverriding>,
+    tx_gas_limit: eth::Gas,
 }
 
 impl Ethereum {
@@ -125,28 +122,58 @@ impl Ethereum {
     pub async fn new(
         rpc: Rpc,
         addresses: contracts::Addresses,
-        gas: Arc<GasPriceEstimator>,
-        tx_gas_limit: U256,
         current_block_args: &shared::current_block::Arguments,
+        tx_gas_limit: eth::Gas,
+        gas_estimator_type: &GasEstimatorType,
+        gas_adjustments: GasPriceParameters,
+    ) -> Self {
+        Self::new_from(
+            rpc,
+            addresses,
+            current_block_args,
+            tx_gas_limit,
+            gas_estimator_type,
+            gas_adjustments,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_from(
+        rpc: Rpc,
+        addresses: contracts::Addresses,
+        current_block_args: &shared::current_block::Arguments,
+        tx_gas_limit: eth::Gas,
+        gas_estimator_type: &GasEstimatorType,
+        gas_adjustments: GasPriceParameters,
         from_address: Option<eth::Address>,
     ) -> Self {
         let Rpc { web3, chain, args } = rpc;
-
         let current_block_stream = current_block_args
             .stream(args.url.clone(), web3.provider.clone())
             .await
             .expect("couldn't initialize current block stream");
 
+        let gas = Arc::new(
+            GasPriceEstimator::new(
+                &web3.provider,
+                &current_block_stream,
+                gas_estimator_type,
+                gas_adjustments,
+            )
+            .await
+            .expect("initialize gas price estimator"),
+        );
+
         let contracts = Contracts::new(&web3, chain, addresses, from_address)
             .await
             .expect("could not initialize important smart contracts");
-        let balance_overrider = Arc::new(BalanceOverrides::new(web3.clone()));
+        let state_overrider = Arc::new(StateOverrides::new(web3.clone()));
         let balance_simulator = BalanceSimulator::new(
             contracts.settlement().clone(),
             contracts.balance_helper().clone(),
-            contracts.vault_relayer().0,
-            Some(*contracts.vault().address()),
-            balance_overrider.clone(),
+            *contracts.vault_relayer(),
+            state_overrider.clone(),
         );
 
         Self {
@@ -156,7 +183,7 @@ impl Ethereum {
                 contracts,
                 gas,
                 balance_simulator,
-                balance_overrider,
+                state_overrider,
                 tx_gas_limit,
             }),
             web3,
@@ -171,8 +198,12 @@ impl Ethereum {
         &self.inner.balance_simulator
     }
 
-    pub fn balance_overrider(&self) -> Arc<dyn BalanceOverriding> {
-        Arc::clone(&self.inner.balance_overrider)
+    pub fn state_overrider(&self) -> Arc<dyn StateOverriding> {
+        Arc::clone(&self.inner.state_overrider)
+    }
+
+    pub fn balance_overrider(&self) -> Arc<dyn StateOverriding> {
+        self.state_overrider()
     }
 
     /// Clones self and returns an instance that captures metrics extended with
@@ -201,13 +232,50 @@ impl Ethereum {
         &self.inner.current_block
     }
 
+    /// The gas price is determined based on the deadline by which the
+    /// transaction must be included on-chain. A shorter deadline requires a
+    /// higher gas price to increase the likelihood of timely inclusion.
+    pub async fn gas_price(&self) -> Result<Eip1559Estimation, Error> {
+        self.inner.gas.estimate().await
+    }
+
+    pub fn gas_estimator(&self) -> Arc<dyn GasPriceEstimating> {
+        Arc::clone(&self.inner.gas) as _
+    }
+
+    pub fn block_gas_limit(&self) -> eth::Gas {
+        self.inner.current_block.borrow().gas_limit.into()
+    }
+
+    /// Per-transaction gas limit configured for this driver. Operators set
+    /// this per chain (e.g. EIP-7825's 16,777,215 cap on Fusaka chains).
+    pub fn tx_gas_limit(&self) -> eth::Gas {
+        self.inner.tx_gas_limit
+    }
+
+    /// Returns the current [`eth::Ether`] balance of the specified account.
+    pub async fn balance(&self, address: eth::Address) -> Result<eth::Ether, Error> {
+        self.web3
+            .provider
+            .get_balance(address)
+            .await
+            .map(Into::into)
+            .map_err(Into::into)
+    }
+
+    /// Returns a [`token::Erc20`] for the specified address.
+    pub fn erc20(&self, address: eth::TokenAddress) -> token::Erc20 {
+        token::Erc20::new(self, address)
+    }
+
     /// Create access list used by a transaction.
     #[instrument(skip_all)]
     pub async fn create_access_list<T>(&self, tx: T) -> Result<eth::AccessList, Error>
     where
         T: Into<TransactionRequest>,
     {
-        self.create_access_list_with_state_overrides(tx, None, None).await
+        self.create_access_list_with_state_overrides(tx, None, None)
+            .await
     }
 
     pub async fn create_access_list_with_state_overrides<T>(
@@ -222,11 +290,16 @@ impl Ethereum {
         let tx = tx.into();
 
         let gas_limit = match self.chain() {
-            Chain::Mainnet => 2_000_000u64.into(),
-            _ => self.inner.tx_gas_limit.try_into().map_err(|err| {
+            Chain::Mainnet => 2_000_000,
+            _ => self.inner.tx_gas_limit.0.try_into().map_err(|err| {
                 Error::GasPrice(anyhow!("failed to convert gas_limit to u64: {err:?}"))
-            })?
+            })?,
         };
+        let gas_limit = tx
+            .gas
+            .unwrap_or(gas_limit)
+            .min(gas_limit)
+            .min(self.simulation_gas_limit()?);
         let tx = tx.with_gas_limit(gas_limit);
         let tx = match self.simulation_gas_price().await {
             Some(gas_price) => tx.with_gas_price(gas_price),
@@ -245,12 +318,16 @@ impl Ethereum {
                     .raw_request("eth_createAccessList".into(), params)
                     .await?
             }
-            None => self.web3.provider.create_access_list(&tx).latest().await?,
+            None => {
+                self.web3
+                    .provider
+                    .create_access_list(&tx)
+                    .block_id(state_override_block_param(state_overrides_block))
+                    .await?
+            }
         };
 
-        let access_list = access_list
-            .ensure_ok()
-            .map_err(Error::AccessList)?;
+        let access_list = access_list.ensure_ok().map_err(Error::AccessList)?;
 
         Ok(access_list.access_list.into())
     }
@@ -266,17 +343,7 @@ impl Ethereum {
         state_overrides: Option<&StateOverride>,
         state_overrides_block: Option<StateOverrideBlock>,
     ) -> Result<eth::Gas, Error> {
-        let tx = TransactionRequest::default()
-            .from(tx.from)
-            .to(tx.to)
-            .value(tx.value.0)
-            .input(tx.input.into())
-            .access_list(tx.access_list.into());
-
-        let tx = match self.simulation_gas_price().await {
-            Some(gas_price) => tx.with_gas_price(gas_price),
-            _ => tx,
-        };
+        let tx = self.simulation_transaction(tx).await?;
 
         let estimate = self
             .web3
@@ -284,11 +351,9 @@ impl Ethereum {
             .estimate_gas(tx)
             .overrides_opt(state_overrides.cloned());
 
-        let estimated_gas = match state_overrides_block {
-            Some(StateOverrideBlock::Number(number)) => estimate.number(number).await,
-            Some(StateOverrideBlock::Pending) => estimate.pending().await,
-            None => estimate.latest().await,
-        }
+        let estimated_gas = estimate
+            .block(state_override_block_param(state_overrides_block))
+            .await
             .map_err(Error::Rpc)?
             .into();
 
@@ -303,7 +368,7 @@ impl Ethereum {
     ) -> Result<eth::Gas, Error> {
         self.ensure_simulation_context_current(context).await?;
 
-        let tx = self.simulation_transaction(tx).await;
+        let tx = self.simulation_transaction(tx).await?;
         let gas = self
             .web3
             .provider
@@ -375,86 +440,40 @@ impl Ethereum {
         Ok(())
     }
 
-    async fn simulation_transaction(&self, tx: eth::Tx) -> TransactionRequest {
+    fn simulation_gas_limit(&self) -> Result<u64, Error> {
+        self.tx_gas_limit()
+            .0
+            .try_into()
+            .map_err(|err| Error::GasPrice(anyhow!("invalid transaction gas limit: {err}")))
+    }
+
+    async fn simulation_transaction(&self, tx: eth::Tx) -> Result<TransactionRequest, Error> {
         let tx = TransactionRequest::default()
+            .with_gas_limit(self.simulation_gas_limit()?)
             .from(tx.from)
             .to(tx.to)
             .value(tx.value.0)
             .input(tx.input.into())
             .access_list(tx.access_list.into());
 
-        match self.simulation_gas_price().await {
+        Ok(match self.simulation_gas_price().await {
             Some(gas_price) => tx.with_gas_price(gas_price),
             None => tx,
-        }
+        })
     }
 
     pub async fn trace(&self, tx: &eth::Tx) -> Result<eth::Gas, Error> {
-        let tx_req = TransactionRequest::default()
-            .from(tx.from)
-            .to(tx.to)
-            .value(tx.value.0)
-            .input(tx.input.clone().into())
-            .gas_limit(8_000_000)
-            .access_list(tx.access_list.clone().into());
-
-        let tx_req = match self.simulation_gas_price().await {
-            Some(gas_price) => tx_req.with_gas_price(gas_price),
-            _ => tx_req,
-        };
-
-        tracing::info!("simulating transaction. Gas {:?}", tx_req.gas);
-
-        let trace = self
-            .web3
-            .provider
-            .trace_call(&tx_req)
-            .latest()
-            .await?;
-
-        let root = trace.trace.into_iter().next().ok_or(Error::Trace)?;
-
-        if let Some(err) = &root.error {
-            tracing::error!("trace error: {:?}", err);
-            return Err(Error::Trace);
-        }
-
-        let execution_gas = match root.result {
-            Some(TraceOutput::Call(result)) => result.gas_used,
-            _ => return Err(Error::Trace),
-        };
-
-        Ok(execution_gas.into())
-    }
-
-    /// The gas price is determined based on the deadline by which the
-    /// transaction must be included on-chain. A shorter deadline requires a
-    /// higher gas price to increase the likelihood of timely inclusion.
-    pub async fn gas_price(&self) -> Result<Eip1559Estimation, Error> {
-        self.inner.gas.estimate().await
-    }
-
-    pub fn block_gas_limit(&self) -> eth::Gas {
-        self.inner.current_block.borrow().gas_limit.into()
-    }
-
-    /// Returns the current [`eth::Ether`] balance of the specified account.
-    pub async fn balance(&self, address: eth::Address) -> Result<eth::Ether, Error> {
-        self.web3
-            .provider
-            .get_balance(address)
+        let tx = self.simulation_transaction(tx.clone()).await?;
+        simulator::ethereum::trace_gas(&self.web3, tx)
             .await
-            .map(Into::into)
-            .map_err(Into::into)
-    }
-
-    /// Returns a [`token::Erc20`] for the specified address.
-    pub fn erc20(&self, address: eth::TokenAddress) -> token::Erc20 {
-        token::Erc20::new(self, address)
+            .map_err(|err| match err {
+                simulator::ethereum::Error::Rpc(err) => Error::Rpc(err),
+                _ => Error::Trace,
+            })
     }
 
     /// Returns the transaction's on-chain inclusion status.
-    pub async fn transaction_status(&self, tx_hash: &eth::TxId) -> Result<eth::TxStatus, Error> {
+    pub async fn transaction_status(&self, tx_hash: &eth::TxId) -> Result<TxStatus, Error> {
         self.web3
             .provider
             .get_transaction_receipt(tx_hash.0)
@@ -467,15 +486,15 @@ impl Ethereum {
                     },
                 ) = result
                 else {
-                    return eth::TxStatus::Pending;
+                    return TxStatus::Pending;
                 };
 
                 if receipt.status() {
-                    eth::TxStatus::Executed {
+                    TxStatus::Executed {
                         block_number: eth::BlockNo(block_number),
                     }
                 } else {
-                    eth::TxStatus::Reverted {
+                    TxStatus::Reverted {
                         block_number: eth::BlockNo(block_number),
                     }
                 }
@@ -483,16 +502,62 @@ impl Ethereum {
             .map_err(Into::into)
     }
 
+    /// The block our successful `Settlement` event for `tx_hash` landed in,
+    /// searching `[from_block, to_block]` inclusive, or `None` if it is not in
+    /// that range. Only a successful settle emits the event, and `eth_getLogs`
+    /// reads block logs even while the receipt-by-hash lookup still lags, so
+    /// this sees a freshly mined settlement that `eth_getTransactionReceipt`
+    /// would still miss. Scanning a range rather than a single block means a
+    /// block the (coalescing) block stream skipped on a fast chain is still
+    /// covered.
+    pub async fn successful_settlement_block(
+        &self,
+        tx_hash: eth::TxId,
+        from_block: u64,
+    ) -> Result<Option<eth::BlockNo>, Error> {
+        let logs = self
+            .contracts()
+            .settlement()
+            .event_filter::<::contracts::GPv2Settlement::GPv2Settlement::Settlement>()
+            .from_block(alloy::eips::BlockNumberOrTag::Number(from_block))
+            // `Latest` rather than the stream's head: the node may already be a block
+            // or two ahead, and querying up to its real tip narrows the race window.
+            .to_block(alloy::eips::BlockNumberOrTag::Latest)
+            .query()
+            .await?;
+        Ok(logs
+            .into_iter()
+            .find(|(_, log)| log.transaction_hash == Some(tx_hash.0))
+            .and_then(|(_, log)| log.block_number)
+            .map(eth::BlockNo))
+    }
+
+    /// The signer's transaction count including the mempool (the `pending`
+    /// tag). A count above the nonce we submitted with means our tx is
+    /// still queued in the mempool or has already mined (the count stays at
+    /// `nonce + 1` once it mines). A count equal to that nonce means the tx
+    /// left the mempool without mining.
+    pub async fn pending_transaction_count(&self, address: eth::Address) -> Result<u64, Error> {
+        self.web3
+            .provider
+            .get_transaction_count(address)
+            .pending()
+            .await
+            .map_err(Into::into)
+    }
+
     #[instrument(skip(self), ret(level = Level::DEBUG))]
     pub(super) async fn simulation_gas_price(&self) -> Option<u128> {
         let base_fee = self.current_block().borrow().base_fee;
-        // Some nodes don't pick a reasonable default value when you don't specify a gas
-        // price and default to 0. Additionally some sneaky tokens have special code
-        // paths that detect that case to try to behave differently during simulations
-        // than they normally would. To not rely on the node picking a reasonable
-        // default value we estimate the current gas price upfront. But because it's
-        // extremely rare that tokens behave that way we are fine with falling back to
-        // the node specific fallback value instead of failing the whole call.
+        // Some nodes don't pick a reasonable default value when you don't
+        // specify a gas price and default to 0. Additionally some
+        // sneaky tokens have special code paths that detect that case
+        // to try to behave differently during simulations
+        // than they normally would. To not rely on the node picking a
+        // reasonable default value we estimate the current gas price
+        // upfront. But because it's extremely rare that tokens behave
+        // that way we are fine with falling back to the node specific
+        // fallback value instead of failing the whole call.
         Some(self.inner.gas.estimate().await.ok()?.effective(base_fee))
     }
 
@@ -510,30 +575,6 @@ impl fmt::Debug for Ethereum {
             .field("gas", &"Arc<NativeGasEstimator>")
             .finish()
     }
-}
-
-#[allow(unused)]
-fn intrinsic_gas(tx: &eth::Tx) -> u64 {
-    const BASE_TX_GAS: u64 = 21_000;
-    const ACCESS_LIST_ADDRESS_GAS: u64 = 2_400;
-    const ACCESS_LIST_STORAGE_KEY_GAS: u64 = 1_900;
-
-    let calldata_gas: u64 = tx
-        .input
-        .iter()
-        .map(|&b| if b == 0 { 4 } else { 16 })
-        .sum();
-
-    let access_list: alloy::eips::eip2930::AccessList = tx.access_list.clone().into();
-    let access_list_gas: u64 = access_list
-        .iter()
-        .map(|item| {
-            ACCESS_LIST_ADDRESS_GAS
-                + item.storage_keys.len() as u64 * ACCESS_LIST_STORAGE_KEY_GAS
-        })
-        .sum();
-
-    BASE_TX_GAS + calldata_gas + access_list_gas
 }
 
 #[derive(Debug, Error)]
@@ -581,6 +622,21 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn into_simulator_error(self, tx: eth::Tx, block: eth::BlockNo) -> simulator::Error {
+        let reverted = self.is_revert();
+        let err = simulator::SimulatorError::Ethereum(match self {
+            Self::Rpc(err) => simulator::ethereum::Error::Rpc(err),
+            Self::ContractRpc(err) => simulator::ethereum::Error::ContractRpc(err),
+            Self::AccessList(err) => simulator::ethereum::Error::AccessList(err),
+            other => simulator::ethereum::Error::Other(anyhow!(other)),
+        });
+        if reverted {
+            simulator::Error::Revert(Box::new(simulator::RevertError { err, tx, block }))
+        } else {
+            simulator::Error::Other(err)
+        }
+    }
+
     /// Returns whether the error indicates that the original transaction
     /// reverted.
     pub fn is_revert(&self) -> bool {
@@ -609,5 +665,136 @@ impl From<SimulationError> for Error {
         match err {
             SimulationError::Method(err) => Self::ContractRpc(err),
         }
+    }
+}
+
+impl From<Ethereum> for simulator::Ethereum {
+    fn from(eth: Ethereum) -> Self {
+        Self::new(
+            eth.web3().clone(),
+            eth.chain(),
+            configs::simulator::Addresses {
+                settlement: Some(*eth.contracts().settlement().address()),
+                weth: Some(*eth.contracts().weth().address()),
+            },
+            eth.gas_estimator(),
+            eth.current_block().clone(),
+            eth.tx_gas_limit().0,
+        )
+    }
+}
+
+#[cfg(test)]
+mod rpc_tests {
+    use {
+        super::*,
+        axum::{Json, Router, extract::State, routing::post},
+        ethrpc::block_stream::{BlockInfo, mock_single_block},
+        gas_price_estimation::FakeGasPriceEstimator,
+        serde_json::{Value, json},
+        std::sync::Mutex,
+    };
+
+    async fn handle_rpc(
+        State(requests): State<Arc<Mutex<Vec<Value>>>>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        let tx = &request["params"][0];
+        let result = match request["method"].as_str().unwrap() {
+            "eth_createAccessList" => json!({"accessList": [], "gasUsed": "0x5208"}),
+            "eth_estimateGas" => json!("0x1234"),
+            "trace_call" => json!({"output": "0x", "trace": [{
+                "type": "call",
+                "action": {"callType": "call", "from": tx["from"], "to": tx["to"], "gas": tx["gas"], "input": "0x", "value": "0x0"},
+                "result": {"output": "0x", "gasUsed": "0x4567"},
+                "subtraces": 0, "traceAddress": []
+            }]}),
+            name => panic!("unexpected RPC: {name}"),
+        };
+        let reply = json!({"id": request["id"], "jsonrpc": "2.0", "result": result});
+        requests.lock().unwrap().push(request);
+        Json(reply)
+    }
+
+    #[test]
+    fn exact_context_revert_classification() {
+        let tx = eth::Tx {
+            from: eth::Address::repeat_byte(1),
+            to: eth::Address::repeat_byte(2),
+            value: 0.into(),
+            input: Default::default(),
+            access_list: Default::default(),
+        };
+        let stale = Error::StaleSimulationContext {
+            expected_number: 1,
+            expected_hash: Default::default(),
+            actual_number: 2,
+            actual_hash: Default::default(),
+        };
+        assert!(matches!(
+            stale.into_simulator_error(tx.clone(), 1.into()),
+            simulator::Error::Other(_)
+        ));
+        let rejected = Error::Rpc(alloy::transports::RpcError::ErrorResp(
+            alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: "execution reverted".into(),
+                data: None,
+            },
+        ));
+        assert!(matches!(
+            rejected.into_simulator_error(tx, 1.into()),
+            simulator::Error::Revert(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn simulation_requests_use_one_bounded_latest_call_each() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/", post(handle_rpc))
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let eth = simulator::Ethereum::new(
+            boundary::unbuffered_web3(&url),
+            Chain::Mainnet,
+            Default::default(),
+            Arc::new(FakeGasPriceEstimator::default()),
+            mock_single_block(BlockInfo::default()),
+            eth::U256::from(10_000_000u64),
+        );
+        let tx = eth::Tx {
+            from: eth::Address::repeat_byte(1),
+            to: eth::Address::repeat_byte(2),
+            value: 0.into(),
+            input: Default::default(),
+            access_list: Default::default(),
+        };
+        let simulator = simulator::Simulator::ethereum(eth.clone());
+        simulator
+            .access_list_for_eth_transfer(tx.from, tx.to)
+            .await
+            .unwrap();
+        assert_eq!(simulator.gas(tx.clone()).await.unwrap(), 0x1234u64.into());
+        let tracing = simulator::Simulator::ethereum_trace(eth);
+        assert_eq!(tracing.gas(tx).await.unwrap(), 0x4567u64.into());
+
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0]["method"], "eth_createAccessList");
+        assert_eq!(calls[0]["params"][1], "latest");
+        assert_eq!(calls[0]["params"][0]["gas"], format!("{:#x}", 2_000_000));
+        assert_eq!(calls[1]["method"], "eth_estimateGas");
+        assert_eq!(calls[1]["params"][1], "latest");
+        assert_eq!(calls[1]["params"][0]["gas"], format!("{:#x}", 10_000_000));
+        assert_eq!(calls[2]["method"], "trace_call");
+        assert_eq!(calls[2]["params"][1], json!(["trace"]));
+        assert_eq!(calls[2]["params"][2], "latest");
+        assert_eq!(calls[2]["params"][0]["gas"], format!("{:#x}", 8_000_000));
+        server.abort();
     }
 }

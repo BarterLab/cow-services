@@ -15,26 +15,30 @@ use {
         providers::ext::AnvilApi,
     },
     app_data::{AppDataDocument, AppDataHash},
-    autopilot::{config::Configuration, infra::persistence::dto},
-    clap::Parser,
+    autopilot::infra::persistence::dto,
+    configs::{
+        autopilot::{
+            Configuration,
+            ethflow::EthflowConfig,
+            native_price::NativePriceConfig,
+            run_loop::RunLoopConfig,
+        },
+        native_price_estimators::{NativePriceEstimator, NativePriceEstimators},
+        order_quoting::{ExternalSolver, OrderQuoting},
+        shared::{GasEstimatorType, SharedConfig},
+        test_util::TestDefault,
+    },
+    ethrpc::Web3,
     model::{
         AuctionId,
         order::{CancellationPayload, Order, OrderCreation, OrderUid},
         quote::{NativeTokenPrice, OrderQuoteRequest, OrderQuoteResponse},
-        solver_competition,
         solver_competition_v2,
         trade::Trade,
     },
     reqwest::{Client, StatusCode, Url},
-    shared::web3::Web3,
-    sqlx::Connection,
-    std::{
-        collections::{HashMap, hash_map::Entry},
-        ops::DerefMut,
-        str::FromStr,
-        sync::LazyLock,
-        time::Duration,
-    },
+    sqlx::{Connection, Executor, Row},
+    std::{ops::DerefMut, str::FromStr, time::Duration},
     tokio::task::JoinHandle,
 };
 
@@ -43,16 +47,11 @@ pub const ORDERS_ENDPOINT: &str = "/api/v1/orders";
 pub const QUOTING_ENDPOINT: &str = "/api/v1/quote";
 pub const ACCOUNT_ENDPOINT: &str = "/api/v1/account";
 pub const AUCTION_ENDPOINT: &str = "/api/v1/auction";
-pub const TRADES_ENDPOINT: &str = "/api/v1/trades";
+pub const TRADES_ENDPOINT: &str = "/api/v2/trades";
 pub const VERSION_ENDPOINT: &str = "/api/v1/version";
+pub const READY_ENDPOINT: &str = "/api/v1/ready";
 pub const SOLVER_COMPETITION_ENDPOINT: &str = "/api/v2/solver_competition";
 const LOCAL_DB_URL: &str = "postgresql://";
-static LOCAL_READ_ONLY_DB_URL: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "postgresql://readonly@localhost/{db}",
-        db = std::env::var("USER").unwrap()
-    )
-});
 
 fn order_status_endpoint(uid: &OrderUid) -> String {
     format!("/api/v1/orders/{uid}/status")
@@ -65,6 +64,10 @@ fn orders_for_tx_endpoint(tx_hash: &B256) -> String {
 fn orders_for_owner(owner: &Address, offset: u64, limit: u64) -> String {
     format!("{ACCOUNT_ENDPOINT}/{owner:?}/orders?offset={offset}&limit={limit}")
 }
+
+/// Default per-auction solve deadline used by [`Services`] when a test does
+/// not override [`Services::min_solve_deadline`].
+pub const DEFAULT_MIN_SOLVE_TIME: Duration = Duration::from_millis(200);
 
 pub struct ServicesBuilder {
     timeout: Duration,
@@ -94,6 +97,7 @@ impl ServicesBuilder {
             http: Client::builder().timeout(self.timeout).build().unwrap(),
             db: sqlx::PgPool::connect(LOCAL_DB_URL).await.unwrap(),
             web3: onchain_components.web3(),
+            min_solve_deadline: DEFAULT_MIN_SOLVE_TIME,
         }
     }
 }
@@ -111,6 +115,12 @@ pub struct Services<'a> {
     http: Client,
     db: Db,
     web3: &'a Web3,
+    /// Per-auction `/solve` deadline enforced by the autopilot. Defaults to
+    /// [`DEFAULT_MIN_SOLVE_TIME`] (200 ms) but latency-sensitive tests (notably
+    /// forked tests whose RPC round trips dominate on CI, or anything crossing
+    /// an extra mocked HTTP service) can bump this before starting the
+    /// protocol.
+    pub min_solve_deadline: Duration,
 }
 
 impl<'a> Services<'a> {
@@ -123,6 +133,7 @@ impl<'a> Services<'a> {
                 .unwrap(),
             db: sqlx::PgPool::connect(LOCAL_DB_URL).await.unwrap(),
             web3: onchain_components.web3(),
+            min_solve_deadline: DEFAULT_MIN_SOLVE_TIME,
         }
     }
 
@@ -130,118 +141,76 @@ impl<'a> Services<'a> {
         ServicesBuilder::new()
     }
 
-    fn api_autopilot_arguments(&self) -> impl Iterator<Item = String> + use<> {
-        [
-            "--native-price-estimators=Forwarder|http://localhost:12088".to_string(),
-            "--amount-to-estimate-prices-with=1000000000000000000".to_string(),
-            "--block-stream-poll-interval=1s".to_string(),
-            format!("--node-ws-url={NODE_WS_HOST}"),
-            "--simulation-node-url=http://localhost:8545".to_string(),
-            "--native-price-cache-max-age=2s".to_string(),
-            format!(
-                "--hooks-contract-address={:?}",
-                self.contracts.hooks.address()
-            ),
-        ]
-        .into_iter()
-    }
-
-    fn autopilot_arguments(&self) -> impl Iterator<Item = String> + use<> {
-        self.api_autopilot_arguments().chain([
-            "--quote-timeout=10s".to_string(),
-            "--native-price-prefetch-time=500ms".to_string(),
-            "--native-price-estimators=Driver|test_quoter|http://localhost:11088/test_solver"
-                .to_string(),
-        ])
-    }
-
-    fn api_autopilot_solver_arguments(&self) -> impl Iterator<Item = String> + use<> {
-        [
-            "--network-block-interval=1s".to_string(),
-            format!(
-                "--settlement-contract-address={:?}",
-                self.contracts.gp_settlement.address()
-            ),
-            format!(
-                "--balances-contract-address={:?}",
-                self.contracts.balances.address()
-            ),
-            format!(
-                "--signatures-contract-address={:?}",
-                self.contracts.signatures.address()
-            ),
-            format!("--native-token-address={:?}", self.contracts.weth.address()),
-            format!(
-                "--balancer-v2-vault-address={:?}",
-                self.contracts.balancer_vault.address()
-            ),
-        ]
-        .into_iter()
+    fn shared_config(&self) -> configs::shared::SharedConfig {
+        configs::shared::SharedConfig {
+            current_block: configs::shared::CurrentBlockConfig {
+                poll_interval: Some(Duration::from_secs(1)),
+                ws_url: Some(NODE_WS_HOST.parse().unwrap()),
+            },
+            simulation_node_url: Some("http://localhost:8545".parse().unwrap()),
+            contracts: configs::shared::ContractAddresses {
+                settlement: Some(*self.contracts.gp_settlement.address()),
+                balances: Some(*self.contracts.balances.address()),
+                signatures: Some(*self.contracts.signatures.address()),
+                native_token: Some(*self.contracts.weth.address()),
+                hooks: Some(*self.contracts.hooks.address()),
+                balancer_v2_vault: Some(*self.contracts.balancer_vault.address()),
+                flashloan_router: self
+                    .contracts
+                    .flashloan_router
+                    .as_ref()
+                    .map(|c| *c.address()),
+            },
+            ..Default::default()
+        }
     }
 
     /// Start the autopilot service in a background task.
-    /// Optionally specify a solve deadline to use instead of the default 2s.
-    /// (note: specifying a larger solve deadline will impact test times as the
-    /// driver delays the submission of the solution until shortly before the
-    /// deadline in case the solution would start to revert at some point).
+    /// Uses [`Self::min_solve_deadline`] as the per-auction solve deadline.
     /// Allows to externally control the shutdown of autopilot.
     pub async fn start_autopilot_with_shutdown_controller(
         &self,
-        solve_deadline: Option<Duration>,
-        extra_args: Vec<String>,
+        config: configs::autopilot::Configuration,
         control: autopilot::shutdown_controller::ShutdownController,
     ) -> JoinHandle<()> {
-        let solve_deadline = solve_deadline.unwrap_or(Duration::from_secs(2));
         let ethflow_contracts = self
             .contracts
             .ethflows
             .iter()
-            .map(|c| format!("{:?}", c.address()))
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(|c| *c.address())
+            .collect::<Vec<_>>();
 
-        let args = [
-            "autopilot".to_string(),
-            "--max-run-loop-delay=100ms".to_string(),
-            "--run-loop-native-price-timeout=500ms".to_string(),
-            format!("--ethflow-contracts={ethflow_contracts}"),
-            "--skip-event-sync=true".to_string(),
-            "--api-address=0.0.0.0:12088".to_string(),
-            format!("--solve-deadline={solve_deadline:?}"),
-        ]
-        .into_iter()
-        .chain(self.api_autopilot_solver_arguments())
-        .chain(self.autopilot_arguments())
-        .chain(extra_args)
-        .collect();
-        let args = ignore_overwritten_cli_params(args);
+        let config = configs::autopilot::Configuration {
+            shared: configs::shared::SharedConfig {
+                volume_fee_bucket_overrides: config.shared.volume_fee_bucket_overrides.clone(),
+                enable_sell_equals_buy_volume_fee: config.shared.enable_sell_equals_buy_volume_fee,
+                ..self.shared_config()
+            },
+            ethflow: EthflowConfig {
+                contracts: ethflow_contracts,
+                ..config.ethflow
+            },
+            run_loop: RunLoopConfig {
+                min_solve_time: self.min_solve_deadline,
+                ..config.run_loop
+            },
+            ..config
+        };
 
-        let args = autopilot::arguments::CliArguments::try_parse_from(args)
-            .map_err(|err| err.to_string())
-            .unwrap();
-        let config = autopilot::config::Configuration::from_path(&args.config)
-            .await
-            .unwrap();
-        tracing::info!("Loaded config: {:?}", config);
-        let join_handle = tokio::task::spawn(autopilot::run(args, config, control));
+        let join_handle = tokio::task::spawn(autopilot::run(config, control));
         self.wait_until_autopilot_ready().await;
 
         join_handle
     }
 
     /// Start the autopilot service in a background task.
-    /// Optionally specify a solve deadline to use instead of the default 2s.
-    /// (note: specifying a larger solve deadline will impact test times as the
-    /// driver delays the submission of the solution until shortly before the
-    /// deadline in case the solution would start to revert at some point)
+    /// Uses [`Self::min_solve_deadline`] as the per-auction solve deadline.
     pub async fn start_autopilot(
         &self,
-        solve_deadline: Option<Duration>,
-        extra_args: Vec<String>,
+        config: configs::autopilot::Configuration,
     ) -> JoinHandle<()> {
         self.start_autopilot_with_shutdown_controller(
-            solve_deadline,
-            extra_args,
+            config,
             autopilot::shutdown_controller::ShutdownController::default(),
         )
         .await
@@ -249,107 +218,110 @@ impl<'a> Services<'a> {
 
     /// Start the api service in a background tasks.
     /// Wait until the service is responsive.
-    pub async fn start_api(&self, extra_args: Vec<String>) {
-        let args: Vec<_> = [
-            "orderbook".to_string(),
-            "--quote-timeout=10s".to_string(),
-            "--quote-verification=enforce-when-possible".to_string(),
-            "--db-read-url".to_string(),
-            LOCAL_READ_ONLY_DB_URL.clone(),
-        ]
-        .into_iter()
-        .chain(self.api_autopilot_solver_arguments())
-        .chain(self.api_autopilot_arguments())
-        .chain(extra_args)
-        .collect();
-        let args = ignore_overwritten_cli_params(args);
+    pub async fn start_api(&self, config: configs::orderbook::Configuration) {
+        let config = configs::orderbook::Configuration {
+            shared: configs::shared::SharedConfig {
+                volume_fee_bucket_overrides: config.shared.volume_fee_bucket_overrides.clone(),
+                enable_sell_equals_buy_volume_fee: config.shared.enable_sell_equals_buy_volume_fee,
+                ..self.shared_config()
+            },
+            ..config
+        };
 
-        let args = orderbook::arguments::Arguments::try_parse_from(args).unwrap();
-        tokio::task::spawn(orderbook::run(args));
+        tokio::task::spawn(orderbook::run(config));
 
         Self::wait_for_api_to_come_up().await;
     }
 
     /// Starts a basic version of the protocol with a single baseline solver.
     pub async fn start_protocol(&self, solver: TestAccount) {
-        // HACK: config is required so in the cases where it isn't passed (like the API
-        // version test), so we create a dummy one
-        let (_config_file, cli_arg) =
-            Configuration::test("test_solver", solver.address()).to_cli_args();
         self.start_protocol_with_args(
-            ExtraServiceArgs {
-                api: Default::default(),
-                autopilot: vec![cli_arg],
-            },
+            configs::autopilot::Configuration::test("test_solver", solver.address()),
+            configs::orderbook::Configuration::test_default(),
             solver,
         )
         .await;
     }
 
-    pub async fn start_protocol_with_args(&self, args: ExtraServiceArgs, solver: TestAccount) {
-        self.start_protocol_with_args_and_haircut(args, solver, 0)
+    pub async fn start_protocol_with_args(
+        &self,
+        autopilot_config: configs::autopilot::Configuration,
+        orderbook_config: configs::orderbook::Configuration,
+        solver: TestAccount,
+    ) {
+        self.start_protocol_with_args_and_solver_fee(autopilot_config, orderbook_config, solver, 0)
             .await;
     }
 
-    pub async fn start_protocol_with_args_and_haircut(
+    pub async fn start_protocol_with_args_and_solver_fee(
         &self,
-        args: ExtraServiceArgs,
+        autopilot_config: configs::autopilot::Configuration,
+        orderbook_config: configs::orderbook::Configuration,
         solver: TestAccount,
-        haircut_bps: u32,
+        solver_fee_bps: u32,
     ) {
         colocation::start_driver(
             self.contracts,
             vec![
-                colocation::start_baseline_solver_with_haircut(
+                colocation::start_baseline_solver_with_solver_fee(
                     "test_solver".into(),
                     solver.clone(),
                     *self.contracts.weth.address(),
                     vec![],
                     1,
                     true,
-                    haircut_bps,
+                    solver_fee_bps,
                 )
                 .await,
             ],
             colocation::LiquidityProvider::UniswapV2,
-            false,
         );
 
-        self.start_autopilot(
-            None,
-            [
-                vec![
-                    "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                        .to_string(),
-                    "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-                ],
-                args.autopilot,
-            ]
-            .concat(),
-        )
-        .await;
-        self.start_api(
-            [
-                vec![
-                    "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                        .to_string(),
-                    "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-                ],
-                args.api,
-            ]
-            .concat(),
-        )
-        .await;
+        let test_quoter = ExternalSolver::new("test_quoter", "http://localhost:11088/test_solver");
+
+        let autopilot_config = Configuration {
+            order_quoting: OrderQuoting {
+                price_estimation_drivers: vec![test_quoter.clone()],
+                ..autopilot_config.order_quoting
+            },
+            shared: SharedConfig {
+                gas_estimators: vec![GasEstimatorType::Driver {
+                    url: Url::from_str("http://localhost:11088/gasprice").unwrap(),
+                }],
+                ..autopilot_config.shared
+            },
+            ..autopilot_config
+        };
+        let orderbook_config = configs::orderbook::Configuration {
+            order_quoting: OrderQuoting {
+                price_estimation_drivers: vec![test_quoter],
+                ..orderbook_config.order_quoting
+            },
+            shared: SharedConfig {
+                gas_estimators: vec![GasEstimatorType::Driver {
+                    url: Url::from_str("http://localhost:11088/gasprice").unwrap(),
+                }],
+                ..orderbook_config.shared
+            },
+            ..orderbook_config
+        };
+
+        tokio::join!(
+            self.start_autopilot(autopilot_config),
+            self.start_api(orderbook_config),
+        );
     }
 
     /// Starts a basic version of the protocol with a single external solver.
     /// Optionally starts a baseline solver and uses it for price estimation.
     pub async fn start_protocol_external_solver(
-        &self,
+        &mut self,
         solver: TestAccount,
         solver_endpoint: Option<Url>,
         run_baseline: bool,
     ) {
+        // configure mainnet's actual solve deadline
+        self.min_solve_deadline = Duration::from_secs(7);
         let external_solver_endpoint =
             solver_endpoint.unwrap_or("http://localhost:8000/".parse().unwrap());
 
@@ -359,14 +331,53 @@ impl<'a> Services<'a> {
             endpoint: external_solver_endpoint,
             base_tokens: vec![],
             merge_solutions: true,
-            haircut_bps: 0,
+            solver_fee_bps: 0,
+            submission_keys: vec![],
         }];
 
-        // Create TOML config file for the driver
-        let (_config_file, config_arg) =
-            Configuration::test("test_solver", solver.address()).to_cli_args();
+        let shared_native_price_config = configs::native_price::NativePriceConfig {
+            cache: configs::native_price::CacheConfig {
+                max_age: Duration::from_secs(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
-        let (autopilot_args, api_args) = if run_baseline {
+        // Create TOML config files
+        let autopilot_config = Configuration {
+            native_price_estimation: {
+                if run_baseline {
+                    NativePriceConfig {
+                        estimators: NativePriceEstimators::new(vec![vec![
+                            NativePriceEstimator::driver(
+                                "test_quoter".to_string(),
+                                Url::from_str("http://localhost:11088/baseline_solver").unwrap(),
+                            ),
+                            NativePriceEstimator::driver(
+                                "test_solver".to_string(),
+                                Url::from_str("http://localhost:11088/test_solver").unwrap(),
+                            ),
+                        ]]),
+                        shared: shared_native_price_config.clone(),
+                        ..NativePriceConfig::test_default()
+                    }
+                } else {
+                    NativePriceConfig {
+                        estimators: NativePriceEstimators::new(vec![vec![
+                            NativePriceEstimator::driver(
+                                "test_quoter".to_string(),
+                                Url::from_str("http://localhost:11088/test_solver").unwrap(),
+                            ),
+                        ]]),
+                        shared: shared_native_price_config,
+                        ..NativePriceConfig::test_default()
+                    }
+                }
+            },
+            ..Configuration::test("test_solver", solver.address())
+        };
+
+        let drivers = if run_baseline {
             solvers.push(
                 colocation::start_baseline_solver(
                     "baseline_solver".into(),
@@ -379,48 +390,44 @@ impl<'a> Services<'a> {
                 .await,
             );
 
-            // Here we call the baseline_solver "test_quoter" to make the native price
-            // estimation use the baseline_solver instead of the test_quoter
-            let autopilot_args = vec![
-                config_arg.clone(),
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/baseline_solver,test_solver|http://localhost:11088/test_solver".to_string(),
-                "--native-price-estimators=Driver|test_quoter|http://localhost:11088/baseline_solver,Driver|test_solver|http://localhost:11088/test_solver".to_string(),
-            ];
-            let api_args = vec![
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/baseline_solver,test_solver|http://localhost:11088/test_solver".to_string(),
-            ];
-            (autopilot_args, api_args)
+            // Here we call the baseline_solver "test_quoter" to make the native
+            // price estimation use the baseline_solver instead of
+            // the test_quoter
+            vec![
+                ExternalSolver::new("test_quoter", "http://localhost:11088/baseline_solver"),
+                ExternalSolver::new("test_solver", "http://localhost:11088/test_solver"),
+            ]
         } else {
-            let autopilot_args = vec![
-                config_arg,
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-                "--native-price-estimators=Driver|test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-            ];
+            vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]
+        };
 
-            let api_args = vec![
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-            ];
-            (autopilot_args, api_args)
+        let autopilot_config = Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(drivers.clone()),
+            ..autopilot_config
+        };
+        let orderbook_config = configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(drivers),
+            ..configs::orderbook::Configuration::test_default()
         };
 
         colocation::start_driver(
             self.contracts,
             solvers,
             colocation::LiquidityProvider::UniswapV2,
-            false,
         );
 
-        self.start_autopilot(Some(Duration::from_secs(11)), autopilot_args)
-            .await;
-        self.start_api(api_args).await;
+        tokio::join!(
+            self.start_autopilot(autopilot_config),
+            self.start_api(orderbook_config),
+        );
     }
 
     async fn wait_for_api_to_come_up() {
         let is_up = || async {
-            reqwest::get(format!("{API_HOST}{VERSION_ENDPOINT}"))
+            reqwest::get(format!("{API_HOST}{READY_ENDPOINT}"))
                 .await
                 .is_ok()
         };
@@ -506,8 +513,30 @@ impl<'a> Services<'a> {
         }
     }
 
+    pub async fn get_solver_competition_unfiltered(
+        &self,
+        auction_id: AuctionId,
+    ) -> Result<solver_competition_v2::Response, StatusCode> {
+        let response = self
+            .http
+            .get(format!(
+                "{API_HOST}/restricted/api/v2/solver_competition/{auction_id}"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let body = response.text().await.unwrap();
+
+        match status {
+            StatusCode::OK => Ok(serde_json::from_str(&body).unwrap()),
+            code => Err(code),
+        }
+    }
+
     pub async fn get_trades(&self, order: &OrderUid) -> Result<Vec<Trade>, StatusCode> {
-        let url = format!("{API_HOST}/api/v1/trades?orderUid={order}");
+        let url = format!("{API_HOST}/api/v2/trades?orderUid={order}");
         let response = self.http.get(url).send().await.unwrap();
 
         let status = response.status();
@@ -834,70 +863,6 @@ impl<'a> Services<'a> {
         }
     }
 
-    /// Get solver competition by auction ID (v1 - deprecated)
-    pub async fn get_solver_competition_v1(
-        &self,
-        auction_id: AuctionId,
-    ) -> Result<solver_competition::SolverCompetitionAPI, (StatusCode, String)> {
-        let response = self
-            .http
-            .get(format!("{API_HOST}/api/v1/solver_competition/{auction_id}"))
-            .send()
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body = response.text().await.unwrap();
-
-        match status {
-            StatusCode::OK => Ok(serde_json::from_str(&body).unwrap()),
-            code => Err((code, body)),
-        }
-    }
-
-    /// Get solver competition by transaction hash (v1 - deprecated)
-    pub async fn get_solver_competition_by_tx_v1(
-        &self,
-        hash: B256,
-    ) -> Result<solver_competition::SolverCompetitionAPI, (StatusCode, String)> {
-        let response = self
-            .http
-            .get(format!(
-                "{API_HOST}/api/v1/solver_competition/by_tx_hash/{hash:?}"
-            ))
-            .send()
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body = response.text().await.unwrap();
-
-        match status {
-            StatusCode::OK => Ok(serde_json::from_str(&body).unwrap()),
-            code => Err((code, body)),
-        }
-    }
-
-    /// Get latest solver competition (v1 - deprecated)
-    pub async fn get_latest_solver_competition_v1(
-        &self,
-    ) -> Result<solver_competition::SolverCompetitionAPI, (StatusCode, String)> {
-        let response = self
-            .http
-            .get(format!("{API_HOST}/api/v1/solver_competition/latest"))
-            .send()
-            .await
-            .unwrap();
-
-        let status = response.status();
-        let body = response.text().await.unwrap();
-
-        match status {
-            StatusCode::OK => Ok(serde_json::from_str(&body).unwrap()),
-            code => Err((code, body)),
-        }
-    }
-
     /// Get total surplus for a user (unstable endpoint)
     pub async fn get_user_total_surplus(
         &self,
@@ -940,40 +905,11 @@ impl<'a> Services<'a> {
     }
 }
 
-pub async fn clear_database() {
-    tracing::info!("Clearing database.");
-
-    async fn truncate_tables() -> Result<(), sqlx::Error> {
-        let mut db = sqlx::PgConnection::connect(LOCAL_DB_URL).await?;
-        let mut db = db.begin().await?;
-        database::clear_DANGER_(&mut db).await?;
-        db.commit().await
-    }
-
-    // This operation can fail when postgres detects a deadlock.
-    // It will terminate one of the deadlocking requests and if it decideds
-    // to terminate this request we need to retry it.
-    let mut attempt = 0;
-    loop {
-        match truncate_tables().await {
-            Ok(_) => return,
-            Err(err) => {
-                tracing::error!(?err, "failed to truncate tables");
-            }
-        }
-        attempt += 1;
-        if attempt >= 10 {
-            panic!("repeatedly failed to clear DB");
-        }
-    }
-}
-
-pub async fn ensure_e2e_readonly_user() {
-    use sqlx::{Executor, Row};
-
-    const PSQL_DUPLICATE_OBJECT_ERROR_CODE: &str = "42710";
-
-    tracing::info!("Ensuring read-only user exists");
+/// Opens a single transaction that first ensures the e2e read-only role
+/// exists and then clears the database. Runs the tx under an exclusive
+/// lock to avoid concurrent calls to this function causing deadlocks.
+pub async fn prepare_database_for_test() {
+    tracing::info!("Preparing database for test.");
     let mut db = sqlx::PgConnection::connect(LOCAL_DB_URL)
         .await
         .expect("Database connection error");
@@ -981,16 +917,43 @@ pub async fn ensure_e2e_readonly_user() {
         .begin()
         .await
         .expect("Database transaction creation error");
+
+    // Serialize concurrent setup attempts across processes to avoid deadlocks.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('e2e_test_setup')::bigint)")
+        .execute(db.deref_mut())
+        .await
+        .expect("failed to acquire advisory lock for readonly user setup");
+
+    ensure_readonly_role(&mut db).await;
+
+    database::clear_DANGER_(&mut db)
+        .await
+        .expect("failed to clear database");
+
+    db.commit().await.expect("Transaction commit error");
+}
+
+/// Ensures the `readonly` role exists in the database, creating it with the
+/// expected privileges if missing.
+async fn ensure_readonly_role(db: &mut sqlx::Transaction<'_, sqlx::Postgres>) {
+    let readonly_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'readonly')")
+            .fetch_one(&mut **db)
+            .await
+            .expect("failed to check for readonly role");
+    if readonly_exists {
+        tracing::info!("Read-only user exists");
+        return;
+    }
+
     let current_db: String = db
         .fetch_one("SELECT current_database();")
         .await
         .expect("Current database name fetching error")
         .get(0);
-
-    let res = db
-        .execute(
-            format!(
-                r#"
+    db.execute(
+        format!(
+            r#"
     CREATE ROLE readonly WITH LOGIN PASSWORD 'password';
     GRANT CONNECT ON DATABASE "{current_db}" TO readonly;
     GRANT USAGE ON SCHEMA public TO readonly;
@@ -999,58 +962,12 @@ pub async fn ensure_e2e_readonly_user() {
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly;
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO readonly;
     "#
-            )
-            .as_str(),
         )
-        .await;
-
-    match res {
-        Err(sqlx::Error::Database(e))
-            if e.code()
-                .is_some_and(|c| c == PSQL_DUPLICATE_OBJECT_ERROR_CODE) =>
-        {
-            // this is considered expected, if multiple tests are run against the same
-            // database
-            tracing::info!("Read-only user already exists! {:?}", e);
-        }
-        Err(e) => {
-            tracing::error!("Read-only user creation failed {:?}", e);
-            panic!("Read-only user creation failed {:?}", e);
-        }
-        Ok(_) => {
-            tracing::info!("Read only user created");
-            db.commit().await.expect("Transaction commit error");
-        }
-    }
+        .as_str(),
+    )
+    .await
+    .expect("Read-only user creation failed");
+    tracing::info!("Read-only user created");
 }
 
 pub type Db = sqlx::Pool<sqlx::Postgres>;
-
-/// Clap does not allow you to overwrite CLI arguments easily. This
-/// function loops over all provided arguments and only keeps the
-/// last one if there are multiples.
-fn ignore_overwritten_cli_params(mut params: Vec<String>) -> Vec<String> {
-    let mut defined_args = HashMap::new();
-    params.reverse(); // reverse to give later params higher priority
-    params.retain(move |param| {
-        let Some((arg, value)) = param.split_once('=') else {
-            return true; // keep anything we can't parse (e.g. program name)
-        };
-        match defined_args.entry(arg.to_string()) {
-            Entry::Occupied(val) => {
-                tracing::info!(
-                    ignored = ?param,
-                    kept = format!("{arg}={}", val.get()),
-                    "ignoring overwritten CLI argument"
-                );
-                false
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(value.to_string());
-                true
-            }
-        }
-    });
-    params.reverse(); // reverse to restore original order again
-    params
-}

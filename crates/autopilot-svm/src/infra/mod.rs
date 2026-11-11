@@ -1,0 +1,17 @@
+//! Infrastructure: database access, driver clients, and the loop seams.
+
+pub mod api;
+pub mod cleanup;
+pub mod competition;
+pub mod config;
+pub mod db;
+pub mod driver;
+pub mod executor;
+pub mod listen;
+pub mod observation;
+pub mod observer;
+pub mod order_events;
+pub mod prices;
+pub mod provider;
+pub mod sponsor;
+pub mod trigger;

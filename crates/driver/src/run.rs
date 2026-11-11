@@ -1,9 +1,6 @@
 use {
     crate::{
-        domain::{
-            Mempools,
-            competition::{order::app_data::AppDataRetriever, risk_detector},
-        },
+        domain::{Mempools, TransactionReceiver, competition::order::app_data::AppDataRetriever},
         infra::{
             self,
             Api,
@@ -12,10 +9,19 @@ use {
             config,
             liquidity,
             notify,
-            simulator::{self, Simulator},
             solver::Solver,
         },
-    }, clap::Parser, futures::future::join_all, shared::arguments::tracing_config, std::{net::SocketAddr, sync::Arc, time::Duration}, tokio::sync::oneshot
+    },
+    alloy::providers::Provider,
+    chain::Chain,
+    clap::Parser,
+    futures::future::join_all,
+    http_client::HttpClientFactory,
+    shared::arguments::tracing_config,
+    simulator::{self, Simulator},
+    std::{net::SocketAddr, sync::Arc, time::Duration},
+    tokio::sync::oneshot,
+    url::Url,
 };
 
 /// The driver entry-point. This function exists in order to be able to run the
@@ -42,22 +48,47 @@ pub async fn run(
 /// Run the driver. This function exists to avoid multiple monomorphizations of
 /// the `run` code, which bloats the binaries and increases compile times.
 async fn run_with(args: cli::Args, addr_sender: Option<oneshot::Sender<SocketAddr>>) {
+    // use dedicated function instead of reading this from `ethrpc` to make
+    // sure we fully initialize the metrics registry before calling any code
+    // that populates those metrics
+    let chain_name = get_chain_name(args.ethrpc.clone()).await;
+
     infra::observe::init(observe::Config::new(
         &args.log,
         args.stderr_threshold,
         args.use_json_logs,
-        tracing_config(&args.tracing, "driver".into()),
+        tracing_config(&args.tracing, format!("driver-{chain_name}")),
     ));
 
     let ethrpc = ethrpc(&args).await;
     let config = config::file::load(ethrpc.chain(), &args.config).await;
 
-    let commit_hash = option_env!("VERGEN_GIT_SHA").unwrap_or("COMMIT_INFO_NOT_FOUND");
+    let version = observe::version::git_version();
 
-    tracing::info!(%commit_hash, "running driver with {config:#?}");
+    tracing::info!(%version, "running driver with {config:#?}");
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
-    let eth = ethereum(&config, ethrpc, &args.current_block).await;
+    let eth = Ethereum::new(
+        ethrpc.clone(),
+        config.contracts.clone(),
+        &args.current_block,
+        config.tx_gas_limit.into(),
+        &config.gas_estimator,
+        config.gas_price_parameters.clone(),
+    )
+    .await;
+
+    let simulator_eth = simulator::Ethereum::new(
+        ethrpc.web3().clone(),
+        ethrpc.chain(),
+        configs::simulator::Addresses {
+            settlement: config.contracts.settlement.map(|address| *address),
+            weth: config.contracts.weth.map(|address| *address),
+        },
+        eth.gas_estimator(),
+        eth.current_block().clone(),
+        config.tx_gas_limit,
+    );
     let app_data_retriever = match &config.app_data_fetching {
         config::file::AppDataFetching::Enabled {
             orderbook_url,
@@ -65,33 +96,22 @@ async fn run_with(args: cli::Args, addr_sender: Option<oneshot::Sender<SocketAdd
         } => Some(AppDataRetriever::new(orderbook_url.clone(), *cache_size)),
         config::file::AppDataFetching::Disabled => None,
     };
+    let solvers = solvers(&config, &eth).await;
+    let http_factory = HttpClientFactory::new(&config.http);
+    // Set up EIP-7702 delegate deployment and solver delegation for solvers
+    // with parallel submission accounts. Must happen before the HTTP server
+    // starts accepting /settle requests.
+    infra::solver::eip7702::setup(&solvers, &eth)
+        .await
+        .expect("EIP-7702 setup failed");
+
     let serve = Api {
-        solvers: solvers(&config, &eth).await,
+        solvers,
         liquidity: liquidity(&config, &eth).await,
         liquidity_sources_notifier: liquidity_sources_notifier(&config, &eth),
-        simulator: simulator(&config, &eth),
-        mempools: Mempools::try_new(
-            config
-                .mempools
-                .iter()
-                .map(|mempool| {
-                    crate::infra::mempool::Mempool::new(
-                        mempool.to_owned(),
-                        config
-                            .solvers
-                            .iter()
-                            .map(|config| config.accounts.first().expect("No accounts available").clone())
-                            .collect(),
-                    )
-                })
-                .collect(),
-            eth.clone(),
-        )
-        .unwrap(),
-        bad_token_detector: risk_detector::bad_tokens::Detector::new(
-            config.simulation_bad_token_max_age,
-            &eth,
-        ),
+        simulator: simulator(&config, simulator_eth, &http_factory),
+        submitter: submitter(&config, &eth, &http_factory),
+        balance_cache: config.balance_cache,
         eth,
         addr: args.addr,
         addr_sender,
@@ -107,7 +127,7 @@ async fn run_with(args: cli::Args, addr_sender: Option<oneshot::Sender<SocketAdd
     futures::pin_mut!(serve);
     tokio::select! {
         result = &mut serve => panic!("serve task exited: {result:?}"),
-        _ = shutdown_signal() => {
+        _ = observe::shutdown::shutdown_signal() => {
             tracing::info!("Gracefully shutting down API");
             shutdown_sender.send(()).expect("failed to send shutdown signal");
             // Shutdown timeout needs to be larger than the auction deadline
@@ -119,34 +139,35 @@ async fn run_with(args: cli::Args, addr_sender: Option<oneshot::Sender<SocketAdd
     };
 }
 
-fn simulator(config: &infra::Config, eth: &Ethereum) -> Simulator {
+fn simulator(
+    config: &infra::Config,
+    eth: simulator::Ethereum,
+    http_factory: &HttpClientFactory,
+) -> Simulator {
+    let blocks = eth.current_block().clone();
     let mut simulator = match &config.simulator {
-        Some(infra::simulator::Config::Tenderly(tenderly)) => Simulator::tenderly(
-            simulator::tenderly::Config {
-                url: tenderly.url.to_owned(),
-                api_key: tenderly.api_key.to_owned(),
-                user: tenderly.user.to_owned(),
-                project: tenderly.project.to_owned(),
-                save: tenderly.save,
-                save_if_fails: tenderly.save_if_fails,
-            },
-            eth.to_owned(),
-        ),
-        Some(infra::simulator::Config::Enso(enso)) => Simulator::enso(
-            simulator::enso::Config {
-                url: enso.url.to_owned(),
-                network_block_interval: enso.network_block_interval.to_owned(),
-            },
-            eth.to_owned(),
-        ),
-        None => Simulator::ethereum(eth.to_owned()),
+        configs::simulator::Config {
+            kind: configs::simulator::SimulatorKind::Tenderly(config),
+            ..
+        } => Simulator::tenderly(config, eth, http_factory),
+        configs::simulator::Config {
+            kind: configs::simulator::SimulatorKind::Ethereum,
+            ..
+        } => Simulator::ethereum(eth),
     };
+
     if config.disable_access_list_simulation {
-        simulator.disable_access_lists()
+        simulator.disable_access_lists();
     }
     if let Some(gas) = config.disable_gas_simulation {
-        simulator.disable_gas(gas)
+        simulator.disable_gas(gas);
     }
+    if let Some(cfg) = &config.simulator.state_override_stream {
+        simulator.set_simulation_overrides(simulator::state_override_stream::spawn_pamm_stream(
+            cfg, blocks,
+        ));
+    }
+
     simulator
 }
 
@@ -159,27 +180,6 @@ async fn ethrpc(args: &cli::Args) -> blockchain::Rpc {
     blockchain::Rpc::try_new(args)
         .await
         .expect("connect ethereum RPC")
-}
-
-async fn ethereum(
-    config: &infra::Config,
-    ethrpc: blockchain::Rpc,
-    current_block_args: &shared::current_block::Arguments,
-) -> Ethereum {
-    let gas = Arc::new(
-        blockchain::GasPriceEstimator::new(ethrpc.web3(), &config.gas_estimator, &config.mempools)
-            .await
-            .expect("initialize gas price estimator"),
-    );
-    Ethereum::new(
-        ethrpc,
-        config.contracts.clone(),
-        gas,
-        config.tx_gas_limit,
-        current_block_args,
-        None,
-    )
-    .await
 }
 
 async fn solvers(config: &config::Config, eth: &Ethereum) -> Vec<Solver> {
@@ -213,29 +213,46 @@ fn liquidity_sources_notifier(
         .expect("initialize notify sources notifier")
 }
 
-#[cfg(unix)]
-async fn shutdown_signal() {
-    // Intercept signals for graceful shutdown. Kubernetes sends sigterm, Ctrl-C
-    // sends sigint.
-    let sigterm = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .unwrap()
-            .recv()
-            .await
-    };
-    let sigint = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .unwrap()
-            .recv()
-            .await;
-    };
-    futures::pin_mut!(sigint);
-    futures::pin_mut!(sigterm);
-    futures::future::select(sigterm, sigint).await;
+async fn get_chain_name(rpc: Url) -> &'static str {
+    let provider = alloy::providers::builder::<alloy::network::Ethereum>().connect_http(rpc);
+    provider
+        .get_chain_id()
+        .await
+        .ok()
+        .and_then(|id| Chain::try_from(id).ok())
+        .map(|chain| chain.name())
+        .unwrap_or("unknown")
 }
 
-#[cfg(windows)]
-async fn shutdown_signal() {
-    // No support for signal handling on Windows.
-    std::future::pending().await
+fn submitter(
+    config: &infra::Config,
+    eth: &Ethereum,
+    http_factory: &HttpClientFactory,
+) -> Arc<dyn TransactionReceiver> {
+    let accounts: Vec<_> = config
+        .solvers
+        .iter()
+        .flat_map(|config| {
+            config
+                .accounts
+                .iter()
+                .cloned()
+                .chain(config.submission_accounts.iter().cloned())
+        })
+        .collect();
+    match &config.receiver {
+        infra::config::Receiver::Mempools(mempools) => {
+            let mempools = mempools
+                .iter()
+                .map(|mempool| infra::Mempool::new(mempool.to_owned(), accounts.clone()))
+                .collect();
+            Arc::new(Mempools::new(mempools, eth.clone()))
+        }
+        infra::config::Receiver::Builders(builders) => Arc::new(infra::Builders::new(
+            builders,
+            accounts,
+            eth.clone(),
+            http_factory.create(),
+        )),
+    }
 }

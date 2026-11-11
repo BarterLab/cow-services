@@ -1,16 +1,19 @@
 use {
     crate::{
         domain::{
+            self,
+            Flashloan,
             competition::{
                 self,
-                order::{self, Side, fees, signature::Scheme},
+                order::{self, Side, signature::Scheme},
             },
-            eth::{self},
             liquidity,
+            quote,
         },
         infra::{config::file::FeeHandler, solver::ManageNativeToken},
     },
     app_data::AppDataHash,
+    eth_domain_types as eth,
     model::order::{BuyTokenDestination, SellTokenSource},
     number::conversions::rational_to_big_decimal,
     std::collections::HashMap,
@@ -22,10 +25,10 @@ pub type WrapperCalls = HashMap<order::Uid, Vec<solvers_dto::auction::WrapperCal
 pub fn new(
     auction: &competition::Auction,
     liquidity: &[liquidity::Liquidity],
-    weth: eth::WethAddress,
+    weth: eth::WrappedNativeToken,
     fee_handler: FeeHandler,
     solver_native_token: ManageNativeToken,
-    flashloan_hints: &HashMap<order::Uid, eth::Flashloan>,
+    flashloan_hints: &HashMap<order::Uid, Flashloan>,
     wrappers: &WrapperCalls,
     deadline: chrono::DateTime<chrono::Utc>,
 ) -> solvers_dto::auction::Auction {
@@ -68,7 +71,22 @@ pub fn new(
     }
 
     solvers_dto::auction::Auction {
-        id: auction.id().as_ref().map(|id| id.0),
+        id: match auction.id {
+            competition::auction::Kind::Competition(id) => solvers_dto::auction::Id::Auction(id.0),
+            competition::auction::Kind::Quote {
+                id,
+                fast_path,
+                price_quality,
+            } => solvers_dto::auction::Id::Quote {
+                id: id.0,
+                fast_path,
+                price_quality: match price_quality {
+                    quote::PriceQuality::Fast => solvers_dto::auction::PriceQuality::Fast,
+                    quote::PriceQuality::Optimal => solvers_dto::auction::PriceQuality::Optimal,
+                    quote::PriceQuality::Verified => solvers_dto::auction::PriceQuality::Verified,
+                },
+            },
+        },
         orders: auction
             .orders()
             .iter()
@@ -78,42 +96,31 @@ pub fn new(
                 if solver_native_token.wrap_address {
                     available.buy.token = available.buy.token.as_erc20(weth)
                 }
-                // In case of volume based fees, fee withheld by driver might be higher than the
-                // surplus of the solution. This would lead to violating limit prices when
-                // driver tries to withhold the volume based fee. To avoid this, we artificially
-                // adjust the order limit amounts (make then worse) before sending to solvers,
-                // to force solvers to only submit solutions with enough surplus to cover the
-                // fee.
+                // In case of volume based fees, fee withheld by driver might be
+                // higher than the surplus of the solution. This
+                // would lead to violating limit prices when
+                // driver tries to withhold the volume based fee. To avoid this,
+                // we artificially adjust the order limit
+                // amounts (make then worse) before sending to solvers,
+                // to force solvers to only submit solutions with enough surplus
+                // to cover the fee.
                 //
                 // https://github.com/cowprotocol/services/issues/2440
-                if fee_handler == FeeHandler::Driver {
-                    order.protocol_fees.iter().for_each(|protocol_fee| {
-                        if let fees::FeePolicy::Volume { factor } = protocol_fee {
-                            match order.side {
-                                Side::Buy => {
-                                    // reduce sell amount by factor
-                                    available.sell.amount = available
-                                        .sell
-                                        .amount
-                                        .apply_factor(1.0 / (1.0 + factor))
-                                        .unwrap_or_default();
-                                }
-                                Side::Sell => {
-                                    // increase buy amount by factor
-                                    available.buy.amount = available
-                                        .buy
-                                        .amount
-                                        .apply_factor(1.0 / (1.0 - factor))
-                                        .unwrap_or_default();
-                                }
-                            }
-                        }
-                    })
-                }
+                let policies: Vec<protocol_fees::FeePolicy> = order
+                    .protocol_fees
+                    .iter()
+                    .filter(|policy| fee_handler.applied_by_driver(policy))
+                    .map(Into::into)
+                    .collect();
+                let (side, limit) = match order.side {
+                    Side::Buy => (protocol_fees::Side::Buy, &mut available.sell.amount),
+                    Side::Sell => (protocol_fees::Side::Sell, &mut available.buy.amount),
+                };
+                *limit = protocol_fees::tighten_limit(&policies, side, limit.0).into();
                 solvers_dto::auction::Order {
                     uid: order.uid.into(),
-                    sell_token: available.sell.token.0.0,
-                    buy_token: available.buy.token.0.0,
+                    sell_token: *available.sell.token,
+                    buy_token: *available.buy.token,
                     sell_amount: available.sell.amount.into(),
                     buy_amount: available.buy.amount.into(),
                     full_sell_amount: order.sell.amount.into(),
@@ -125,10 +132,8 @@ pub fn new(
                     receiver: order.receiver,
                     owner: order.signature.signer,
                     partially_fillable: order.is_partial(),
-                    class: match order.kind {
-                        order::Kind::Market => solvers_dto::auction::Class::Market,
-                        order::Kind::Limit => solvers_dto::auction::Class::Limit,
-                    },
+                    // Deprecated field, every order is a limit order.
+                    class: solvers_dto::auction::Class::Limit,
                     pre_interactions: order
                         .pre_interactions
                         .iter()
@@ -147,14 +152,16 @@ pub fn new(
                     buy_token_destination: buy_token_destination_from_domain(
                         order.buy_token_balance.into(),
                     ),
-                    fee_policies: (fee_handler == FeeHandler::Solver).then_some(
+                    penalty_cap_native: order.penalty_cap_native.map(Into::into),
+                    fee_policies: (fee_handler == FeeHandler::Solver).then(|| {
                         order
                             .protocol_fees
                             .iter()
+                            .filter(|policy| !fee_handler.applied_by_driver(policy))
                             .cloned()
                             .map(fee_policy_from_domain)
-                            .collect(),
-                    ),
+                            .collect()
+                    }),
                     app_data: AppDataHash(order.app_data.hash().0.into()),
                     flashloan_hint: flashloan_hints.get(&order.uid).map(Into::into),
                     wrappers: wrappers
@@ -182,14 +189,14 @@ pub fn new(
                         solvers_dto::auction::ConstantProductPool {
                             id: liquidity.id.0.to_string(),
                             address: pool.address,
-                            router: pool.router.0,
+                            router: *pool.router,
                             gas_estimate: liquidity.gas.into(),
                             tokens: pool
                                 .reserves
                                 .iter()
                                 .map(|asset| {
                                     (
-                                        asset.token.0.0,
+                                        *asset.token,
                                         solvers_dto::auction::ConstantProductReserve {
                                             balance: asset.amount.into(),
                                         },
@@ -204,18 +211,14 @@ pub fn new(
                     solvers_dto::auction::Liquidity::ConcentratedLiquidity(
                         solvers_dto::auction::ConcentratedLiquidityPool {
                             id: liquidity.id.0.to_string(),
-                            address: pool.address.0,
-                            router: pool.router.0,
+                            address: *pool.address,
+                            router: *pool.router,
                             gas_estimate: liquidity.gas.0,
-                            tokens: vec![pool.tokens.get().0.0.0, pool.tokens.get().1.0.0],
+                            tokens: vec![*pool.tokens.get().0, *pool.tokens.get().1],
                             sqrt_price: pool.sqrt_price.0,
                             liquidity: pool.liquidity.0,
                             tick: pool.tick.0,
-                            liquidity_net: pool
-                                .liquidity_net
-                                .iter()
-                                .map(|(key, value)| (key.0, value.0))
-                                .collect(),
+                            liquidity_net: pool.liquidity_net.clone(),
                             fee: rational_to_big_decimal(&pool.fee.0),
                         },
                     )
@@ -331,7 +334,7 @@ pub fn new(
     }
 }
 
-fn fee_policy_from_domain(value: fees::FeePolicy) -> solvers_dto::auction::FeePolicy {
+fn fee_policy_from_domain(value: order::FeePolicy) -> solvers_dto::auction::FeePolicy {
     match value {
         order::FeePolicy::Surplus {
             factor,
@@ -353,11 +356,13 @@ fn fee_policy_from_domain(value: fees::FeePolicy) -> solvers_dto::auction::FeePo
                 fee: quote.fee.amount.into(),
             },
         },
-        order::FeePolicy::Volume { factor } => solvers_dto::auction::FeePolicy::Volume { factor },
+        order::FeePolicy::Volume { factor, .. } => {
+            solvers_dto::auction::FeePolicy::Volume { factor }
+        }
     }
 }
 
-fn interaction_from_domain(value: eth::Interaction) -> solvers_dto::auction::InteractionData {
+fn interaction_from_domain(value: domain::Interaction) -> solvers_dto::auction::InteractionData {
     solvers_dto::auction::InteractionData {
         target: value.target,
         value: value.value.0,
@@ -365,6 +370,8 @@ fn interaction_from_domain(value: eth::Interaction) -> solvers_dto::auction::Int
     }
 }
 
+// Deprecated External/Internal arms are retained for wire compatibility.
+#[allow(deprecated)]
 fn sell_token_source_from_domain(value: SellTokenSource) -> solvers_dto::auction::SellTokenSource {
     match value {
         SellTokenSource::Erc20 => solvers_dto::auction::SellTokenSource::Erc20,
@@ -373,6 +380,7 @@ fn sell_token_source_from_domain(value: SellTokenSource) -> solvers_dto::auction
     }
 }
 
+#[allow(deprecated)]
 fn buy_token_destination_from_domain(
     value: BuyTokenDestination,
 ) -> solvers_dto::auction::BuyTokenDestination {

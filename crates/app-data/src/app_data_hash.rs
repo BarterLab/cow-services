@@ -28,7 +28,6 @@ use {
         fmt::{self, Debug, Formatter},
         str::FromStr,
     },
-    tiny_keccak::{Hasher, Keccak},
 };
 
 /// A JSON object used to represent app data documents for uploading and
@@ -73,13 +72,8 @@ impl Serialize for AppDataHash {
     where
         S: Serializer,
     {
-        let mut bytes = [0u8; 2 + 32 * 2];
-        bytes[..2].copy_from_slice(b"0x");
-        // Can only fail if the buffer size does not match but we know it is correct.
-        const_hex::encode_to_slice(self.0, &mut bytes[2..]).unwrap();
-        // Hex encoding is always valid utf8.
-        let s = std::str::from_utf8(&bytes).unwrap();
-        serializer.serialize_str(s)
+        let mut buffer = const_hex::Buffer::<32, true>::new();
+        serializer.serialize_str(buffer.format(&self.0))
     }
 }
 
@@ -107,11 +101,7 @@ impl PartialEq<[u8; 32]> for AppDataHash {
 /// Hash full app data to get the bytes expected to be set as the contract level
 /// app data.
 pub fn hash_full_app_data(app_data: &[u8]) -> [u8; 32] {
-    let mut hasher = Keccak::v256();
-    hasher.update(app_data);
-    let mut hash = [0u8; 32];
-    hasher.finalize(&mut hash);
-    hash
+    alloy_primitives::keccak256(app_data).0
 }
 
 /// Create an IPFS CIDv1 from a hash created by `hash_full_app_data`.

@@ -1,12 +1,12 @@
 use {
-    crate::domain::eth::{self, ContractAddress},
+    crate::{domain::blockchain::CodeDigest, infra::liquidity::AtBlock},
     alloy::primitives::Address,
     chain::Chain,
-    contracts::alloy::BalancerV2Vault,
+    contracts::BalancerV2Vault,
     derive_more::Debug,
+    eth_domain_types::{self as eth, ContractAddress},
     hex_literal::hex,
-    reqwest::Url,
-    shared::sources::uniswap_v2::{
+    liquidity_sources::uniswap_v2::{
         BAOSWAP_INIT,
         HONEYSWAP_INIT,
         SUSHISWAP_INIT,
@@ -14,7 +14,8 @@ use {
         TESTNET_UNISWAP_INIT,
         UNISWAP_INIT,
     },
-    std::{collections::HashSet, time::Duration},
+    reqwest::Url,
+    std::{collections::HashSet, num::NonZeroUsize, time::Duration},
 };
 
 /// Configuration options for liquidity fetching.
@@ -42,6 +43,20 @@ pub struct Config {
 
     /// 0x liquidity fetcher.
     pub zeroex: Option<ZeroEx>,
+
+    /// The block at which liquidity for `/solve` requests gets fetched.
+    pub fetch_at_block: AtBlock,
+
+    /// Minimum time between two background refreshes of the cached pools.
+    pub refresh_cooldown: Duration,
+
+    /// How many blocks older than the last background refresh cached pools
+    /// may be to still be returned for recent liquidity requests.
+    pub max_recent_block_age: u64,
+
+    /// How many of the most recently used token pairs get kept up to date in
+    /// the background.
+    pub max_auto_updated_pairs: NonZeroUsize,
 }
 
 /// Uniswap V2 (and Uniswap V2 clone) liquidity fetching options.
@@ -51,7 +66,7 @@ pub struct UniswapV2 {
     pub router: eth::ContractAddress,
     /// The digest of the pool initialization code. This digest is used for
     /// computing the deterministic pool addresses per token pair.
-    pub pool_code: eth::CodeDigest,
+    pub pool_code: CodeDigest,
     /// How long liquidity should not be fetched for a token pair that didn't
     /// return useful liquidity before allowing to fetch it again.
     pub missing_pool_cache_time: Duration,
@@ -62,7 +77,7 @@ impl UniswapV2 {
     #[expect(clippy::self_named_constructors)]
     pub fn uniswap_v2(chain: Chain) -> Option<Self> {
         Some(Self {
-            router: ContractAddress::from(contracts::alloy::UniswapV2Router02::deployment_address(
+            router: ContractAddress::from(contracts::UniswapV2Router02::deployment_address(
                 &chain.id(),
             )?),
             pool_code: UNISWAP_INIT.into(),
@@ -73,7 +88,7 @@ impl UniswapV2 {
     /// Returns the liquidity configuration for SushiSwap.
     pub fn sushi_swap(chain: Chain) -> Option<Self> {
         Some(Self {
-            router: ContractAddress::from(contracts::alloy::SushiSwapRouter::deployment_address(
+            router: ContractAddress::from(contracts::SushiSwapRouter::deployment_address(
                 &chain.id(),
             )?),
             pool_code: SUSHISWAP_INIT.into(),
@@ -84,7 +99,7 @@ impl UniswapV2 {
     /// Returns the liquidity configuration for Honeyswap.
     pub fn honeyswap(chain: Chain) -> Option<Self> {
         Some(Self {
-            router: ContractAddress::from(contracts::alloy::BaoswapRouter::deployment_address(
+            router: ContractAddress::from(contracts::HoneyswapRouter::deployment_address(
                 &chain.id(),
             )?),
             pool_code: HONEYSWAP_INIT.into(),
@@ -95,7 +110,7 @@ impl UniswapV2 {
     /// Returns the liquidity configuration for Baoswap.
     pub fn baoswap(chain: Chain) -> Option<Self> {
         Some(Self {
-            router: ContractAddress::from(contracts::alloy::BaoswapRouter::deployment_address(
+            router: ContractAddress::from(contracts::BaoswapRouter::deployment_address(
                 &chain.id(),
             )?),
             pool_code: BAOSWAP_INIT.into(),
@@ -111,7 +126,7 @@ impl UniswapV2 {
         }
         .into();
         Some(Self {
-            router: ContractAddress::from(contracts::alloy::PancakeRouter::deployment_address(
+            router: ContractAddress::from(contracts::PancakeRouter::deployment_address(
                 &chain.id(),
             )?),
             pool_code,
@@ -123,9 +138,9 @@ impl UniswapV2 {
     /// test networks.
     pub fn testnet_uniswapv2(chain: Chain) -> Option<Self> {
         Some(Self {
-            router: ContractAddress::from(
-                contracts::alloy::TestnetUniswapV2Router02::deployment_address(&chain.id())?,
-            ),
+            router: ContractAddress::from(contracts::TestnetUniswapV2Router02::deployment_address(
+                &chain.id(),
+            )?),
             pool_code: TESTNET_UNISWAP_INIT.into(),
             missing_pool_cache_time: Duration::from_secs(60 * 60),
         })
@@ -139,7 +154,7 @@ pub struct Swapr {
     pub router: eth::ContractAddress,
     /// The digest of the pool initialization code. This digest is used for
     /// computing the deterministic pool addresses per token pair.
-    pub pool_code: eth::CodeDigest,
+    pub pool_code: CodeDigest,
     /// How long liquidity should not be fetched for a token pair that didn't
     /// return useful liquidity before allowing to fetch it again.
     pub missing_pool_cache_time: Duration,
@@ -150,13 +165,19 @@ impl Swapr {
     #[expect(clippy::self_named_constructors)]
     pub fn swapr(chain: Chain) -> Option<Self> {
         Some(Self {
-            router: ContractAddress::from(contracts::alloy::SwaprRouter::deployment_address(
-                &chain.id(),
-            )?),
+            router: ContractAddress::from(contracts::SwaprRouter::deployment_address(&chain.id())?),
             pool_code: SWAPR_INIT.into(),
             missing_pool_cache_time: Duration::from_secs(60 * 60),
         })
     }
+}
+
+/// Pool-indexer-specific Uniswap V3 config.
+#[derive(Clone, Debug)]
+pub struct UniswapV3PoolIndexer {
+    /// Service root, e.g. `http://pool-indexer/` exposing
+    /// `/api/v1/{network}/uniswap/v3/`.
+    pub url: Url,
 }
 
 /// Uniswap V3 liquidity fetching options.
@@ -168,34 +189,23 @@ pub struct UniswapV3 {
     /// How many pools should be initialized during start up.
     pub max_pools_to_initialize: usize,
 
-    /// The URL used to connect to uniswap v3 subgraph client.
-    pub graph_url: Url,
+    /// Where pool data is fetched from.
+    pub pool_indexer: UniswapV3PoolIndexer,
 
     /// How often the liquidity source should be reinitialized to
     /// become aware of new pools.
     pub reinit_interval: Option<Duration>,
-
-    /// How many pool IDs can be present in a where clause of a Tick query at
-    /// once. Some subgraphs are overloaded and throw errors when there are
-    /// too many.
-    pub max_pools_per_tick_query: usize,
 }
 
 impl UniswapV3 {
     /// Returns the liquidity configuration for Uniswap V3.
     #[expect(clippy::self_named_constructors)]
-    pub fn uniswap_v3(
-        graph_url: &Url,
-        chain: Chain,
-        max_pools_per_tick_query: usize,
-    ) -> Option<Self> {
+    pub fn uniswap_v3(pool_indexer: UniswapV3PoolIndexer, chain: Chain) -> Option<Self> {
         Some(Self {
-            router: contracts::alloy::UniswapV3SwapRouterV2::deployment_address(&chain.id())?
-                .into(),
+            router: contracts::UniswapV3SwapRouterV2::deployment_address(&chain.id())?.into(),
             max_pools_to_initialize: 100,
-            graph_url: graph_url.clone(),
+            pool_indexer,
             reinit_interval: None,
-            max_pools_per_tick_query,
         })
     }
 }
@@ -252,37 +262,37 @@ impl BalancerV2 {
         }
 
         Some(Self {
-            vault: ContractAddress(BalancerV2Vault::deployment_address(&chain.id())?),
+            vault: ContractAddress::from(BalancerV2Vault::deployment_address(&chain.id())?),
             weighted: address_for!(
                 chain,
                 [
-                    contracts::alloy::BalancerV2WeightedPoolFactory,
-                    contracts::alloy::BalancerV2WeightedPool2TokensFactory,
+                    contracts::BalancerV2WeightedPoolFactory,
+                    contracts::BalancerV2WeightedPool2TokensFactory,
                 ]
             ),
             weighted_v3plus: address_for!(
                 chain,
                 [
-                    contracts::alloy::BalancerV2WeightedPoolFactoryV3,
-                    contracts::alloy::BalancerV2WeightedPoolFactoryV4,
+                    contracts::BalancerV2WeightedPoolFactoryV3,
+                    contracts::BalancerV2WeightedPoolFactoryV4,
                 ]
             ),
-            stable: address_for!(chain, [contracts::alloy::BalancerV2StablePoolFactoryV2,]),
+            stable: address_for!(chain, [contracts::BalancerV2StablePoolFactoryV2,]),
             liquidity_bootstrapping: address_for!(
                 chain,
                 [
-                    contracts::alloy::BalancerV2LiquidityBootstrappingPoolFactory,
-                    contracts::alloy::BalancerV2NoProtocolFeeLiquidityBootstrappingPoolFactory,
+                    contracts::BalancerV2LiquidityBootstrappingPoolFactory,
+                    contracts::BalancerV2NoProtocolFeeLiquidityBootstrappingPoolFactory,
                 ]
             ),
             composable_stable: address_for!(
                 chain,
                 [
-                    contracts::alloy::BalancerV2ComposableStablePoolFactory,
-                    contracts::alloy::BalancerV2ComposableStablePoolFactoryV3,
-                    contracts::alloy::BalancerV2ComposableStablePoolFactoryV4,
-                    contracts::alloy::BalancerV2ComposableStablePoolFactoryV5,
-                    contracts::alloy::BalancerV2ComposableStablePoolFactoryV6,
+                    contracts::BalancerV2ComposableStablePoolFactory,
+                    contracts::BalancerV2ComposableStablePoolFactoryV3,
+                    contracts::BalancerV2ComposableStablePoolFactoryV4,
+                    contracts::BalancerV2ComposableStablePoolFactoryV5,
+                    contracts::BalancerV2ComposableStablePoolFactoryV6,
                 ]
             ),
             pool_deny_list: Vec::new(),

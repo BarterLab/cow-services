@@ -30,7 +30,7 @@ async fn solutions_with_flashloan() {
     )));
 
     let settlement = Address::repeat_byte(5);
-    let order = ab_order().app_data(app_data).receiver(Some(settlement));
+    let order = ab_order().app_data(app_data).receiver(settlement.into());
 
     let test = setup()
         .settlement_address(settlement)
@@ -66,7 +66,7 @@ async fn solutions_without_flashloan() {
         protocol_app_data,
     )));
     let settlement = Address::repeat_byte(5);
-    let order = ab_order().app_data(app_data).receiver(Some(settlement));
+    let order = ab_order().app_data(app_data).receiver(settlement.into());
 
     let test = setup()
         .settlement_address(settlement)
@@ -79,6 +79,55 @@ async fn solutions_without_flashloan() {
     // blocked by https://github.com/cowprotocol/services/issues/3218
     // todo: instead, check the solution using
     // `test.solve().await.ok().orders(&[order]);`
+    test.solve().await.ok();
+}
+
+/// A flashloan-hint order is only visible as a flashloan order after
+/// `update_orders` promotes its `AppData` from `Hash` to `Full`. If the
+/// `flashloans_enabled=false` retain runs *before* promotion (as in the buggy
+/// parallelized ordering), the driver sees `AppData::Hash(_).flashloan() ==
+/// None` and the order survives. When the bug regresses, the flashloan order
+/// reaches the solver mock and the `/solve` body `assert_eq!` panics.
+#[tokio::test]
+#[ignore]
+async fn flashloan_order_filtered_when_flashloans_disabled() {
+    let flashloan = Flashloan {
+        liquidity_provider: Address::from_slice(&[1; 20]),
+        receiver: Address::from_slice(&[2; 20]),
+        token: Address::from_slice(&[3; 20]),
+        protocol_adapter: Address::from_slice(&[4; 20]),
+        amount: ::alloy::primitives::U256::from(3),
+    };
+    let protocol_app_data = ProtocolAppData {
+        flashloan: Some(flashloan),
+        ..Default::default()
+    };
+    let app_data = AppData::Full(Arc::new(protocol_app_data_into_validated(
+        protocol_app_data,
+    )));
+
+    let test = setup()
+        .flashloans_enabled(false)
+        .pool(ab_pool())
+        // Normal order: expected to reach the solver and settle.
+        .order(ab_order())
+        // Flashloan-hint order: the driver must drop this before /solve. The
+        // mock orderbook indexes it by hash; the driver only sees the hash on
+        // /solve and must fetch + promote it before the retain runs.
+        .order(
+            ab_order()
+                .rename("flashloan-ab")
+                .app_data(app_data)
+                .filtered(),
+        )
+        .solution(ab_solution())
+        .done()
+        .await;
+
+    // If the ordering bug regresses, the flashloan order reaches the solver
+    // and the solver mock's `check_solve_request` panics with
+    // "/solve request body does not match expectation" plus an orders-array
+    // diff.
     test.solve().await.ok();
 }
 

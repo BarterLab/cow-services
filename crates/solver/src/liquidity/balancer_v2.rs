@@ -2,29 +2,18 @@
 
 use {
     crate::{
-        interactions::{
-            BalancerSwapGivenOutInteraction,
-            allowances::{AllowanceManager, AllowanceManaging, Allowances},
-        },
-        liquidity::{
-            AmmOrderExecution,
-            Liquidity,
-            SettlementHandling,
-            StablePoolOrder,
-            WeightedProductOrder,
-        },
+        interactions::BalancerSwapGivenOutInteraction,
+        liquidity::{Liquidity, SettlementHandling, StablePoolOrder, WeightedProductOrder},
         liquidity_collector::LiquidityCollecting,
-        settlement::SettlementEncoder,
     },
     alloy::primitives::{Address, B256},
     anyhow::Result,
-    model::TokenPair,
-    shared::{
-        http_solver::model::TokenAmount,
+    liquidity_sources::{
+        balancer_v2::pool_fetching::BalancerPoolFetching,
         recent_block_cache::Block,
-        sources::balancer_v2::pool_fetching::BalancerPoolFetching,
-        web3::Web3,
     },
+    model::TokenPair,
+    shared::http_solver::model::TokenAmount,
     std::{collections::HashSet, sync::Arc},
     tracing::instrument,
 };
@@ -34,22 +23,18 @@ pub struct BalancerV2Liquidity {
     settlement: Address,
     vault: Address,
     pool_fetcher: Arc<dyn BalancerPoolFetching>,
-    allowance_manager: Box<dyn AllowanceManaging>,
 }
 
 impl BalancerV2Liquidity {
     pub fn new(
-        web3: Web3,
         pool_fetcher: Arc<dyn BalancerPoolFetching>,
         settlement: Address,
         vault: Address,
     ) -> Self {
-        let allowance_manager = AllowanceManager::new(web3, settlement);
         Self {
             settlement,
             vault,
             pool_fetcher,
-            allowance_manager: Box::new(allowance_manager),
         }
     }
 
@@ -60,15 +45,7 @@ impl BalancerV2Liquidity {
     ) -> Result<(Vec<StablePoolOrder>, Vec<WeightedProductOrder>)> {
         let pools = self.pool_fetcher.fetch(pairs, block).await?;
 
-        let tokens = pools.relevant_tokens();
-
-        let allowances = self
-            .allowance_manager
-            .get_allowances(tokens, self.vault)
-            .await?;
-
         let inner = Arc::new(Inner {
-            allowances,
             settlement: self.settlement,
             vault: self.vault,
         });
@@ -134,18 +111,13 @@ pub struct SettlementHandler {
 struct Inner {
     settlement: Address,
     vault: Address,
-    allowances: Allowances,
 }
 
 impl SettlementHandler {
-    pub fn new(pool_id: B256, settlement: Address, vault: Address, allowances: Allowances) -> Self {
+    pub fn new(pool_id: B256, settlement: Address, vault: Address) -> Self {
         SettlementHandler {
             pool_id,
-            inner: Arc::new(Inner {
-                settlement,
-                vault,
-                allowances,
-            }),
+            inner: Arc::new(Inner { settlement, vault }),
         }
     }
 
@@ -180,44 +152,11 @@ impl SettlementHandling<WeightedProductOrder> for SettlementHandler {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-
-    fn encode(&self, execution: AmmOrderExecution, encoder: &mut SettlementEncoder) -> Result<()> {
-        self.inner_encode(execution, encoder)
-    }
 }
 
 impl SettlementHandling<StablePoolOrder> for SettlementHandler {
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn encode(&self, execution: AmmOrderExecution, encoder: &mut SettlementEncoder) -> Result<()> {
-        self.inner_encode(execution, encoder)
-    }
-}
-
-impl SettlementHandler {
-    fn inner_encode(
-        &self,
-        execution: AmmOrderExecution,
-        encoder: &mut SettlementEncoder,
-    ) -> Result<()> {
-        if let Some(approval) = self
-            .inner
-            .allowances
-            .approve_token(execution.input_max.clone())?
-        {
-            encoder.append_to_execution_plan_internalizable(
-                Arc::new(approval),
-                execution.internalizable,
-            );
-        }
-        encoder.append_to_execution_plan_internalizable(
-            Arc::new(self.swap(execution.input_max, execution.output)),
-            execution.internalizable,
-        );
-
-        Ok(())
     }
 }
 
@@ -225,17 +164,10 @@ impl SettlementHandler {
 mod tests {
     use {
         super::*,
-        crate::interactions::allowances::{Approval, MockAllowanceManaging},
         alloy::primitives::U256,
-        contracts::alloy::BalancerV2Vault,
-        maplit::{btreemap, hashmap, hashset},
-        mockall::predicate::*,
-        model::TokenPair,
-        shared::{
-            baseline_solver::BaseTokens,
-            http_solver::model::{InternalizationStrategy, TokenAmount},
-            interaction::Interaction,
-            sources::balancer_v2::{
+        contracts::BalancerV2Vault,
+        liquidity_sources::{
+            balancer_v2::{
                 pool_fetching::{
                     AmplificationParameter,
                     CommonPoolState,
@@ -249,7 +181,11 @@ mod tests {
                 },
                 swap::fixed_point::Bfp,
             },
+            base_tokens::BaseTokens,
         },
+        maplit::{btreemap, hashset},
+        mockall::predicate::*,
+        model::TokenPair,
     };
 
     fn dummy_contracts() -> (Address, BalancerV2Vault::Instance) {
@@ -270,7 +206,6 @@ mod tests {
     #[tokio::test]
     async fn fetches_liquidity() {
         let mut pool_fetcher = MockBalancerPoolFetching::new();
-        let mut allowance_manager = MockAllowanceManaging::new();
 
         let weighted_pools = vec![
             WeightedPool {
@@ -378,20 +313,6 @@ mod tests {
                 }
             });
 
-        // Fetches allowances for all tokens in pools.
-        allowance_manager
-            .expect_get_allowances()
-            .with(
-                eq(hashset![
-                    Address::repeat_byte(0x70),
-                    Address::repeat_byte(0x71),
-                    Address::repeat_byte(0x73),
-                    Address::repeat_byte(0xb0),
-                ]),
-                always(),
-            )
-            .returning(|_, _| Ok(Allowances::empty(Address::repeat_byte(0xc1))));
-
         let base_tokens = BaseTokens::new(Address::repeat_byte(0xb0), &[]);
         let traded_pairs = [
             TokenPair::new(
@@ -417,10 +338,14 @@ mod tests {
             settlement,
             vault: *vault.address(),
             pool_fetcher: Arc::new(pool_fetcher),
-            allowance_manager: Box::new(allowance_manager),
         };
         let (stable_orders, weighted_orders) = liquidity_provider
-            .get_orders(pairs, Block::Recent)
+            .get_orders(
+                pairs,
+                Block::Recent {
+                    schedule_update: false,
+                },
+            )
             .await
             .unwrap();
 
@@ -454,80 +379,6 @@ mod tests {
         assert_eq!(
             (&stable_orders[0].reserves, &stable_orders[0].fee),
             (&stable_pools[0].reserves, &"0.002".parse().unwrap()),
-        );
-    }
-
-    #[test]
-    fn encodes_swaps_in_settlement() {
-        let (settlement, vault) = dummy_contracts();
-        let inner = Arc::new(Inner {
-            settlement,
-            vault: *vault.address(),
-            allowances: Allowances::new(
-                *vault.address(),
-                hashmap! {
-                    Address::repeat_byte(0x70) => U256::from(0),
-                    Address::repeat_byte(0x71) =>  U256::from(100),
-                },
-            ),
-        });
-        let handler = SettlementHandler {
-            pool_id: B256::repeat_byte(0x90),
-            inner,
-        };
-
-        let mut encoder = SettlementEncoder::new(Default::default());
-        SettlementHandling::<WeightedProductOrder>::encode(
-            &handler,
-            AmmOrderExecution {
-                input_max: TokenAmount::new(Address::repeat_byte(0x70), U256::from(10)),
-                output: TokenAmount::new(Address::repeat_byte(0x71), U256::from(11)),
-                internalizable: false,
-            },
-            &mut encoder,
-        )
-        .unwrap();
-        SettlementHandling::<WeightedProductOrder>::encode(
-            &handler,
-            AmmOrderExecution {
-                input_max: TokenAmount::new(Address::repeat_byte(0x71), U256::from(12)),
-                output: TokenAmount::new(Address::repeat_byte(0x72), U256::from(13)),
-                internalizable: false,
-            },
-            &mut encoder,
-        )
-        .unwrap();
-
-        let [_, interactions, _] = encoder
-            .finish(InternalizationStrategy::SkipInternalizableInteraction)
-            .interactions;
-        assert_eq!(
-            interactions,
-            [
-                Approval {
-                    token: Address::repeat_byte(0x70),
-                    spender: *vault.address(),
-                }
-                .encode(),
-                BalancerSwapGivenOutInteraction {
-                    settlement,
-                    vault: *vault.address(),
-                    pool_id: B256::repeat_byte(0x90),
-                    asset_in_max: TokenAmount::new(Address::repeat_byte(0x70), U256::from(10)),
-                    asset_out: TokenAmount::new(Address::repeat_byte(0x71), U256::from(11)),
-                    user_data: Default::default(),
-                }
-                .encode(),
-                BalancerSwapGivenOutInteraction {
-                    settlement,
-                    vault: *vault.address(),
-                    pool_id: B256::repeat_byte(0x90),
-                    asset_in_max: TokenAmount::new(Address::repeat_byte(0x71), U256::from(12)),
-                    asset_out: TokenAmount::new(Address::repeat_byte(0x72), U256::from(13)),
-                    user_data: Default::default(),
-                }
-                .encode(),
-            ],
         );
     }
 }

@@ -89,7 +89,7 @@ User signs order → Orderbook validates → Autopilot includes in auction
   - Database tests: `cargo nextest run postgres -p orderbook -p database -p autopilot --test-threads 1 --run-ignored ignored-only`
   - E2E local tests: `cargo nextest run -p e2e local_node --test-threads 1 --failure-output final --run-ignored ignored-only`
   - E2E forked tests: `cargo nextest run -p e2e forked_node --test-threads 1 --run-ignored ignored-only --failure-output final`
-  - Driver tests: `RUST_MIN_STACK=3145728 cargo nextest run -p driver --test-threads 1 --run-ignored ignored-only`
+  - Driver tests: `RUST_MIN_STACK=3145728 cargo nextest run -p driver --run-ignored ignored-only`
 - E2E tests available in `crates/e2e`
 
 ### Testing Requirements
@@ -105,6 +105,7 @@ User signs order → Orderbook validates → Autopilot includes in auction
 - Spot format: `cargo +nightly fmt -- <path>` (never call stable `cargo fmt`)
 - Lint: `cargo clippy --locked --workspace --all-features --all-targets -- -D warnings`
 - Check format: `cargo +nightly fmt --all -- --check`
+- Only format **after** as a final step! — i.e. after checking compilation, running tests, etc.
 
 ### Local Development Environment
 - Start local PostgreSQL: `docker compose up -d`
@@ -128,7 +129,7 @@ configs/        # Configuration files
 - Tokio-console support: **Only available in playground environment** (set `TOKIO_CONSOLE=true` to activate when running in playground)
 - Production builds do **not** include tokio-console overhead
 - Runtime log filter changes via UNIX socket at `/tmp/log_filter_override_<program_name>_<pid>.sock`
-- Memory allocator: Uses jemalloc by default with built-in heap profiling support (enable at runtime via MALLOC_CONF environment variable). Can optionally use mimalloc via `--features mimalloc-allocator`
+- Memory allocator: Uses jemalloc with built-in heap profiling support (enable at runtime via MALLOC_CONF environment variable)
 
 ## Playground Environment
 
@@ -153,9 +154,7 @@ Use rust-analyzer MCP when appropriate such as finding usages or renaming. After
 
 ## Code Style
 
-Instead of using full paths like `volume_fee_bucket_overrides: Vec<shared::arguments::TokenBucketFeeOverride>`, import the type at the beginning so you don't have to use the full path later.
-
-Don't add a lot of comments. Add comments only if the code is a bit weird or the concept is not clear.
+See `docs/CODE_STYLE.md` for the code style rules — follow them for all non-trivial changes.
 
 ## CoW Protocol Database Access
 
@@ -181,26 +180,55 @@ Databases: `mainnet`, `arbitrum-one`, `base`, `linea`, `polygon`, `xdai`, `sepol
 
 Use `$ETH_MAINNET_RPC` from `.env.claude` for mainnet. Use `cast` or whatever tools you want freely.
 
-## Grafana Logs Access
+## Victoria Logs Access
 
-Use the `scripts/vlogs` wrapper to query Victoria Logs:
+Use the `CoW-Prod` MCP tools to query Victoria Logs directly.
 
-```bash
-# Basic usage
-scripts/vlogs "<expr>" [--from <time>] [--to <time>] [--max <lines>] [--env <prod|staging>] [--raw]
+**Timestamps**: MCP requires RFC3339 format (e.g., `2026-04-09T00:00:00Z`). Compute absolute timestamps from the current date rather than using relative time.
 
-# Examples
-scripts/vlogs "NOT container:controller order created 0xabc..." --from now-24h
-scripts/vlogs "NOT container:controller network:mainnet settlement failed" --from now-6h --max 50
-scripts/vlogs "error" --env staging --from now-1h
-scripts/vlogs "NOT container:controller 0xabc..." --raw  # full JSON with labels
+**IMPORTANT**: Order UIDs and other structured fields (like `quote_id`, `auction_id`) live inside the `all` field in Victoria Logs. You MUST prefix them with `all:` to match. Plain text terms (like `order created`, `filtered`) match the log message directly and don't need the prefix. You can also use parsed fields directly (e.g., `parsed.fields.order_uid:0x...`) for more precise matching.
+
+**IMPORTANT — Protect context window**: Raw log entries contain ~4KB of kubernetes/ec2 metadata each. **Always** append `| fields _time, _msg, all` (or specific `parsed.fields.*`) to strip noise. Use small `limit` values (10-20) and only increase if needed. Examples:
+- General order search: `... | fields _time, _msg, all`
+- When you only need specific parsed fields: `... | fields _time, _msg, parsed.fields.err, parsed.fields.driver, parsed.spans.auction.auction_id`
+
+**Available MCP tools:**
+- `victorialogs_query` — Main log search (LogsQL expression + time range + limit)
+- `victorialogs_hits` — Count matching logs grouped by time buckets
+- `victorialogs_field_names` / `victorialogs_field_values` — Explore available fields
+- `victorialogs_facets` — Most frequent values per field
+- `victorialogs_stats_query` / `victorialogs_stats_query_range` — Aggregation queries
+- `victorialogs_stream_field_names` / `victorialogs_stream_field_values` — Stream metadata
+
+**Key fields:**
+- Stream fields (efficient filters): `container`, `namespace`, `pod`
+- `network` — chain name (mainnet, arbitrum-one, base, etc.)
+- `all` — full structured JSON log (search with `all:` prefix for UIDs)
+- `parsed.fields.*` — individual parsed fields (e.g., `parsed.fields.order_uid`, `parsed.fields.quote_id`)
+- `_msg` — the log message text
+
+**Example queries:**
 ```
+# Search for order logs (exclude nginx controller, strip metadata)
+query: "container:!controller AND network:mainnet AND all:0xabc... | fields _time, _msg, all"
+start: "<COMPUTED_RFC3339>"
+limit: 20
 
-Defaults: `--from now-12h`, `--to now`, `--max 100`, `--env prod`
+# Search for order creation on mainnet
+query: "container:!controller AND network:mainnet AND \"order created\" AND all:0xabc... | fields _time, _msg, all"
+start: "<COMPUTED_RFC3339>"
+limit: 10
 
-Datasource UIDs (hardcoded in script): `vm-auth-prod` (production), `vm-auth-staging` (staging)
+# Settlement failures with just error details
+query: "container:!controller AND network:mainnet AND \"settlement failed\" | fields _time, _msg, parsed.fields.err, parsed.fields.driver, parsed.spans.auction.auction_id"
+start: "<COMPUTED_RFC3339>"
+limit: 10
 
-With `--raw`, each log entry has an `all` field containing the full unparsed JSON log message (with timestamp, level, fields, spans, trace_id). Useful for extracting structured data like `order_uid`, `quote_id`, `request_id`, etc.
+# Sort results by time
+query: "container:!controller AND network:mainnet AND all:0xabc... | fields _time, _msg, all | sort by (_time) asc"
+start: "<COMPUTED_RFC3339>"
+limit: 20
+```
 
 ## Etherscan API (V2)
 

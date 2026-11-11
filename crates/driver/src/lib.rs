@@ -12,13 +12,21 @@ pub mod util;
 #[cfg(test)]
 mod tests;
 
-pub use self::run::{run, start};
+pub mod contracts {
+    pub use ::contracts::{self as alloy, *};
+}
 
-pub use contracts;
-pub use model;
-pub use app_data;
-pub use observe;
-pub use ethrpc;
-pub use serde_ext;
-pub use solvers_dto;
-pub use shared;
+pub use {
+    self::run::{run, start},
+    alloy,
+    app_data,
+    balance_overrides,
+    configs,
+    ethrpc,
+    model,
+    observe,
+    serde_ext,
+    shared,
+    simulator,
+    solvers_dto,
+};

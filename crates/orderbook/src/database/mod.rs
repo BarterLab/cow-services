@@ -1,10 +1,9 @@
 pub mod app_data;
-pub mod auction_prices;
 pub mod auctions;
+pub mod debug_report;
 mod fee_policies;
 pub mod orders;
 pub mod quotes;
-pub mod solver_competition;
 pub mod solver_competition_v2;
 pub mod total_surplus;
 pub mod trades;
@@ -15,7 +14,13 @@ use {
     database::byte_array::ByteArray,
     model::order::Order,
     shared::arguments::DB_MAX_CONNECTIONS_DEFAULT,
-    sqlx::{PgConnection, PgPool, postgres::PgPoolOptions},
+    sqlx::{
+        Connection,
+        PgConnection,
+        PgPool,
+        postgres::{PgConnectOptions, PgPoolOptions},
+    },
+    std::time::Duration,
 };
 
 // TODO: There is remaining optimization potential by implementing sqlx encoding
@@ -25,6 +30,20 @@ use {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max_pool_size: u32,
+    /// Maps directly to Postgres' `statement_timeout` parameter, applied on a
+    /// per-connection basis, but *only* if the pool was created using
+    /// [`Postgres::try_new_with_timeout`].
+    pub statement_timeout: Duration,
+    /// Connections returned to the pool that still have pending work after
+    /// this long get closed instead of reused, which makes the server abort
+    /// that work (in conjunction with `client_connection_check_interval`).
+    pub connection_release_timeout: Duration,
+    /// By default Postgres doesn't stop a running query when the caller
+    /// disconnects. This option configures Postgres'
+    /// `client_connection_check_interval` which continuously checks if the
+    /// caller is still alive and aborts the running query when the caller
+    /// disconnects.
+    pub client_connection_check_interval: Duration,
 }
 
 impl Default for Config {
@@ -32,6 +51,9 @@ impl Default for Config {
         Self {
             // Match SQLx default pool size
             max_pool_size: DB_MAX_CONNECTIONS_DEFAULT.get(),
+            statement_timeout: Duration::from_secs(30),
+            connection_release_timeout: Duration::from_millis(50),
+            client_connection_check_interval: Duration::from_millis(500),
         }
     }
 }
@@ -49,9 +71,20 @@ pub struct Postgres {
 impl Postgres {
     pub fn try_new(uri: &str, config: Config) -> Result<Self> {
         Ok(Self {
-            pool: PgPoolOptions::new()
-                .max_connections(config.max_pool_size)
-                .connect_lazy(uri)?,
+            pool: pool_options(&config).connect_lazy_with(connect_options(uri, &config)?),
+            config,
+        })
+    }
+
+    /// Creates a Postgres connection pool, but applies the [`Config`]'s
+    /// `statement_timeout` to all queries.
+    pub fn try_new_with_timeout(uri: &str, config: Config) -> Result<Self> {
+        let options = connect_options(uri, &config)?.options([(
+            "statement_timeout",
+            format!("{}ms", config.statement_timeout.as_millis()),
+        )]);
+        Ok(Self {
+            pool: pool_options(&config).connect_lazy_with(options),
             config,
         })
     }
@@ -74,15 +107,159 @@ impl Postgres {
     }
 }
 
+/// Applies connnect options that should be applied to ALL connections:
+/// - `client_connection_check_interval`: interval in which the postgres DB
+///   checks if the caller is still alive. When the caller no longer responds to
+///   those health pings the DB will abort the currently running query.
+fn connect_options(uri: &str, config: &Config) -> Result<PgConnectOptions> {
+    Ok(uri.parse::<PgConnectOptions>()?.options([(
+        "client_connection_check_interval",
+        format!("{}ms", config.client_connection_check_interval.as_millis()),
+    )]))
+}
+
+fn pool_options(config: &Config) -> PgPoolOptions {
+    let release_timeout = config.connection_release_timeout;
+    PgPoolOptions::new()
+        .max_connections(config.max_pool_size)
+        .after_release(move |conn, _meta| {
+            Box::pin(async move {
+                // Normally a when a connection's RAII guard struct gets dropped
+                // `sqlx` still awaits the connection's result before returning
+                // it back to the connection pool. At that point it's impossible
+                // for anyone to even see the result of the query so the DB is
+                // kept busy AND we have 1 fewer connection in our pool until
+                // the query finishes.
+                // `after_release()` runs BEFORE all this happens and can signal
+                // whether we want to immediately terminate the connection
+                // (return false) or do the usual work of awaiting the result
+                // (return true).
+                // We use the same mechanism as `sqlx` to determine whether the
+                // connection is busy (`conn.ping().await`) but we apply a
+                // timout to catch long running queries early.
+                match tokio::time::timeout(release_timeout, conn.ping()).await {
+                    Ok(result) => result.map(|()| true),
+                    Err(_) => {
+                        Metrics::get().busy_connections_closed.inc();
+                        Ok(false)
+                    }
+                }
+            })
+        })
+}
+
 #[derive(prometheus_metric_storage::MetricStorage)]
 struct Metrics {
     /// Timing of db queries.
     #[metric(name = "orderbook_database_queries", labels("type"))]
     database_queries: prometheus::HistogramVec,
+
+    /// Connections that got closed because they were still busy when they
+    /// were returned to the pool.
+    #[metric(name = "orderbook_database_busy_connections_closed")]
+    busy_connections_closed: prometheus::IntCounter,
 }
 
 impl Metrics {
     fn get() -> &'static Self {
         Metrics::instance(observe::metrics::get_storage_registry()).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, sqlx::Executor, std::time::Instant};
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_statement_timeout_cancels_slow_query() {
+        let config = Config {
+            statement_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let db = Postgres::try_new_with_timeout("postgresql://", config).unwrap();
+        let mut conn = db.pool.acquire().await.unwrap();
+
+        // A fast query should succeed.
+        conn.execute("SELECT 1").await.unwrap();
+
+        // A query exceeding the timeout should fail.
+        let err = conn
+            .execute("SELECT pg_sleep(5)")
+            .await
+            .expect_err("should have timed out");
+        let db_err = err.as_database_error().expect("should be a database error");
+        assert_eq!(db_err.code().as_deref(), Some("57014")); // query_canceled
+    }
+
+    async fn backend_pid(conn: &mut PgConnection) -> i32 {
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_busy_connection_gets_closed_on_release() {
+        let config = Config {
+            max_pool_size: 1,
+            connection_release_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let db = Postgres::try_new("postgresql://", config).unwrap();
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        let pid = backend_pid(&mut conn).await;
+        // Simulates a request that gets cancelled while its query is running.
+        let abandoned = async move { conn.execute("SELECT pg_sleep(30)").await };
+        tokio::time::timeout(Duration::from_millis(100), abandoned)
+            .await
+            .expect_err("query should still be running");
+
+        // The pool has a single connection, so this only succeeds in time if
+        // the busy connection got closed instead of waiting for its query.
+        let mut conn = tokio::time::timeout(Duration::from_secs(5), db.pool.acquire())
+            .await
+            .expect("busy connection should have been closed")
+            .unwrap();
+        assert_ne!(backend_pid(&mut conn).await, pid);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sqlx::query_scalar("SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1)")
+            .bind(pid)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "server should have aborted the abandoned query"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_idle_connection_gets_reused_on_release() {
+        let config = Config {
+            max_pool_size: 1,
+            ..Default::default()
+        };
+        let db = Postgres::try_new("postgresql://", config).unwrap();
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        let pid = backend_pid(&mut conn).await;
+        drop(conn);
+
+        // Rolling back an abandoned transaction is quick, so the connection
+        // should be reused as well.
+        let mut tx = db.pool.begin().await.unwrap();
+        assert_eq!(backend_pid(&mut tx).await, pid);
+        drop(tx);
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        assert_eq!(backend_pid(&mut conn).await, pid);
     }
 }

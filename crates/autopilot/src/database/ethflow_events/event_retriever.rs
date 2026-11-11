@@ -7,8 +7,9 @@ use {
         rpc::types::{Filter, FilterSet},
         sol_types::SolEvent,
     },
-    contracts::alloy::CoWSwapEthFlow::CoWSwapEthFlow,
-    shared::{event_handling::AlloyEventRetrieving, web3::Web3},
+    contracts::CoWSwapEthFlow::CoWSwapEthFlow,
+    ethrpc::Web3,
+    event_indexing::event_handler::AlloyEventRetrieving,
 };
 
 pub struct EthFlowRefundRetriever {

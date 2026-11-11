@@ -1,32 +1,34 @@
 use {
-    crate::domain,
     alloy::primitives::Address,
     chain::Chain,
-    contracts::alloy::{
+    contracts::{
         ChainalysisOracle,
+        FlashLoanRouter,
         GPv2AllowListAuthentication,
         GPv2Settlement,
         HooksTrampoline,
         WETH9,
         support::Balances,
     },
+    eth_domain_types as eth,
     ethrpc::Web3,
 };
 
 #[derive(Debug, Clone)]
 pub struct Contracts {
     settlement: GPv2Settlement::Instance,
-    signatures: contracts::alloy::support::Signatures::Instance,
+    signatures: contracts::support::Signatures::Instance,
     weth: WETH9::Instance,
     balances: Balances::Instance,
     chainalysis_oracle: Option<ChainalysisOracle::Instance>,
     trampoline: HooksTrampoline::Instance,
+    flashloan_router: Address,
 
     /// The authenticator contract that decides which solver is allowed to
     /// submit settlements.
     authenticator: GPv2AllowListAuthentication::Instance,
     /// The domain separator for settlement contract used for signing orders.
-    settlement_domain_separator: domain::eth::DomainSeparator,
+    settlement_domain_separator: eth::DomainSeparator,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ pub struct Addresses {
     pub weth: Option<Address>,
     pub balances: Option<Address>,
     pub trampoline: Option<Address>,
+    pub flashloan_router: Option<Address>,
 }
 
 impl Contracts {
@@ -48,10 +51,10 @@ impl Contracts {
             web3.provider.clone(),
         );
 
-        let signatures = contracts::alloy::support::Signatures::Instance::new(
+        let signatures = contracts::support::Signatures::Instance::new(
             addresses
                 .signatures
-                .or_else(|| contracts::alloy::support::Signatures::deployment_address(&chain.id()))
+                .or_else(|| contracts::support::Signatures::deployment_address(&chain.id()))
                 .unwrap(),
             web3.provider.clone(),
         );
@@ -80,11 +83,16 @@ impl Contracts {
             web3.provider.clone(),
         );
 
+        let flashloan_router = addresses
+            .flashloan_router
+            .or_else(|| FlashLoanRouter::deployment_address(&chain.id()))
+            .unwrap();
+
         let chainalysis_oracle = ChainalysisOracle::Instance::deployed(&web3.provider)
             .await
             .ok();
 
-        let settlement_domain_separator = domain::eth::DomainSeparator(
+        let settlement_domain_separator = eth::DomainSeparator(
             settlement
                 .domainSeparator()
                 .call()
@@ -111,6 +119,7 @@ impl Contracts {
             settlement_domain_separator,
             authenticator,
             trampoline,
+            flashloan_router,
         }
     }
 
@@ -122,7 +131,7 @@ impl Contracts {
         &self.balances
     }
 
-    pub fn signatures(&self) -> &contracts::alloy::support::Signatures::Instance {
+    pub fn signatures(&self) -> &contracts::support::Signatures::Instance {
         &self.signatures
     }
 
@@ -130,7 +139,7 @@ impl Contracts {
         &self.trampoline
     }
 
-    pub fn settlement_domain_separator(&self) -> &domain::eth::DomainSeparator {
+    pub fn settlement_domain_separator(&self) -> &eth::DomainSeparator {
         &self.settlement_domain_separator
     }
 
@@ -144,11 +153,15 @@ impl Contracts {
 
     /// Wrapped version of the native token (e.g. WETH for Ethereum, WXDAI for
     /// Gnosis Chain)
-    pub fn wrapped_native_token(&self) -> domain::eth::WrappedNativeToken {
+    pub fn wrapped_native_token(&self) -> eth::WrappedNativeToken {
         (*self.weth.address()).into()
     }
 
     pub fn authenticator(&self) -> &GPv2AllowListAuthentication::Instance {
         &self.authenticator
+    }
+
+    pub fn flashloan_router(&self) -> Address {
+        self.flashloan_router
     }
 }

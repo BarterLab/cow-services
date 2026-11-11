@@ -6,9 +6,13 @@ use {
             ext::{AnvilApi, ImpersonateConfig},
         },
     },
-    autopilot::config::Configuration,
     chrono::{NaiveDateTime, Utc},
-    contracts::alloy::{ERC20, IZeroex},
+    configs::{
+        autopilot::Configuration,
+        order_quoting::{ExternalSolver, OrderQuoting},
+        test_util::TestDefault,
+    },
+    contracts::{ERC20, IZeroex},
     e2e::{
         api::zeroex::{Eip712TypedZeroExOrder, ZeroExApi},
         assert_approximately_eq,
@@ -23,6 +27,7 @@ use {
         },
     },
     ethrpc::{Web3, alloy::CallBuilderExt},
+    liquidity_sources::zeroex,
     model::{
         order::{OrderCreation, OrderKind},
         signature::EcdsaSigningScheme,
@@ -31,7 +36,7 @@ use {
 };
 
 /// The block number from which we will fetch state for the forked tests.
-pub const FORK_BLOCK: u64 = 23112197;
+pub const FORK_BLOCK: u64 = 24843565;
 pub const USDT_WHALE: Address = address!("F977814e90dA44bFA03b6295A0616a897441aceC");
 pub const USDC_WHALE: Address = address!("28c6c06298d514db089934071355e5743bf21d60");
 
@@ -188,25 +193,25 @@ async fn zero_ex_liquidity(web3: Web3) {
         colocation::LiquidityProvider::ZeroEx {
             api_port: zeroex_api_port,
         },
-        false,
     );
-    let (_config_file, config_arg) =
-        Configuration::test("test_solver", solver.address()).to_cli_args();
 
     services
-        .start_autopilot(
-            None,
-            vec![
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-                config_arg,
-            ],
-        )
+        .start_autopilot(Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..Configuration::test("test_solver", solver.address())
+        })
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+                "test_quoter",
+                "http://localhost:11088/test_solver",
+            )]),
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
 
     // Drive solution
@@ -293,15 +298,16 @@ fn create_zeroex_liquidity_orders(
     zeroex_addr: Address,
     chain_id: u64,
     weth_address: Address,
-) -> [shared::zeroex_api::OrderRecord; 3] {
+) -> [zeroex::OrderRecord; 3] {
     let typed_order = Eip712TypedZeroExOrder {
         maker_token: order_creation.buy_token,
         taker_token: order_creation.sell_token,
         // fully covers execution costs
         maker_amount: u128::try_from(order_creation.buy_amount).unwrap() * 3,
         taker_amount: u128::try_from(order_creation.sell_amount).unwrap() * 2,
-        // makes 0x order partially filled, but the amount is higher than the cowswap order to
-        // make sure the 0x order is not overfilled in the end of the e2e test
+        // makes 0x order partially filled, but the amount is higher than the
+        // cowswap order to make sure the 0x order is not overfilled in the end
+        // of the e2e test
         remaining_fillable_taker_amount: (order_creation.sell_amount
             * alloy::primitives::U256::from(3)
             / alloy::primitives::U256::from(2))
@@ -320,8 +326,8 @@ fn create_zeroex_liquidity_orders(
     let usdt_weth_order = Eip712TypedZeroExOrder {
         maker_token: weth_address,
         taker_token: order_creation.buy_token,
-        // the value comes from the `--amount-to-estimate-prices-with` config to provide
-        // sufficient liquidity
+        // the value comes from the `--amount-to-estimate-prices-with` config to
+        // provide sufficient liquidity
         maker_amount: 1_000_000_000_000_000_000u128,
         taker_amount: order_creation.sell_amount.try_into().unwrap(),
         remaining_fillable_taker_amount: order_creation.sell_amount.try_into().unwrap(),
@@ -337,8 +343,8 @@ fn create_zeroex_liquidity_orders(
     let usdc_weth_order = Eip712TypedZeroExOrder {
         maker_token: weth_address,
         taker_token: order_creation.sell_token,
-        // the value comes from the `--amount-to-estimate-prices-with` config to provide
-        // sufficient liquidity
+        // the value comes from the `--amount-to-estimate-prices-with` config to
+        // provide sufficient liquidity
         maker_amount: 1_000_000_000_000_000_000u128,
         taker_amount: order_creation.sell_amount.try_into().unwrap(),
         remaining_fillable_taker_amount: order_creation.sell_amount.try_into().unwrap(),
@@ -363,7 +369,7 @@ struct ZeroExOrderAmounts {
 
 async fn get_zeroex_order_amounts(
     zeroex: &IZeroex::Instance,
-    zeroex_order: &shared::zeroex_api::OrderRecord,
+    zeroex_order: &zeroex::OrderRecord,
 ) -> anyhow::Result<ZeroExOrderAmounts> {
     Ok(zeroex
         .getLimitOrderRelevantState(
@@ -398,7 +404,7 @@ async fn get_zeroex_order_amounts(
 
 async fn fill_or_kill_zeroex_limit_order(
     zeroex: &IZeroex::Instance,
-    zeroex_order: &shared::zeroex_api::OrderRecord,
+    zeroex_order: &zeroex::OrderRecord,
     from: Address,
 ) -> anyhow::Result<B256> {
     let order = zeroex_order.order();

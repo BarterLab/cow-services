@@ -17,7 +17,7 @@ use {
             OnceLock,
             atomic::{AtomicBool, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     },
     tokio::task::JoinHandle,
 };
@@ -127,7 +127,9 @@ pub fn serve_metrics(
 
 // `/metrics` route exposing encoded prometheus data to monitoring system
 async fn handle_metrics() -> String {
-    encode(get_registry())
+    let mut text = encode(get_registry());
+    text.push_str(&crate::client_metrics::encode());
+    text
 }
 
 async fn handle_liveness_probe(
@@ -198,9 +200,15 @@ impl Metrics {
     }
 
     pub fn measure_auction_overhead(&self, start: Instant, component: &str, phase: &str) {
+        self.record_auction_overhead(start.elapsed(), component, phase);
+    }
+
+    /// Like [`Self::measure_auction_overhead`] but for a duration that was
+    /// timed elsewhere (e.g. serialization cost isolated from transmission).
+    pub fn record_auction_overhead(&self, elapsed: Duration, component: &str, phase: &str) {
         self.auction_overhead_time
             .with_label_values(&[component, phase])
-            .inc_by(start.elapsed().as_secs_f64());
+            .inc_by(elapsed.as_secs_f64());
 
         self.auction_overhead_count
             .with_label_values(&[component, phase])

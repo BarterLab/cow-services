@@ -1,23 +1,24 @@
 use {
-    super::{competition::solution::settlement, eth},
+    super::competition::solution::{GasFeeOverride, Settlement},
     crate::{
         domain::{
-            BlockNo,
-            competition::solution::Settlement,
-            eth::{TxId, TxStatus},
+            blockchain::TxStatus,
+            competition::solution::settlement::EncodedSettlement,
+            submission,
         },
-        infra::{self, Ethereum, observe, solver},
+        infra::{self, Ethereum, observe, solver::Account},
     },
     alloy::{
         consensus::Transaction,
-        eips::{BlockNumberOrTag, eip1559::Eip1559Estimation},
+        eips::eip1559::Eip1559Estimation,
         network::TxSigner,
-        providers::Provider,
+        primitives::Bytes,
     },
-    anyhow::Context,
-    ethrpc::block_stream::into_stream,
-    futures::{FutureExt, StreamExt, future::{join_all, select_ok}},
-    thiserror::Error,
+    anyhow::{Context, anyhow},
+    eth_domain_types::{self as eth, BlockNo, TxId},
+    futures::{FutureExt, StreamExt, future::select_ok},
+    itertools::Itertools,
+    num::Saturating,
     tracing::Instrument,
 };
 
@@ -27,8 +28,46 @@ use {
 /// we increase slightly more.
 const GAS_PRICE_BUMP_PCT: u64 = 13;
 
-/// The gas amount required to cancel a transaction.
-const CANCELLATION_GAS_AMOUNT: u64 = 21000;
+/// The gas amount required to cancel a transaction. Self-transfer intrinsic
+/// 21000 plus the fallback of the EIP-7702 delegate (21396 measured on
+/// mainnet).
+const CANCELLATION_GAS_AMOUNT: u64 = 22_000;
+
+/// How the settlement transaction should be submitted on-chain.
+#[derive(Debug, Clone)]
+pub enum SubmissionMode {
+    /// Solver EOA signs and submits directly to the settlement contract.
+    Direct(eth::Address),
+    /// A dedicated submission EOA signs and pays for the tx while routing it
+    /// through the solver's EIP-7702 delegate.
+    Delegated {
+        /// The address that signs the transaction and whose nonce is used.
+        submitter_eoa: eth::Address,
+        /// The solver EOA address. In EIP-7702 mode tx.to is set to this
+        /// address (which delegates to Solver7702Delegate), instead of the
+        /// settlement contract.
+        solver_eoa: eth::Address,
+    },
+}
+
+impl SubmissionMode {
+    /// A delegated submission changes both the destination and the calldata.
+    pub(crate) fn changes_transaction(&self, original_sender: eth::Address) -> bool {
+        !matches!(self, Self::Direct(sender) if *sender == original_sender)
+    }
+}
+
+/// Submits a settlement and waits until it is mined or the submission
+/// deadline passes.
+#[async_trait::async_trait]
+pub trait TransactionReceiver: Send + Sync + std::fmt::Debug {
+    async fn execute(
+        &self,
+        settlement: &EncodedSettlement,
+        submission_deadline: BlockNo,
+        mode: &SubmissionMode,
+    ) -> Result<eth::TxId, Error>;
+}
 
 /// The mempools used to execute settlements.
 #[derive(Debug, Clone)]
@@ -38,157 +77,184 @@ pub struct Mempools {
 }
 
 impl Mempools {
+    pub fn new(mempools: Vec<infra::Mempool>, ethereum: Ethereum) -> Self {
+        Self { mempools, ethereum }
+    }
+
     pub fn try_new(mempools: Vec<infra::Mempool>, ethereum: Ethereum) -> Result<Self, NoMempools> {
         if mempools.is_empty() {
-            Err(NoMempools)
-        } else {
-            Ok(Self { mempools, ethereum })
+            return Err(NoMempools);
         }
+        Ok(Self::new(mempools, ethereum))
     }
 
-    pub async fn nonce(&self, solver_account: solver::Account) -> Result<u64, Error> {
-        let address = solver_account.address();
-        // A single settlement fanout must use one canonical nonce source.
-        let nonce_block_number = self
+    pub async fn nonce(&self, account: Account) -> Result<u64, Error> {
+        let block = self
             .mempools
             .first()
-            .and_then(|mempool| mempool.config().nonce_block_number);
-        let call = self.ethereum.web3().provider.get_transaction_count(address);
-
-        match nonce_block_number {
-            Some(BlockNumberOrTag::Latest) => call.latest(),
-            Some(BlockNumberOrTag::Earliest) => call.earliest(),
-            Some(BlockNumberOrTag::Finalized) => call.finalized(),
-            Some(BlockNumberOrTag::Number(number)) => call.number(number),
-            Some(BlockNumberOrTag::Pending) => call.pending(),
-            Some(BlockNumberOrTag::Safe) => call.safe(),
-            None => call,
-        }
+            .and_then(|m| m.config().nonce_block_number);
+        infra::mempool::get_nonce(
+            &self.ethereum.web3().provider,
+            TxSigner::address(&account),
+            block,
+        )
         .await
-        .map_err(|err| Error::Other(anyhow::Error::from(err).context("failed to fetch nonce")))
+        .map_err(Error::Other)
     }
 
-    /// Publish a settlement to the mempools.
+    pub fn revert_protection(&self) -> RevertProtection {
+        if self
+            .mempools
+            .iter()
+            .any(|mempool| !mempool.reverts_can_get_mined())
+        {
+            RevertProtection::Enabled
+        } else {
+            RevertProtection::Disabled
+        }
+    }
+
     pub async fn execute(
         &self,
-        solver_account: solver::Account,
+        account: Account,
         settlement: &Settlement,
-        submission_deadline: BlockNo,
+        deadline: BlockNo,
     ) -> Result<eth::TxId, Error> {
-        let (submission, _remaining_futures) = select_ok(self.mempools.iter().map(|mempool| {
-            let solver_account = solver_account.clone();
-            async move {
-                let result = self
-                    .submit(
-                        mempool,
-                        solver_account,
-                        settlement,
-                        submission_deadline,
-                    )
-                    .instrument(tracing::info_span!("mempool", kind = mempool.to_string()))
-                    .await;
-                observe::mempool_executed(mempool, settlement, &result);
-                result
-            }
-            .boxed()
-        }))
-        .await?;
-
-        Ok(submission.tx_hash)
+        let protect = settlement.may_revert()
+            && matches!(self.revert_protection(), RevertProtection::Enabled);
+        let eligible = self
+            .mempools
+            .iter()
+            .filter(|pool| !protect || !pool.reverts_can_get_mined())
+            .cloned()
+            .collect();
+        let eligible =
+            Self::try_new(eligible, self.ethereum.clone()).map_err(anyhow::Error::from)?;
+        let encoded = settlement
+            .encode(&self.ethereum, Some(deadline))
+            .map_err(anyhow::Error::from)?;
+        TransactionReceiver::execute(
+            &eligible,
+            &encoded,
+            deadline,
+            &SubmissionMode::Direct(TxSigner::address(&account)),
+        )
+        .await
     }
 
-    /// Publish a settlement to the mempools.
+    /// Relay fanout uses a caller-reserved nonce for every endpoint.
     pub async fn execute_till_block(
         &self,
-        solver_account: solver::Account,
+        account: Account,
         nonce: u64,
         settlement: &Settlement,
         target_block: BlockNo,
     ) -> Result<Vec<Result<SubmissionSuccess, Error>>, Error> {
-        let results = join_all(self.mempools.iter().map(|mempool| {
-            let solver_account = solver_account.clone();
-            async move {
-                let result = self
-                    .submit_till_block(
-                        mempool,
-                        solver_account,
-                        nonce,
-                        settlement,
-                        target_block,
-                    )
-                    .instrument(tracing::info_span!("mempool", kind = mempool.to_string()))
-                    .await;
-                observe::mempool_executed(mempool, settlement, &result);
-                result
+        let target_block = settlement
+            .submission_deadline(target_block)
+            .context("requested deadline precedes exact simulation target")?;
+        let protect = settlement.may_revert()
+            && self
+                .mempools
+                .iter()
+                .any(|mempool| !mempool.reverts_can_get_mined());
+        let settlement = settlement
+            .encode(&self.ethereum, Some(target_block))
+            .map_err(anyhow::Error::from)?;
+        let mode = SubmissionMode::Direct(TxSigner::address(&account));
+        let results = futures::future::join_all(self.mempools.iter().map(|mempool| async {
+            if protect && mempool.reverts_can_get_mined() {
+                return Err(anyhow!("reverting transactions can be mined by this mempool").into());
             }
-            .boxed()
+            self.submit(
+                mempool,
+                &settlement,
+                target_block,
+                &mode,
+                Some((&account, nonce)),
+            )
+            .await
         }))
         .await;
-
+        self.update_metrics(&results.iter().map(Outcome::from).collect::<Vec<_>>());
         Ok(results)
     }
 
-    /// Defines if the mempools are configured in a way that guarantees that
-    /// settled solution will not revert.
-    pub fn revert_protection(&self) -> RevertProtection {
-        match self
-            .mempools
-            .iter()
-            .all(|mempool| mempool.reverts_can_get_mined())
-        {
-            true => RevertProtection::Disabled,
-            false => RevertProtection::Enabled,
+    async fn estimate(
+        &self,
+        tx: eth::Tx,
+        settlement: &EncodedSettlement,
+    ) -> Result<eth::Gas, infra::blockchain::Error> {
+        match &settlement.simulation_context {
+            Some(context) => {
+                self.ethereum
+                    .estimate_gas_with_simulation_context(tx, context)
+                    .await
+            }
+            None => {
+                self.ethereum
+                    .estimate_gas_with_state_overrides(
+                        tx,
+                        settlement.state_overrides.as_ref(),
+                        settlement.state_overrides_block,
+                    )
+                    .await
+            }
         }
     }
 
     async fn submit(
         &self,
         mempool: &infra::mempool::Mempool,
-        solver_account: solver::Account,
-        settlement: &Settlement,
+        settlement: &EncodedSettlement,
         submission_deadline: BlockNo,
+        mode: &SubmissionMode,
+        relay: Option<(&Account, u64)>,
     ) -> Result<SubmissionSuccess, Error> {
-        // Don't submit risky transactions if revert protection is
-        // enabled and the settlement may revert in this mempool.
-        if settlement.may_revert()
-            && matches!(self.revert_protection(), RevertProtection::Enabled)
-            && mempool.reverts_can_get_mined()
-        {
-            return Err(Error::Disabled);
-        }
+        let tx = prepare_submission(&settlement.internalized, mode);
+        let signer = tx.from;
 
-        let tx = settlement.transaction(settlement::Internalization::Enable);
-        let state_overrides = settlement.state_overrides();
-        let state_overrides_block = settlement.state_overrides_block();
-
-        // Instantiate block stream and skip the current block before we submit the
-        // settlement. This way we only run iterations in blocks that can potentially
-        // include the settlement.
-        let mut block_stream = into_stream(self.ethereum.current_block().clone());
-        block_stream.next().await;
+        // Only run iterations in blocks that can include the settlement.
+        let mut block_stream = submission::next_blocks(&self.ethereum).await;
 
         let current_block = self.ethereum.current_block().borrow().number;
-        // The tx is simulated before submitting the solution to the competition, but a
-        // delay between that and the actual execution can cause the simulation to be
-        // invalid which doesn't make sense to submit to the mempool anymore.
-        if mempool.reverts_can_get_mined() {
-            if let Err(err) = self
-                .ethereum
-                .estimate_gas_with_state_overrides(
-                    tx.clone(),
-                    state_overrides,
-                    state_overrides_block,
+        // The tx is simulated before submitting the solution to the
+        // competition, but a delay between that and the actual
+        // execution can cause the simulation to be invalid which
+        // doesn't make sense to submit to the mempool anymore.
+        if let Some(context) = &settlement.simulation_context {
+            if relay.is_none() {
+                return Err(anyhow!(
+                    "exact simulation context requires block-targeted bundle submission"
                 )
+                .into());
+            }
+            if submission_deadline.0 != context.target_block() {
+                return Err(
+                    anyhow!("submission deadline differs from exact simulation target").into(),
+                );
+            }
+        }
+        let needs_validation = settlement.simulation_context.is_some()
+            || mode.changes_transaction(settlement.internalized.from);
+        if needs_validation {
+            let gas = self
+                .estimate(tx.clone(), settlement)
                 .await
-            {
+                .context("validate prepared submission transaction")?;
+            if gas.0 > settlement.gas.limit.0 {
+                return Err(anyhow!("prepared submission exceeds its signed gas limit").into());
+            }
+        } else if mempool.reverts_can_get_mined() {
+            if let Err(err) = self.estimate(tx.clone(), settlement).await {
                 if err.is_revert() {
                     tracing::info!(
                         ?err,
                         "settlement tx simulation reverted before submitting to the mempool"
                     );
                     return Err(Error::SimulationRevert {
-                        submitted_at_block: current_block,
-                        reverted_at_block: current_block,
+                        submitted_at_block: current_block.into(),
+                        reverted_at_block: current_block.into(),
                     });
                 } else {
                     tracing::warn!(
@@ -201,23 +267,28 @@ impl Mempools {
             tracing::trace!("skipping tx simulation because mempool does not mine reverting txs");
         }
 
-        let nonce = mempool.get_nonce(solver_account.clone().address()).await?;
+        // Fetch the nonce for the signing account (not the solver in 7702
+        // mode).
+        let nonce = match relay {
+            Some((_, nonce)) => nonce,
+            None => mempool.get_nonce(signer).await?,
+        };
 
         // estimate the gas price such that the tx should still be included
-        // even if the gas price increases the maximum amount until the submission
-        // deadline
+        // even if the gas price increases the maximum amount until the
+        // submission deadline
         let current_gas_price = self
             .ethereum
             .gas_price()
             .await
             .context("failed to compute current gas price")?;
-        let submission_block = self.ethereum.current_block().borrow().number;
+        let submission_block = self.ethereum.current_block().borrow().number.into();
         let blocks_until_deadline = submission_deadline.saturating_sub(submission_block);
 
-        // if there is still a tx pending we also have to make sure we outbid that one
-        // enough to make the node replace it in the mempool
+        // if there is still a tx pending we also have to make sure we outbid
+        // that one enough to make the node replace it in the mempool
         let replacement_gas_price = self
-            .minimum_replacement_gas_price(mempool, solver_account.clone(), nonce)
+            .minimum_replacement_gas_price(mempool, signer, nonce)
             .await;
         let final_gas_price = match &replacement_gas_price {
             Some(replacement_gas_price)
@@ -228,23 +299,57 @@ impl Mempools {
             _ => current_gas_price,
         };
 
+        let final_gas_price = apply_gas_fee_override(
+            final_gas_price,
+            settlement.gas_fee_override,
+            replacement_gas_price.as_ref(),
+        );
+
         tracing::debug!(
-            submission_block,
-            blocks_until_deadline,
+            ?submission_block,
+            ?blocks_until_deadline,
             ?replacement_gas_price,
             ?current_gas_price,
             ?final_gas_price,
+            ?signer,
             "submitting settlement tx"
         );
-        let hash = mempool
-            .submit(
-                tx.clone(),
-                final_gas_price,
-                settlement.gas.limit,
-                solver_account.clone(),
+        if let Some(context) = &settlement.simulation_context {
+            self.ethereum
+                .ensure_simulation_context_current(context)
+                .await
+                .context("simulation expired before signing")?;
+        }
+        let hash = if let Some((account, _)) = relay {
+            let context = settlement.simulation_context.as_ref();
+            let first_block = match context {
+                Some(context) => context.target_block(),
+                None => submission_block
+                    .0
+                    .checked_add(1)
+                    .context("submission block overflow")?,
+            };
+            let relay = infra::mempool::RelaySubmission {
+                account,
                 nonce,
-            )
-            .await?;
+                chain_id: self.ethereum.chain().id(),
+                blocks: first_block..=submission_deadline.0,
+                exact_timestamp: context.map(|context| context.target_timestamp()),
+            };
+            mempool
+                .submit_till_block(tx.clone(), final_gas_price, settlement.gas.limit, relay)
+                .await?
+        } else {
+            mempool
+                .submit(
+                    tx.clone(),
+                    final_gas_price,
+                    settlement.gas.limit,
+                    signer,
+                    nonce,
+                )
+                .await?
+        };
 
         // Wait for the transaction to be mined, expired or failing.
         let result = async {
@@ -260,74 +365,104 @@ impl Mempools {
                     });
                 match receipt {
                     TxStatus::Executed { block_number } => return Ok(SubmissionSuccess {
-                        tx_hash: hash.clone(),
-                        submitted_at_block: submission_block.into(),
+                        tx_hash: hash,
+                        submitted_at_block: submission_block,
                         included_in_block: block_number,
                     }),
                     TxStatus::Reverted { block_number } => {
                         return Err(Error::Revert {
-                            tx_id: hash.clone(),
+                            tx_id: hash,
                             submitted_at_block: submission_block,
-                            reverted_at_block: block_number.into(),
+                            reverted_at_block: block_number,
                         })
                     }
                     TxStatus::Pending => {
                         // Check if the current block reached the submission deadline block number
-                        if block.number >= submission_deadline {
+                        if BlockNo(block.number) >= submission_deadline {
                             tracing::debug!(
-                                submission_deadline,
+                                submission_deadline = submission_deadline.0,
                                 current_block = block.number,
                                 settle_tx_hash = ?hash,
                                 "exceeded submission deadline, cancelling"
                             );
-                            let _ = self
-                                .cancel(mempool, final_gas_price, solver_account, nonce)
-                                .await;
+                            if relay.is_none() { let _ = self.cancel(mempool, final_gas_price, signer, nonce).await; }
                             return Err(Error::Expired {
-                                tx_id: hash.clone(),
+                                tx_id: hash,
                                 submitted_at_block: submission_block,
                                 submission_deadline,
                             });
                         }
-                        // Check if transaction still simulates
-                        if let Err(err) = self
-                            .ethereum
-                            .estimate_gas_with_state_overrides(
-                                tx.clone(),
-                                state_overrides,
-                                state_overrides_block,
-                            )
-                            .await
-                        {
-                            if err.is_revert() {
-                                tracing::info!(
-                                    settle_tx_hash = ?hash,
-                                    ?err,
-                                    "tx started failing in mempool, cancelling"
-                                );
-                                let _ = self
-                                    .cancel(mempool, final_gas_price, solver_account, nonce)
-                                    .await;
-                                return Err(Error::SimulationRevert {
-                                    submitted_at_block: submission_block,
-                                    reverted_at_block: block.number,
-                                });
-                            } else {
-                                tracing::warn!(?hash, ?err, "couldn't re-simulate tx");
-                            }
+                        // A node can report a new block before its receipt index catches up,
+                        // so re-simulating reverts on our own already-applied tx. Tell that
+                        // apart from a real revert with two signals: our `Settlement` event in
+                        // any block since submission (which `eth_getLogs` sees even while the
+                        // receipt lags), and the signer's pending nonce (which still covers our
+                        // tx while it sits in the mempool).
+                        let (gas, mined, pending_nonce) = futures::join!(
+                            self.estimate(tx.clone(), settlement),
+                            self.ethereum
+                                .successful_settlement_block(hash, submission_block.0),
+                            self.ethereum.pending_transaction_count(signer),
+                        );
+
+                        if let Ok(Some(included_in_block)) = mined {
+                            // Found on-chain in [submission_block, head]. The receipt-by-hash
+                            // lookup is just lagging, and scanning the whole range catches it
+                            // even if the block stream coalesced past the block it mined in.
+                            // Report success now rather than wait on the receipt and risk the
+                            // deadline.
+                            tracing::info!(
+                                ?hash,
+                                ?included_in_block,
+                                "settlement found on-chain via getLogs, treating as success"
+                            );
+                            return Ok(SubmissionSuccess {
+                                tx_hash: hash,
+                                submitted_at_block: submission_block,
+                                included_in_block,
+                            });
+                        }
+
+                        let resimulation_reverted = matches!(&gas, Err(err) if err.is_revert());
+                        if requires_cancellation(resimulation_reverted, &pending_nonce, nonce) {
+                            tracing::info!(
+                                settle_tx_hash = ?hash,
+                                err = ?gas.as_ref().err(),
+                                "tx started failing in mempool, cancelling"
+                            );
+                            if relay.is_none() { let _ = self.cancel(mempool, final_gas_price, signer, nonce).await; }
+                            return Err(Error::SimulationRevert {
+                                submitted_at_block: submission_block,
+                                reverted_at_block: block.number.into(),
+                            });
+                        } else if let Err(err) = &pending_nonce {
+                            tracing::warn!(
+                                ?hash,
+                                ?err,
+                                "couldn't fetch the pending nonce, not cancelling"
+                            );
+                        } else if resimulation_reverted {
+                            tracing::debug!(
+                                ?hash,
+                                "detected false positive revert (already pending tx conflicted \
+                                 with our simulation), waiting for next block"
+                            );
+                        } else if let Err(err) = &gas {
+                            tracing::warn!(?hash, ?err, "couldn't re-simulate tx");
                         }
                     }
                 }
             }
-            Err(Error::Other(anyhow::anyhow!(
+            Err(Error::Other(anyhow!(
                 "Block stream finished unexpectedly"
             )))
         }
         .await;
 
         if result.is_err() {
-            // Do one last attempt to see if the transaction was confirmed (in case of race
-            // conditions or misclassified errors like `OrderFilled` simulation failures).
+            // One last check in case the tx landed after the loop exited, e.g.
+            // the receipt finally caught up to a block we had
+            // already processed.
             if let Ok(TxStatus::Executed { block_number }) =
                 self.ethereum.transaction_status(&hash).await
             {
@@ -339,213 +474,7 @@ impl Mempools {
                 return Ok(SubmissionSuccess {
                     tx_hash: hash,
                     included_in_block: block_number,
-                    submitted_at_block: submission_block.into(),
-                });
-            }
-        }
-        result
-    }
-
-    async fn submit_till_block(
-        &self,
-        mempool: &infra::mempool::Mempool,
-        solver_account: solver::Account,
-        nonce: u64,
-        settlement: &Settlement,
-        submission_deadline: BlockNo,
-    ) -> Result<SubmissionSuccess, Error> {
-        // Don't submit risky transactions if revert protection is
-        // enabled and the settlement may revert in this mempool.
-        if settlement.may_revert()
-            && matches!(self.revert_protection(), RevertProtection::Enabled)
-            && mempool.reverts_can_get_mined()
-        {
-            return Err(Error::Disabled);
-        }
-
-        let tx = settlement.transaction(settlement::Internalization::Enable);
-        let state_overrides = settlement.state_overrides();
-        let state_overrides_block = settlement.state_overrides_block();
-
-        // Instantiate block stream and skip the current block before we submit the
-        // settlement. This way we only run iterations in blocks that can potentially
-        // include the settlement.
-        let mut block_stream = into_stream(self.ethereum.current_block().clone());
-        block_stream.next().await;
-
-        let current_block = self.ethereum.current_block().borrow().number;
-        // The tx is simulated before submitting the solution to the competition, but a
-        // delay between that and the actual execution can cause the simulation to be
-        // invalid which doesn't make sense to submit to the mempool anymore.
-        if mempool.reverts_can_get_mined() {
-            if let Err(err) = self
-                .ethereum
-                .estimate_gas_with_state_overrides(
-                    tx.clone(),
-                    state_overrides,
-                    state_overrides_block,
-                )
-                .await
-            {
-                if err.is_revert() {
-                    tracing::info!(
-                        ?err,
-                        "settlement tx simulation reverted before submitting to the mempool"
-                    );
-                    return Err(Error::SimulationRevert {
-                        submitted_at_block: current_block,
-                        reverted_at_block: current_block,
-                    });
-                } else {
-                    tracing::warn!(
-                        ?err,
-                        "couldn't simulate tx before submitting to the mempool"
-                    );
-                }
-            }
-        } else {
-            tracing::trace!("skipping tx simulation because mempool does not mine reverting txs");
-        }
-
-        // estimate the gas price such that the tx should still be included
-        // even if the gas price increases the maximum amount until the submission
-        // deadline
-        let current_gas_price = self
-            .ethereum
-            .gas_price()
-            .await
-            .context("failed to compute current gas price")?;
-        let submission_block = self.ethereum.current_block().borrow().number;
-        let blocks_until_deadline = submission_deadline.saturating_sub(submission_block);
-
-        // if there is still a tx pending we also have to make sure we outbid that one
-        // enough to make the node replace it in the mempool
-        let replacement_gas_price = self
-            .minimum_replacement_gas_price(mempool, solver_account.clone(), nonce)
-            .await;
-        let final_gas_price = match &replacement_gas_price {
-            Some(replacement_gas_price)
-                if replacement_gas_price.max_fee_per_gas > current_gas_price.max_fee_per_gas =>
-            {
-                *replacement_gas_price
-            }
-            _ => current_gas_price,
-        };
-
-        tracing::debug!(
-            submission_block,
-            blocks_until_deadline,
-            ?replacement_gas_price,
-            ?current_gas_price,
-            ?final_gas_price,
-            "submitting settlement tx"
-        );
-        let hash = mempool
-            .submit_till_block(
-                tx.clone(),
-                final_gas_price,
-                settlement.gas.limit,
-                solver_account.clone(),
-                nonce,
-                current_block,
-                submission_deadline,
-            )
-            .await?;
-
-        // Wait for the transaction to be mined, expired or failing.
-        let result = async {
-            while let Some(block) = block_stream.next().await {
-                tracing::debug!(?hash, current_block = ?block.number, "checking if tx is confirmed");
-                let receipt = self
-                    .ethereum
-                    .transaction_status(&hash)
-                    .await
-                    .unwrap_or_else(|err| {
-                        tracing::warn!(?hash, ?err, "failed to get transaction status",);
-                        TxStatus::Pending
-                    });
-                match receipt {
-                    TxStatus::Executed { block_number } => return Ok(SubmissionSuccess {
-                        tx_hash: hash.clone(),
-                        submitted_at_block: submission_block.into(),
-                        included_in_block: block_number,
-                    }),
-                    TxStatus::Reverted { block_number } => {
-                        return Err(Error::Revert {
-                            tx_id: hash.clone(),
-                            submitted_at_block: submission_block,
-                            reverted_at_block: block_number.into(),
-                        })
-                    }
-                    TxStatus::Pending => {
-                        // Check if the current block reached the submission deadline block number
-                        if block.number >= submission_deadline {
-                            tracing::debug!(
-                                submission_deadline,
-                                current_block = block.number,
-                                settle_tx_hash = ?hash,
-                                "exceeded submission deadline, cancelling"
-                            );
-                            let _ = self
-                                .cancel(mempool, final_gas_price, solver_account, nonce)
-                                .await;
-                            return Err(Error::Expired {
-                                tx_id: hash.clone(),
-                                submitted_at_block: submission_block,
-                                submission_deadline,
-                            });
-                        }
-                        // Check if transaction still simulates
-                        if let Err(err) = self
-                            .ethereum
-                            .estimate_gas_with_state_overrides(
-                                tx.clone(),
-                                state_overrides,
-                                state_overrides_block,
-                            )
-                            .await
-                        {
-                            if err.is_revert() {
-                                tracing::info!(
-                                    settle_tx_hash = ?hash,
-                                    ?err,
-                                    "tx started failing in mempool, cancelling"
-                                );
-                                let _ = self
-                                    .cancel(mempool, final_gas_price, solver_account, nonce)
-                                    .await;
-                                return Err(Error::SimulationRevert {
-                                    submitted_at_block: submission_block,
-                                    reverted_at_block: block.number,
-                                });
-                            } else {
-                                tracing::warn!(?hash, ?err, "couldn't re-simulate tx");
-                            }
-                        }
-                    }
-                }
-            }
-            Err(Error::Other(anyhow::anyhow!(
-                "Block stream finished unexpectedly"
-            )))
-        }
-        .await;
-
-        if result.is_err() {
-            // Do one last attempt to see if the transaction was confirmed (in case of race
-            // conditions or misclassified errors like `OrderFilled` simulation failures).
-            if let Ok(TxStatus::Executed { block_number }) =
-                self.ethereum.transaction_status(&hash).await
-            {
-                tracing::info!(
-                    ?hash,
-                    ?block_number,
-                    "Found confirmed transaction, ignoring error"
-                );
-                return Ok(SubmissionSuccess {
-                    tx_hash: hash,
-                    included_in_block: block_number,
-                    submitted_at_block: submission_block.into(),
+                    submitted_at_block: submission_block,
                 });
             }
         }
@@ -558,12 +487,12 @@ impl Mempools {
         &self,
         mempool: &infra::mempool::Mempool,
         original_tx_gas_price: Eip1559Estimation,
-        solver_account: solver::Account,
+        signer: eth::Address,
         nonce: u64,
     ) -> Result<TxId, Error> {
         let fallback_gas_price = original_tx_gas_price.scaled_by_pct(GAS_PRICE_BUMP_PCT);
         let replacement_gas_price = self
-            .minimum_replacement_gas_price(mempool, solver_account.clone(), nonce)
+            .minimum_replacement_gas_price(mempool, signer, nonce)
             .await;
 
         // the node is the ultimate source of truth to compute the minimum
@@ -575,8 +504,8 @@ impl Mempools {
         };
 
         let cancellation = eth::Tx {
-            from: solver_account.address(),
-            to: solver_account.address(),
+            from: signer,
+            to: signer,
             value: 0.into(),
             input: Default::default(),
             access_list: Default::default(),
@@ -594,7 +523,7 @@ impl Mempools {
                 cancellation,
                 final_gas_price,
                 CANCELLATION_GAS_AMOUNT.into(),
-                solver_account,
+                signer,
                 nonce,
             )
             .await
@@ -607,22 +536,23 @@ impl Mempools {
     async fn minimum_replacement_gas_price(
         &self,
         mempool: &infra::Mempool,
-        solver_account: solver::Account,
+        signer: eth::Address,
         next_nonce: u64,
     ) -> Option<Eip1559Estimation> {
-        if let Some(last_submission) = mempool.last_submission(solver_account.clone()) {
+        if let Some(last_submission) = mempool.last_submission(signer) {
             if last_submission.nonce == next_nonce {
                 Some(last_submission.gas_price.scaled_by_pct(GAS_PRICE_BUMP_PCT))
             } else {
                 None
             }
         } else {
-            // If we don't have the last submission in-memory (i.e. first submission
-            // attempt after a restart) we try to inspect the nodes transaction mempool.
-            // This is only done as a backup since it can incur significant latency and
+            // If we don't have the last submission in-memory (i.e. first
+            // submission attempt after a restart) we try to inspect
+            // the nodes transaction mempool. This is only done as a
+            // backup since it can incur significant latency and
             // is generally not very widely supported.
             let pending_tx = mempool
-                .find_pending_tx_in_mempool(solver_account, next_nonce)
+                .find_pending_tx_in_mempool(signer, next_nonce)
                 .await
                 .inspect_err(|err| tracing::debug!(?err, "could not inspect tx mempool"))
                 .ok()??;
@@ -638,26 +568,215 @@ impl Mempools {
             Some(pending_tx_gas_price.scaled_by_pct(GAS_PRICE_BUMP_PCT))
         }
     }
+
+    /// Update per-mempool metrics based on submission outcomes.
+    ///
+    /// When a winner exists, `Failed` outcomes are reclassified as `Superseded`
+    /// since errors are typically race-condition false-positives.
+    fn update_metrics(&self, stats: &[Outcome]) {
+        let winner_exists = stats.iter().any(|s| matches!(s, Outcome::Success { .. }));
+        // Using `zip_eq` to catch regressions in tests (sizes always match in
+        // practice).
+        for (mempool, &outcome) in self.mempools.iter().zip_eq(stats.iter()) {
+            let label = match outcome {
+                Outcome::Failed { .. } if winner_exists => Outcome::Superseded.metric_label(),
+                other => other.metric_label(),
+            };
+            observe::mempool_submission_result(
+                &mempool.to_string(),
+                label,
+                outcome.blocks_passed(),
+            );
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionReceiver for Mempools {
+    /// Race the mempools concurrently; first success wins. Pending
+    /// submission futures are dropped at that point and every other mempool is
+    /// recorded as `Superseded`. If every mempool fails, return one of the
+    /// failure errors.
+    async fn execute(
+        &self,
+        settlement: &EncodedSettlement,
+        submission_deadline: BlockNo,
+        mode: &SubmissionMode,
+    ) -> Result<eth::TxId, Error> {
+        let mut stats = vec![Outcome::Superseded; self.mempools.len()];
+
+        let res = select_ok(
+            self.mempools
+                .iter()
+                .zip(stats.iter_mut())
+                .map(|(mempool, stat)| {
+                    async move {
+                        let result = self
+                            .submit(mempool, settlement, submission_deadline, mode, None)
+                            .instrument(tracing::info_span!("mempool", kind = %mempool))
+                            .await;
+                        // Log inline so errors from mempools that later get
+                        // superseded still surface;
+                        // metrics are emitted from `update_metrics` once the
+                        // race outcome is known.
+                        observe::mempool_log(mempool, settlement, &result);
+                        *stat = Outcome::from(&result);
+                        result
+                    }
+                    .boxed()
+                }),
+        )
+        .await
+        // Drop the remaining futures (and the mutable borrow on `stats` they
+        // carry) so `update_metrics` can read `stats` below.
+        .map(|(success, _remaining)| success);
+
+        self.update_metrics(&stats);
+
+        Ok(res?.tx_hash)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Outcome {
+    /// Submission future was dropped because another mempool won the race.
+    Superseded,
+    Success {
+        blocks_passed: u64,
+    },
+    Failed {
+        reason: &'static str,
+        blocks_passed: Option<u64>,
+    },
+}
+
+impl Outcome {
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            Outcome::Superseded => "Superseded",
+            Outcome::Success { .. } => "Success",
+            Outcome::Failed { reason, .. } => reason,
+        }
+    }
+
+    pub(crate) fn blocks_passed(self) -> Option<u64> {
+        match self {
+            Outcome::Superseded => None,
+            Outcome::Success { blocks_passed } => Some(blocks_passed),
+            Outcome::Failed { blocks_passed, .. } => blocks_passed,
+        }
+    }
+}
+
+impl From<&Result<SubmissionSuccess, Error>> for Outcome {
+    fn from(result: &Result<SubmissionSuccess, Error>) -> Self {
+        match result {
+            Ok(s) => Outcome::Success {
+                blocks_passed: s.blocks_passed(),
+            },
+            Err(err @ (Error::Revert { .. } | Error::SimulationRevert { .. })) => Outcome::Failed {
+                reason: "Revert",
+                blocks_passed: err.blocks_passed(),
+            },
+            Err(err @ Error::Expired { .. }) => Outcome::Failed {
+                reason: "Expired",
+                blocks_passed: err.blocks_passed(),
+            },
+            Err(Error::Other(_)) => Outcome::Failed {
+                reason: "Other",
+                blocks_passed: None,
+            },
+        }
+    }
+}
+
+/// Applies the solver's gas fee override if present. When a replacement
+/// transaction is pending, the solver's values are raised to at least the
+/// replacement minimum (a node requirement).
+pub(crate) fn apply_gas_fee_override(
+    driver_estimate: Eip1559Estimation,
+    solver_override: Option<GasFeeOverride>,
+    replacement_price: Option<&Eip1559Estimation>,
+) -> Eip1559Estimation {
+    let Some(gas_override) = solver_override else {
+        return driver_estimate;
+    };
+    let solver_price = Eip1559Estimation {
+        max_fee_per_gas: gas_override.max_fee_per_gas,
+        max_priority_fee_per_gas: gas_override.max_priority_fee_per_gas,
+    };
+    match replacement_price {
+        Some(replacement) => Eip1559Estimation {
+            max_fee_per_gas: std::cmp::max(
+                solver_price.max_fee_per_gas,
+                replacement.max_fee_per_gas,
+            ),
+            max_priority_fee_per_gas: std::cmp::max(
+                solver_price.max_priority_fee_per_gas,
+                replacement.max_priority_fee_per_gas,
+            ),
+        },
+        None => solver_price,
+    }
+}
+
+/// In EIP-7702 mode, reroute the tx through the solver EOA's delegate. Its
+/// fallback expects the 20-byte target address followed by target calldata.
+/// `from` is the submitter EOA so simulations see the correct `msg.sender`
+/// for the delegate's caller whitelist. The solver EOA is in `tx.to` and
+/// becomes `address(this)` when the delegate runs.
+pub(crate) fn prepare_submission(tx: &eth::Tx, mode: &SubmissionMode) -> eth::Tx {
+    let mut tx = tx.clone();
+    match mode {
+        SubmissionMode::Direct(solver_eoa) => {
+            tx.from = *solver_eoa;
+            tx
+        }
+        SubmissionMode::Delegated {
+            submitter_eoa,
+            solver_eoa,
+        } => {
+            let original_target = tx.to;
+            tx.from = *submitter_eoa;
+            tx.to = *solver_eoa;
+            tx.input = delegated_calldata(original_target, &tx.input);
+            tx
+        }
+    }
+}
+
+fn delegated_calldata(target: eth::Address, calldata: &Bytes) -> Bytes {
+    let mut input = Vec::with_capacity(target.len() + calldata.len());
+    input.extend_from_slice(target.as_slice());
+    input.extend_from_slice(calldata);
+    input.into()
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("no mempools configured")]
+pub struct NoMempools;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevertProtection {
+    Enabled,
+    Disabled,
 }
 
 pub struct SubmissionSuccess {
     pub tx_hash: eth::TxId,
-    /// At which block we started to submit the transaction.
-    pub included_in_block: eth::BlockNo,
     /// In which block the transaction actually appeared onchain.
+    pub included_in_block: eth::BlockNo,
+    /// At which block we started to submit the transaction.
     pub submitted_at_block: eth::BlockNo,
 }
 
-#[derive(Debug, Error)]
-#[error("no mempools configured, cannot execute settlements")]
-pub struct NoMempools;
-
-/// Defines if the mempools are configured in a way that guarantees that
-/// /settle'd solution will not revert.
-#[derive(Debug, Clone, Copy)]
-pub enum RevertProtection {
-    Enabled,
-    Disabled,
+impl SubmissionSuccess {
+    /// Number of blocks between submission start and on-chain inclusion.
+    pub fn blocks_passed(&self) -> u64 {
+        self.included_in_block
+            .saturating_sub(self.submitted_at_block)
+            .0
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -688,8 +807,118 @@ pub enum Error {
         submitted_at_block: BlockNo,
         submission_deadline: BlockNo,
     },
-    #[error("Strategy disabled for this tx")]
-    Disabled,
     #[error("Failed to submit: {0:?}")]
     Other(#[from] anyhow::Error),
+}
+
+impl Error {
+    /// Number of blocks between the first submission and when the error was
+    /// returned, if the error carries that timing.
+    pub fn blocks_passed(&self) -> Option<u64> {
+        let (start, end) = match self {
+            Self::Revert {
+                submitted_at_block,
+                reverted_at_block,
+                ..
+            }
+            | Self::SimulationRevert {
+                submitted_at_block,
+                reverted_at_block,
+            } => (*submitted_at_block, *reverted_at_block),
+            Self::Expired {
+                submitted_at_block,
+                submission_deadline,
+                ..
+            } => (*submitted_at_block, *submission_deadline),
+            Self::Other(_) => return None,
+        };
+        Some(end.saturating_sub(start).0)
+    }
+}
+
+/// Whether a submitted settlement whose receipt is missing should be cancelled.
+/// We cancel only when the re-simulation reverts and the signer's pending nonce
+/// shows our tx is gone from the mempool (`pending_nonce <= submission_nonce`,
+/// so it was neither mined nor is it still queued). While the tx is still
+/// queued the revert is just our own pending tx re-applied, a false positive,
+/// so we keep waiting. A failed nonce lookup counts as "unknown" and never
+/// cancels.
+fn requires_cancellation<E>(
+    resimulation_reverted: bool,
+    pending_nonce: &Result<u64, E>,
+    submission_nonce: u64,
+) -> bool {
+    resimulation_reverted && matches!(pending_nonce, Ok(n) if *n <= submission_nonce)
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        alloy::primitives::{Bytes, address},
+    };
+
+    const ORIGINAL_FROM: eth::Address = address!("0000000000000000000000000000000000000001");
+    const SETTLEMENT: eth::Address = address!("0000000000000000000000000000000000000002");
+    const SOLVER: eth::Address = address!("0000000000000000000000000000000000000003");
+    const SUBMITTER: eth::Address = address!("0000000000000000000000000000000000000004");
+
+    fn tx(input: Bytes) -> eth::Tx {
+        eth::Tx {
+            from: ORIGINAL_FROM,
+            to: SETTLEMENT,
+            value: 0.into(),
+            input,
+            access_list: Default::default(),
+        }
+    }
+
+    #[test]
+    fn delegated_submission_rewrites_transaction() {
+        let prepared = prepare_submission(
+            &tx(Bytes::from_static(&[0xaa, 0xbb])),
+            &SubmissionMode::Delegated {
+                submitter_eoa: SUBMITTER,
+                solver_eoa: SOLVER,
+            },
+        );
+        let mut expected = SETTLEMENT.as_slice().to_vec();
+        expected.extend_from_slice(&[0xaa, 0xbb]);
+
+        assert_eq!(prepared.from, SUBMITTER);
+        assert_eq!(prepared.to, SOLVER);
+        assert_eq!(prepared.input, Bytes::from(expected));
+    }
+
+    const SUBMISSION_NONCE: u64 = 7;
+    const STILL_QUEUED: Result<u64, ()> = Ok(8); // pending advanced past our nonce
+    const DROPPED: Result<u64, ()> = Ok(7); // pending still at our nonce, tx is gone
+    const NONCE_LOOKUP_FAILED: Result<u64, ()> = Err(());
+
+    #[test]
+    fn cancels_only_when_reverted_and_tx_left_the_mempool() {
+        // Reverted and the tx is no longer queued: a real revert, cancel.
+        assert!(requires_cancellation(true, &DROPPED, SUBMISSION_NONCE));
+        // Reverted but still queued: the revert is our own pending tx, so wait.
+        assert!(!requires_cancellation(
+            true,
+            &STILL_QUEUED,
+            SUBMISSION_NONCE
+        ));
+        // Re-simulation still succeeds: wait regardless of the nonce.
+        assert!(!requires_cancellation(false, &DROPPED, SUBMISSION_NONCE));
+    }
+
+    #[test]
+    fn failed_nonce_lookup_never_cancels() {
+        // An unknown pending nonce must never trigger a cancel, even on a
+        // revert. Otherwise a flaky nonce lookup reverts to the
+        // original bug: cancelling a tx that may have mined or is still
+        // queued.
+        assert!(!requires_cancellation(
+            true,
+            &NONCE_LOOKUP_FAILED,
+            SUBMISSION_NONCE
+        ));
+    }
 }

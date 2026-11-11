@@ -4,7 +4,7 @@
 //! and update the metrics, if the event is worth measuring.
 
 use {
-    super::{Ethereum, Mempool, simulator, solver::Timeouts},
+    super::{Mempool, solver::Timeouts},
     crate::{
         boundary,
         domain::{
@@ -13,17 +13,18 @@ use {
                 self,
                 Solution,
                 Solved,
-                solution::{self, Settlement},
+                solution::{self, Settlement, settlement::EncodedSettlement},
             },
-            eth::{self, Gas},
             mempools::{self, SubmissionSuccess},
             quote::{self, Quote},
             time::{Deadline, Remaining},
         },
-        infra::solver,
+        infra::{builders::Delivery, solver},
         util::http,
     },
+    eth_domain_types as eth,
     ethrpc::block_stream::BlockInfo,
+    observe::tracing::lazy::Lazy,
     std::{
         collections::{BTreeMap, HashSet},
         time::Duration,
@@ -36,7 +37,7 @@ pub mod metrics;
 /// Setup the observability. The log argument configures the tokio tracing
 /// framework.
 pub fn init(obs_config: observe::Config) {
-    observe::tracing::initialize_reentrant(&obs_config);
+    observe::tracing::init::initialize_reentrant(&obs_config);
     metrics::init();
     #[cfg(unix)]
     observe::heap_dump_handler::spawn_heap_dump_handler();
@@ -126,22 +127,17 @@ pub fn encoding_failed(
     solver: &solver::Name,
     id: &solution::Id,
     err: &solution::Error,
-    has_haircut: bool,
+    orders: &[competition::order::Uid],
 ) {
     tracing::info!(
         ?id,
+        ?orders,
         ?err,
-        has_haircut,
         "discarded solution: settlement encoding"
     );
-    let reason = if has_haircut {
-        "SettlementEncodingHaircut"
-    } else {
-        "SettlementEncoding"
-    };
     metrics::get()
         .dropped_solutions
-        .with_label_values(&[solver.as_str(), reason])
+        .with_label_values(&[solver.as_str(), "SettlementEncoding"])
         .inc();
 }
 
@@ -179,26 +175,11 @@ pub fn score(settlement: &Settlement, score: &eth::Ether) {
 
 // Observe that the winning settlement started failing upon arrival of a new
 // block
-pub fn winner_voided(
-    solver: &solver::Name,
-    block: BlockInfo,
-    err: &simulator::RevertError,
-    has_haircut: bool,
-) {
-    tracing::warn!(
-        block = block.number,
-        ?err,
-        has_haircut,
-        "solution reverts on new block"
-    );
-    let reason = if has_haircut {
-        "SimulationRevertHaircut"
-    } else {
-        "SimulationRevert"
-    };
+pub fn winner_voided(solver: &solver::Name, block: BlockInfo, err: &simulator::RevertError) {
+    tracing::warn!(block = block.number, ?err, "solution reverts on new block");
     metrics::get()
         .dropped_solutions
-        .with_label_values(&[solver.as_str(), reason])
+        .with_label_values(&[solver.as_str(), "SimulationRevert"])
         .inc();
 }
 
@@ -251,21 +232,21 @@ pub fn settled(solver: &solver::Name, result: &Result<competition::Settled, comp
 }
 
 /// Observe the result of solving an auction.
-pub fn solved(solver: &str, result: &Result<Option<Solved>, competition::Error>) {
+pub fn solved(solver: &str, result: &Result<Vec<Solved>, competition::Error>) {
     match result {
-        Ok(Some(solved)) => {
-            tracing::info!(?solved, "solved auction");
-            metrics::get()
-                .solutions
-                .with_label_values(&[solver, "Success"])
-                .inc();
-        }
-        Ok(None) => {
+        Ok(solutions) if solutions.is_empty() => {
             tracing::debug!("no solution found");
             metrics::get()
                 .solutions
                 .with_label_values(&[solver, "SolutionNotFound"])
                 .inc();
+        }
+        Ok(solutions) => {
+            tracing::info!(?solutions, "solved auction");
+            metrics::get()
+                .solutions
+                .with_label_values(&[solver, "Success"])
+                .inc_by(solutions.len() as u64);
         }
         Err(err) => {
             tracing::warn!(?err, "failed to solve auction");
@@ -278,7 +259,11 @@ pub fn solved(solver: &str, result: &Result<Option<Solved>, competition::Error>)
 }
 
 /// Observe the result of quoting an auction.
-pub fn quoted(solver: &solver::Name, order: &quote::Order, result: &Result<Quote, quote::Error>) {
+pub fn quoted(
+    solver: &solver::Name,
+    order: &impl std::fmt::Debug,
+    result: &Result<Quote, quote::Error>,
+) {
     match result {
         Ok(quote) => {
             tracing::info!(?order, ?quote, "quoted order");
@@ -304,6 +289,12 @@ pub fn quoted(solver: &solver::Name, order: &quote::Order, result: &Result<Quote
                             "NoSolutions"
                         }
                         quote::Error::QuotingFailed(quote::QuotingFailed::Math) => "MathError",
+                        quote::Error::QuotingFailed(quote::QuotingFailed::UnsupportedToken) => {
+                            "UnsupportedToken"
+                        }
+                        quote::Error::QuotingFailed(quote::QuotingFailed::FastPathNotSupported) => {
+                            "FastPathNotSupported"
+                        }
                         quote::Error::DeadlineExceeded(_) => "DeadlineExceeded",
                         quote::Error::Blockchain(_) => "BlockchainError",
                         quote::Error::Solver(solver::Error::Http(_)) => "SolverHttpError",
@@ -311,6 +302,7 @@ pub fn quoted(solver: &solver::Name, order: &quote::Order, result: &Result<Quote
                             "SolverDeserializeError"
                         }
                         quote::Error::Solver(solver::Error::Dto(_)) => "SolverDtoError",
+                        quote::Error::Solver(solver::Error::CustomError(_)) => "SolverCustomError",
                         quote::Error::Boundary(_) => "Unknown",
                         quote::Error::Encoding(_) => "Encoding",
                     },
@@ -326,8 +318,24 @@ pub fn mounting_solver(solver: &solver::Name, path: &str) {
 }
 
 /// Observe that a request is about to be sent to the solver.
-pub fn solver_request(endpoint: &Url, req: &str) {
+pub fn solver_request(endpoint: &Url, req: impl AsRef<[u8]>) {
+    let req = Lazy(|| String::from_utf8_lossy(req.as_ref()));
     tracing::trace!(%endpoint, %req, "sending request to solver");
+}
+
+/// Observe how long serializing and streaming the solve request body to a
+/// solver took, both the isolated serialization cost and the total including
+/// the solver transfer.
+pub fn serialized_solve_request(solver: &solver::Name, serialize: Duration, total: Duration) {
+    let metrics = metrics::get();
+    metrics
+        .solve_request_body_time
+        .with_label_values(&[solver.as_str(), "serialization"])
+        .observe(serialize.as_secs_f64());
+    metrics
+        .solve_request_body_time
+        .with_label_values(&[solver.as_str(), "total"])
+        .observe(total.as_secs_f64());
 }
 
 /// Observe that a response was received from the solver.
@@ -336,98 +344,119 @@ pub fn solver_response(
     res: Result<&str, &http::Error>,
     solver: &str,
     compute_time: Duration,
+    solver_timeout: Duration,
     is_quote_request: bool,
 ) {
+    let metrics = metrics::get();
+    let kind = if is_quote_request { "quote" } else { "auction" };
     match res {
         Ok(res) => {
-            tracing::trace!(%endpoint, %res, "received response from solver")
+            tracing::trace!(%endpoint, %res, kind, "received response from solver")
         }
         Err(err) => {
-            tracing::warn!(%endpoint, ?err, "failed to receive response from solver")
+            tracing::warn!(%endpoint, ?err, kind, "failed to receive response from solver")
         }
     }
-    let kind = if is_quote_request { "quote" } else { "auction" };
-    metrics::get()
+    metrics
         .used_solve_time
         .with_label_values(&[solver, kind])
         .observe(compute_time.as_secs_f64());
+    if compute_time > solver_timeout {
+        let overrun = compute_time - solver_timeout;
+        tracing::trace!(
+            solver,
+            elapsed = ?compute_time,
+            ?solver_timeout,
+            ?overrun,
+            "solver exceeded its deadline",
+        );
+        metrics
+            .solver_deadline_overruns
+            .with_label_values(&[solver, kind])
+            .inc();
+    }
 }
 
-/// Observe the result of mempool transaction execution.
-pub fn mempool_executed(
+/// Log a single mempool submission attempt. Called inline from the racing
+/// task so that errors from mempools that later get superseded are still
+/// visible in logs. Metrics are emitted separately from `update_metrics`
+/// once the race outcome is known.
+pub fn mempool_log(
     mempool: &Mempool,
-    settlement: &Settlement,
-    res: &Result<SubmissionSuccess, mempools::Error>,
+    settlement: &EncodedSettlement,
+    result: &Result<SubmissionSuccess, mempools::Error>,
 ) {
-    match res {
-        Ok(submission) => {
-            tracing::info!(
-                txid = ?submission.tx_hash,
-                %mempool,
-                ?settlement,
-                "sending transaction via mempool succeeded",
-            );
-        }
-        Err(mempools::Error::Disabled) => {
-            tracing::debug!(
-                %mempool,
-                "sending transaction via mempool disabled",
-            );
-        }
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                %mempool,
-                ?settlement,
-                "sending transaction via mempool failed",
-            );
-        }
+    match result {
+        Ok(submission) => tracing::info!(
+            txid = ?submission.tx_hash,
+            %mempool,
+            ?settlement,
+            "sending transaction via mempool succeeded",
+        ),
+        Err(err) => tracing::warn!(
+            ?err,
+            %mempool,
+            ?settlement,
+            "sending transaction via mempool failed",
+        ),
     }
-    let result = match res {
-        Ok(_) => "Success",
-        Err(mempools::Error::Revert { .. } | mempools::Error::SimulationRevert { .. }) => "Revert",
-        Err(mempools::Error::Expired { .. }) => "Expired",
-        Err(mempools::Error::Other(_)) => "Other",
-        Err(mempools::Error::Disabled) => "Disabled",
-    };
+}
+
+/// Log the submission of a settlement to the block builders.
+pub fn builders_submission_result(
+    settlement: &EncodedSettlement,
+    result: &Result<SubmissionSuccess, mempools::Error>,
+) {
+    match result {
+        Ok(submission) => tracing::info!(
+            txid = ?submission.tx_hash,
+            ?settlement,
+            "sending transaction via builders succeeded",
+        ),
+        Err(err) => tracing::warn!(?err, ?settlement, "sending transaction via builders failed",),
+    }
+}
+
+/// Emit per-receiver submission counters with the final, reclassified label
+/// (`Success` / `Revert` / `Expired` / `Other` / `Superseded` / `Disabled`).
+/// Called once per receiver after the submission resolves.
+pub fn mempool_submission_result(receiver: &str, label: &str, blocks_passed: Option<u64>) {
     metrics::get()
         .mempool_submission
-        .with_label_values(&[&mempool.to_string(), result])
+        .with_label_values(&[receiver, label])
         .inc();
-
-    // For some of the errors we are interested in observing the exact block numbers
-    // passed since the first submission.
-    let blocks_passed = match res {
-        Ok(SubmissionSuccess {
-            submitted_at_block,
-            included_in_block,
-            ..
-        }) => Some(("Success", &submitted_at_block.0, &included_in_block.0)),
-        Err(mempools::Error::Revert {
-            tx_id: _,
-            submitted_at_block,
-            reverted_at_block,
-        }) => Some(("Revert", submitted_at_block, reverted_at_block)),
-        Err(mempools::Error::SimulationRevert {
-            submitted_at_block,
-            reverted_at_block,
-        }) => Some(("Revert", submitted_at_block, reverted_at_block)),
-        Err(mempools::Error::Expired {
-            tx_id: _,
-            submitted_at_block,
-            submission_deadline,
-        }) => Some(("Expired", submitted_at_block, submission_deadline)),
-        Err(mempools::Error::Other(_)) => None,
-        Err(mempools::Error::Disabled) => None,
-    };
-
-    if let Some((label, start, end)) = blocks_passed {
-        let blocks_passed = end.saturating_sub(*start);
+    if let Some(blocks) = blocks_passed {
         metrics::get()
             .mempool_submission_results_blocks_passed
-            .with_label_values(&[&mempool.to_string(), label])
-            .inc_by(blocks_passed);
+            .with_label_values(&[receiver, label])
+            .inc_by(blocks);
     }
+}
+
+/// Observe how long a block builder took to answer a settlement bundle.
+pub fn builder_response_time(builder: &str, elapsed: Duration) {
+    metrics::get()
+        .builder_submission_time
+        .with_label_values(&[builder])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Observe how far the settlement bundle for `block` got with a block builder.
+pub fn bundle_submission(builder: &str, block: u64, delivery: &Delivery) {
+    match delivery {
+        Delivery::Accepted(result) => {
+            tracing::debug!(builder, block, %result, "builder accepted the bundle")
+        }
+        Delivery::Rejected(err) => {
+            tracing::warn!(builder, block, ?err, "builder rejected the bundle")
+        }
+        Delivery::TimedOut => tracing::warn!(builder, block, "builder did not answer in time"),
+        Delivery::Unreachable(err) => tracing::warn!(builder, block, ?err, "builder unreachable"),
+    }
+    metrics::get()
+        .builder_submission
+        .with_label_values(&[builder, delivery.metric_label()])
+        .inc();
 }
 
 /// Observe that an invalid DTO was received.
@@ -436,7 +465,7 @@ pub fn invalid_dto(err: &impl std::error::Error, dto: &str) {
 }
 
 /// Observe that the quoting process is about to start.
-pub fn quoting(order: &quote::Order) {
+pub fn quoting(order: &impl std::fmt::Debug) {
     tracing::trace!(?order, "quoting");
 }
 
@@ -447,15 +476,21 @@ fn competition_error(err: &competition::Error) -> &'static str {
         competition::Error::Solver(solver::Error::Http(_)) => "SolverHttpError",
         competition::Error::Solver(solver::Error::Deserialize(_)) => "SolverDeserializeError",
         competition::Error::Solver(solver::Error::Dto(_)) => "SolverDtoError",
+        competition::Error::Solver(solver::Error::CustomError(_)) => "SolverCustomError",
         competition::Error::SubmissionError => "SubmissionError",
         competition::Error::TooManyPendingSettlements => "TooManyPendingSettlements",
         competition::Error::NoValidOrdersFound => "NoValidOrdersFound",
         competition::Error::MalformedRequest => "MalformedRequest",
+        competition::Error::FastPathOrderMismatch => "FastPathOrderMismatch",
+        competition::Error::FastPathLimitNotMet => "FastPathLimitNotMet",
+        competition::Error::FastPathInvalidOrder(_) => "FastPathInvalidOrder",
+        competition::Error::FastPathSettlement(_) => "FastPathSettlement",
+        competition::Error::EncodingFailed(_) => "EncodingFailed",
     }
 }
 
 pub fn deadline(deadline: &Deadline, timeouts: &Timeouts) {
-    tracing::debug!(?deadline, ?timeouts, "computed deadline");
+    tracing::trace!(?deadline, ?timeouts, "computed deadline");
 }
 
 pub fn sending_solve_request(solver: &str, remaining_time: Duration, is_quote_request: bool) {
@@ -467,25 +502,9 @@ pub fn sending_solve_request(solver: &str, remaining_time: Duration, is_quote_re
         .observe(remaining_time.as_secs_f64());
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum OrderExcludedFromAuctionReason {
     CouldNotFetchBalance,
     InsufficientBalance,
     OrderWithZeroAmountRemaining,
-}
-
-pub fn order_excluded_from_auction(
-    order: &competition::Order,
-    reason: OrderExcludedFromAuctionReason,
-) {
-    tracing::trace!(uid=?order.uid, ?reason, "order excluded from auction");
-}
-
-/// Observe that a settlement was simulated
-pub fn simulated(eth: &Ethereum, tx: &eth::Tx, gas: &Result<Gas, simulator::Error>) {
-    let block: eth::BlockNo = eth.current_block().borrow().number.into();
-    match gas {
-        Ok(gas) => tracing::debug!(block = ?block, gas = ?gas.0, ?tx, "simulated settlement"),
-        Err(err) => tracing::debug!(block = ?block, ?err, "simulated settlement"),
-    }
 }

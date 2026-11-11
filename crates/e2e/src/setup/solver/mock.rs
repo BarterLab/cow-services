@@ -1,13 +1,12 @@
 //! Mock solver for testing purposes. It returns a custom solution.
 
 use {
-    crate::setup::solver::shutdown_signal,
     axum::Json,
     futures::{FutureExt, future::BoxFuture},
     reqwest::Url,
     solvers_dto::{
         auction::Auction,
-        solution::{Solution, Solutions},
+        solution::{Solution, SolverResponse},
     },
     std::sync::{Arc, Mutex, MutexGuard},
 };
@@ -25,24 +24,45 @@ pub struct Mock {
 pub struct State {
     /// In-memory set of the auctions received by the solver.
     auctions: Arc<Mutex<Vec<Auction>>>,
-    /// The currently configured solution to return.
-    solution: Arc<Mutex<SolutionFuture>>,
+    /// The currently configured response to return.
+    response: Arc<Mutex<ResponseFuture>>,
 }
 
 type SolutionFuture = Arc<dyn Fn() -> BoxFuture<'static, Option<Solution>> + Send + Sync>;
+type ResponseFuture = Arc<dyn Fn() -> BoxFuture<'static, SolverResponse> + Send + Sync>;
 
 impl Mock {
+    /// Instructs the solver to return a new response from now on.
+    pub fn configure_response(&self, response: SolverResponse) {
+        *self.state.response.lock().unwrap() = Arc::new(move || {
+            let response = response.clone();
+            async move { response }.boxed()
+        });
+    }
+
+    /// Instructs the solver to return a new response from now on.
+    pub fn configure_response_async(&self, response: ResponseFuture) {
+        *self.state.response.lock().unwrap() = response;
+    }
+
     /// Instructs the solver to return a new solution from now on.
     pub fn configure_solution(&self, solution: Option<Solution>) {
-        *self.state.solution.lock().unwrap() = Arc::new(move || {
-            let solution = solution.clone();
-            async move { solution }.boxed()
+        self.configure_response(SolverResponse::Solutions {
+            solutions: solution.into_iter().collect(),
         });
     }
 
     /// Instructs the solver to return a new solution from now on.
     pub fn configure_solution_async(&self, solution: SolutionFuture) {
-        *self.state.solution.lock().unwrap() = solution;
+        self.configure_response_async(Arc::new(move || {
+            let solution = solution.clone();
+            async move {
+                SolverResponse::Solutions {
+                    solutions: solution().await.into_iter().collect(),
+                }
+            }
+            .boxed()
+        }));
     }
 
     /// Returns all the auctions received by the solver
@@ -54,7 +74,14 @@ impl Mock {
 impl Mock {
     pub async fn new() -> Self {
         let state = State {
-            solution: Arc::new(Mutex::new(Arc::new(|| async { None }.boxed()))),
+            response: Arc::new(Mutex::new(Arc::new(|| {
+                async {
+                    SolverResponse::Solutions {
+                        solutions: Vec::new(),
+                    }
+                }
+                .boxed()
+            }))),
             auctions: Arc::new(Mutex::new(vec![])),
         };
 
@@ -67,7 +94,7 @@ impl Mock {
 
         tokio::task::spawn(async move {
             axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(observe::shutdown::shutdown_signal())
                 .await
                 .unwrap();
         });
@@ -82,14 +109,13 @@ impl Mock {
 async fn solve(
     state: axum::extract::State<State>,
     Json(auction): Json<Auction>,
-) -> (axum::http::StatusCode, Json<Solutions>) {
-    let auction_id = auction.id.unwrap_or_default();
+) -> (axum::http::StatusCode, Json<SolverResponse>) {
+    let auction_id = auction.id.id();
     state.auctions.lock().unwrap().push(auction);
-    let solutions: Vec<_> = {
-        let solution_generator = state.solution.lock().unwrap().clone();
-        solution_generator().await.into_iter().collect()
+    let response = {
+        let response_generator = state.response.lock().unwrap().clone();
+        response_generator().await
     };
-    let solutions = Solutions { solutions };
-    tracing::trace!(?auction_id, ?solutions, "/solve");
-    (axum::http::StatusCode::OK, Json(solutions))
+    tracing::trace!(?auction_id, ?response, "/solve");
+    (axum::http::StatusCode::OK, Json(response))
 }

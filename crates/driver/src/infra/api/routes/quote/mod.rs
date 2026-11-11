@@ -1,6 +1,6 @@
 use {
     crate::infra::{
-        api::{Error, State},
+        api::{Error, State, extract::LoggingQuery},
         observe,
     },
     tracing::Instrument,
@@ -16,24 +16,34 @@ pub(in crate::infra::api) fn quote(router: axum::Router<State>) -> axum::Router<
 
 async fn route(
     state: axum::extract::State<State>,
-    order: axum::extract::Query<dto::Order>,
+    LoggingQuery(order): LoggingQuery<dto::Order>,
 ) -> Result<axum::Json<dto::Quote>, (axum::http::StatusCode, axum::Json<Error>)> {
+    let order = order.into_domain();
+    let quote_id = order.quote_id.0;
     let handle_request = async {
-        let order = order.0.into_domain();
         observe::quoting(&order);
-        let quote = order
+        let result = order
             .quote(
                 state.eth(),
                 state.solver(),
                 state.liquidity(),
                 state.tokens(),
+                state.competition(),
             )
             .await;
-        observe::quoted(state.solver().name(), &order, &quote);
-        Ok(axum::response::Json(dto::Quote::new(quote?)))
+        observe::quoted(state.solver().name(), &order, &result);
+        let quote = result?;
+        Ok(axum::response::Json(dto::Quote::new(
+            quote,
+            state.solver().fast_path_enabled(),
+        )))
     };
 
     handle_request
-        .instrument(tracing::info_span!("/quote", solver = %state.solver().name()))
+        .instrument(tracing::info_span!(
+            "/quote",
+            solver = %state.solver().name(),
+            quote_id
+        ))
         .await
 }

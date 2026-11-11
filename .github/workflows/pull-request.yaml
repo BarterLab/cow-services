@@ -5,68 +5,108 @@ on:
   # We require PRs to be up to date before merging so technically it is not needed run the rust job
   # on main. However for the cache to be usable in PRs we do need the job on main.
   push:
-    branches: [ main ]
+    branches: [main]
 jobs:
+  # Finds the jobs and the tests that the changes of a PR can affect. A job
+  # skips only when its output is `false`. Start the `if` of each job that
+  # reads these outputs with `!cancelled()`, so that the job also runs when
+  # this job skips or fails.
+  changes:
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    outputs:
+      unit: ${{ fromJSON(steps.select.outputs.groups || '{}').unit }}
+      e2e: ${{ fromJSON(steps.select.outputs.groups || '{}').e2e }}
+      driver: ${{ fromJSON(steps.select.outputs.groups || '{}').driver }}
+      db: ${{ fromJSON(steps.select.outputs.groups || '{}').db }}
+      db-solana: ${{ fromJSON(steps.select.outputs.groups || '{}').db-solana }}
+      doc: ${{ fromJSON(steps.select.outputs.groups || '{}').doc }}
+      event-bus: ${{ fromJSON(steps.select.outputs.groups || '{}').event-bus }}
+      nextest-filter: ${{ steps.select.outputs.nextest-filter }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The PR merge commit and its parents. The first parent is the base branch.
+          fetch-depth: 2
+      - run: rustup toolchain install stable --profile minimal
+      - id: select
+        uses: ./.github/actions/select-tests
+        with:
+          base: HEAD^1
+          # `db` and `db-solana` have the packages with tests that have
+          # `postgres` and `solana_db` in their names. `doc` has the packages
+          # with doc tests. Update these lists when a package gets such tests:
+          # a PR that changes only a package that is not in a list skips the
+          # tests of that list.
+          groups: |
+            unit=*
+            e2e=e2e
+            driver=driver
+            db=autopilot database orderbook
+            db-solana=autopilot-svm solana-indexer solana-orderbook
+            doc=autopilot driver number testlib
+            event-bus=event-bus-dto
+          # The tests of these packages use a database that has the
+          # migrations of the folder.
+          paths: |
+            database/sql/=autopilot database orderbook e2e
+            database/sql-pool-indexer/=e2e
+            database/sql-solana/=autopilot-svm solana-indexer solana-orderbook
+          # No test reads these files.
+          ignore: |
+            docs/
+            database/README.md
+
   lint:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: lint
+      - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
         with:
           profile: minimal
           toolchain: nightly
           components: rustfmt
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
+      - uses: tombi-toml/setup-tombi@f2ae7247d62521245eb2793d653b9df472b9e090 # v1.2.4
+        with:
+          version: "1.1.0"
       - run: |
           rustup --version
           rustup show
           cargo --version
           cargo +nightly fmt --version
           cargo clippy --version
+          tombi --version
       - run: just fmt --check
-      - run: just clippy 
-  
-  trivy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-
-      - name: Run Trivy
-        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # v0.32.0
-        with:
-          scan-type: 'fs'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload Trivy scan results to GitHub Security
-        uses: github/codeql-action/upload-sarif@51f77329afa6477de8c49fc9c7046c15b9a4e79d # v3.29.5
-        with:
-          sarif_file: 'trivy-results.sarif'
+      - run: just clippy
+      - run: just fmt-toml --check
 
   cargo-audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   nitpicker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ethanis/nitpicker@e891622bbd9a6ec97a473bcfacfca7332caf2862 # v1.7
@@ -75,20 +115,26 @@ jobs:
           token: "${{ secrets.GITHUB_TOKEN }}"
 
   doc-tests:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.doc != 'false' }}
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: doc-tests
       - run: just test-doc
 
   unit-tests:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.unit != 'false' }}
     timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
@@ -97,19 +143,29 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - uses: taiki-e/install-action@e4767ccc6762bc4347ef2275c75ea77f5f36e27f # nextest
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: workspace-tests
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: nextest
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
-      - run: cargo build --tests
-      - run: just test-unit
+      - run: cargo build --locked --tests
+      # Run only the tests of the packages that the changes can affect. Some of
+      # these packages can have no tests.
+      - run: just test-unit ${FILTER:+-E "$FILTER" --no-tests=warn}
+        env:
+          FILTER: ${{ needs.changes.outputs.nextest-filter }}
 
   test-db:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.db != 'false' }}
     timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
@@ -118,31 +174,77 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: workspace-tests
       # Start the build process in the background. The following cargo test command will automatically
       # wait for the build process to be done before proceeding.
-      - run: cargo build -p orderbook -p database -p autopilot --tests &
-      - uses: taiki-e/install-action@e4767ccc6762bc4347ef2275c75ea77f5f36e27f # nextest
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
+      - run: cargo build --locked --tests &
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
-          file: docker-compose.yaml
-          up-opts: -d db
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
-        with:
-          file: docker-compose.yaml
-          up-opts: migrations --abort-on-container-failure
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+          tool: nextest
+      - run: docker compose -f docker-compose.yaml up -d db
+      - run: docker compose -f docker-compose.yaml up migrations --abort-on-container-failure
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
-      - run: just test-db
+      # Run only the tests of the packages that the changes can affect.
+      - run: just test-db ${FILTER:+-E "$FILTER" --no-tests=warn}
+        env:
+          FILTER: ${{ needs.changes.outputs.nextest-filter }}
 
-  test-local-node:
+  # Runs against a database holding only the solana.* series, so a schema
+  # accidentally depending on the base series fails here.
+  test-db-solana:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.db-solana != 'false' }}
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    env:
+      # Shrink artifact size by not including debug info. Makes build faster and shrinks cache.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: workspace-tests
+      # Start the build process in the background. The following cargo test command will automatically
+      # wait for the build process to be done before proceeding.
+      - run: cargo build --locked --tests &
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: nextest
+      - run: docker compose -f docker-compose.yaml up -d db
+      - run: docker compose -f docker-compose.yaml up migrations-solana --abort-on-container-failure
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.39.0
+      # Run only the tests of the packages that the changes can affect.
+      - run: just test-db-solana ${FILTER:+-E "$FILTER"}
+        env:
+          FILTER: ${{ needs.changes.outputs.nextest-filter }}
+
+  # Sharded with nextest partitions, one runner per shard. The gate jobs
+  # carry the names the branch ruleset requires.
+  test-local-node-shard:
+    name: test-local-node (${{ matrix.shard }}/4)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.e2e != 'false' }}
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       # Shrink artifact size by not including debug info. Makes build faster and shrinks cache.
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -150,36 +252,62 @@ jobs:
       CARGO_TERM_COLOR: always
       TOML_TRACE_ERROR: 1
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: foundry-rs/foundry-toolchain@82dee4ba654bd2146511f85f0d013af94670c4de # v1.4.0
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          # pinned so that a new anvil release cannot break CI without a code change
+          version: v1.9.0
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: e2e
       # Start the build process in the background. The following cargo test command will automatically
       # wait for the build process to be done before proceeding.
-      - run: cargo build -p e2e --tests &
-      - uses: taiki-e/install-action@e4767ccc6762bc4347ef2275c75ea77f5f36e27f # nextest
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
+      - run: cargo build --locked -p e2e --tests &
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
-          file: docker-compose.yaml
-          up-opts: -d db
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
-        with:
-          file: docker-compose.yaml
-          up-opts: migrations --abort-on-container-failure
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+          tool: nextest
+      - run: docker compose -f docker-compose.yaml up -d db
+      - run: docker compose -f docker-compose.yaml up migrations --abort-on-container-failure
+      - run: docker compose -f docker-compose.yaml up migrations-pool-indexer --abort-on-container-failure
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
-      - run: just test-e2e-local
+      - run: just test-e2e-local --partition count:${{ matrix.shard }}/4
+
+  test-local-node:
+    needs: [changes, test-local-node-shard]
+    # Runs even when a shard fails: a skipped required check counts as passing.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          result="${{ needs.test-local-node-shard.result }}"
+          # The shards skip only when no change affects the e2e tests.
+          if [ "$result" = skipped ] && [ "${{ needs.changes.result }}" = success ] &&
+            [ "${{ needs.changes.outputs.e2e }}" = false ]; then
+            exit 0
+          fi
+          test "$result" = success
 
   test-forked-node:
+    name: test-forked-node (${{ matrix.shard }}/2)
+    needs: changes
     # Do not run this job on forks since some secrets are required for it.
+    # Also skip it when no change affects the e2e tests.
     if: |
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      !cancelled() && needs.changes.outputs.e2e != 'false' && (
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      )
     timeout-minutes: 60
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     env:
       # Shrink artifact size by not including debug info. Makes build faster and shrinks cache.
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -189,34 +317,33 @@ jobs:
       FORK_URL_GNOSIS: ${{ secrets.FORK_URL_GNOSIS }}
       TOML_TRACE_ERROR: 1
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: foundry-rs/foundry-toolchain@82dee4ba654bd2146511f85f0d013af94670c4de # v1.4.0
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
-          # the latest version introduced a bug caused forked node tests to fail
-          # only switch back to latest stable version after it was fixed in anvil
-          version: v1.0.0
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+          # pinned so that a new anvil release cannot break CI without a code change
+          version: v1.9.0
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: e2e
       # Start the build process in the background. The following cargo test command will automatically
       # wait for the build process to be done before proceeding.
-      - run: cargo build -p e2e --tests &
-      - uses: taiki-e/install-action@e4767ccc6762bc4347ef2275c75ea77f5f36e27f # nextest
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
+      - run: cargo build --locked -p e2e --tests &
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
-          file: docker-compose.yaml
-          up-opts: -d db
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
-        with:
-          file: docker-compose.yaml
-          up-opts: migrations --abort-on-container-failure
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+          tool: nextest
+      - run: docker compose -f docker-compose.yaml up -d db
+      - run: docker compose -f docker-compose.yaml up migrations --abort-on-container-failure
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
-      - run: just test-e2e-forked
+      - run: just test-e2e-forked --partition count:${{ matrix.shard }}/2
 
   test-driver:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.driver != 'false' }}
     timeout-minutes: 60
     runs-on: ubuntu-latest
     env:
@@ -226,18 +353,25 @@ jobs:
       CARGO_TERM_COLOR: always
       TOML_TRACE_ERROR: 1
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: foundry-rs/foundry-toolchain@82dee4ba654bd2146511f85f0d013af94670c4de # v1.4.0
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
-      - uses: taiki-e/install-action@e4767ccc6762bc4347ef2275c75ea77f5f36e27f # nextest
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          # pinned so that a new anvil release cannot break CI without a code change
+          version: v1.9.0
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: driver
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: nextest
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
       # Build the driver's tests.
-      - run: cargo build -p driver --tests
+      - run: cargo build --locked -p driver --tests
       # Don't spawn any docker containers. The driver's tests will spawn anvil itself.
       - run: just test-driver
 
@@ -245,38 +379,41 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Build Solidity artifacts
-        working-directory: crates/contracts/solidity
+        working-directory: contracts/solidity
         run: make -B artifacts
       - name: Verify no JSON changes
         run: |
-          if git diff --exit-code -- 'crates/contracts/artifacts/*.json'; then
+          if git diff --exit-code -- 'contracts/artifacts/*.json'; then
             echo "✓ Solidity artifacts are up-to-date"
           else
-            echo "✗ Solidity artifacts are out-of-date. Please run 'cd crates/contracts/solidity && make -B artifacts' and commit the changes."
+            echo "✗ Solidity artifacts are out-of-date. Please run 'cd contracts/solidity && make -B artifacts' and commit the changes."
             # run the command again to show exactly what the changes would be
-            git diff --exit-code -- 'crates/contracts/artifacts/*.json'
+            git diff --exit-code -- 'contracts/artifacts/*.json'
             exit 1
           fi
-
 
   openapi:
     timeout-minutes: 60
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: npm install @apidevtools/swagger-cli @stoplight/spectral-cli
       - run: node_modules/.bin/swagger-cli validate crates/orderbook/openapi.yml
       - run: node_modules/.bin/swagger-cli validate crates/driver/openapi.yml
       - run: node_modules/.bin/swagger-cli validate crates/solvers/openapi.yml
+      - run: node_modules/.bin/swagger-cli validate crates/solana-orderbook/openapi.yml
+      - run: node_modules/.bin/swagger-cli validate crates/autopilot-svm/openapi.yml
       - run: node_modules/.bin/spectral lint crates/orderbook/openapi.yml
       - run: node_modules/.bin/spectral lint crates/driver/openapi.yml
       - run: node_modules/.bin/spectral lint crates/solvers/openapi.yml
+      - run: node_modules/.bin/spectral lint crates/solana-orderbook/openapi.yml
+      - run: node_modules/.bin/spectral lint crates/autopilot-svm/openapi.yml
 
   run-flaky-test:
     # to debug a flaky test set `if` to true and configure the flaky test in the `run` step
@@ -292,25 +429,26 @@ jobs:
       FORK_URL_MAINNET: ${{ secrets.FORK_URL_MAINNET }}
       FORK_URL_GNOSIS: ${{ secrets.FORK_URL_GNOSIS }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
-      - uses: foundry-rs/foundry-toolchain@82dee4ba654bd2146511f85f0d013af94670c4de # v1.4.0
-      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          # pinned so that a new anvil release cannot break CI without a code change
+          version: v1.9.0
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: e2e
       # Start the build process in the background. The following cargo test command will automatically
       # wait for the build process to be done before proceeding.
-      - run: cargo build -p e2e --tests &
-      - uses: taiki-e/install-action@e4767ccc6762bc4347ef2275c75ea77f5f36e27f # nextest
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
+      - run: cargo build --locked -p e2e --tests &
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
-          file: docker-compose.yaml
-          up-opts: -d db
-      - uses: yu-ichiro/spin-up-docker-compose-action@b7808421e139a485cb455f78e66605ca9dbe4334 # v1.2
-        with:
-          file: docker-compose.yaml
-          up-opts: migrations --abort-on-container-failure
-      - uses: extractions/setup-just@e33e0265a09d6d736e2ee1e0eb685ef1de4669ff
+          tool: nextest
+      - run: docker compose -f docker-compose.yaml up -d db
+      - run: docker compose -f docker-compose.yaml up migrations --abort-on-container-failure
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
         with:
           just-version: 1.39.0
       - name: Run test in a loop
@@ -323,3 +461,59 @@ jobs:
             fi
             attempt=$((attempt+1))
           done
+
+  generated-contracts:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install nightly --profile minimal --component rustfmt
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: generated-contracts
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.39.0
+      - uses: tombi-toml/setup-tombi@f2ae7247d62521245eb2793d653b9df472b9e090 # v1.2.4
+        with:
+          version: "1.1.0"
+      - name: Verify the code hasn't been tampered with by generating contracts again and making sure there has been no changes
+        run: |
+          just generate-contracts
+          if git diff --exit-code; then
+            echo "✓ Generated contracts are up-to-date"
+          else
+            echo "✗ Generated contracts are out-of-date or were modified by hand. Please run 'just generate-contracts' and commit the changes."
+            exit 1
+          fi
+
+  event-bus-schemas:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.event-bus != 'false' }}
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          shared-key: event-bus-schemas
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: 1.39.0
+      - name: Verify the generated event bus schemas are up-to-date
+        run: |
+          just generate-event-schemas
+          if git diff --exit-code -- 'crates/event-bus-dto/schemas/*.json'; then
+            echo "✓ Event bus schemas are up-to-date"
+          else
+            echo "✗ Event bus schemas are out-of-date. Please run 'just generate-event-schemas' and commit the changes."
+            # run the command again to show exactly what the changes would be
+            git diff --exit-code -- 'crates/event-bus-dto/schemas/*.json'
+            exit 1
+          fi

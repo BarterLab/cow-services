@@ -1,5 +1,11 @@
 use {
-    autopilot::{config::Configuration, shutdown_controller::ShutdownController},
+    autopilot::shutdown_controller::ShutdownController,
+    configs::{
+        autopilot::{Configuration, run_loop::RunLoopConfig},
+        order_quoting::{ExternalSolver, OrderQuoting},
+        shared::SharedConfig,
+        test_util::TestDefault,
+    },
     e2e::setup::{
         OnchainComponents,
         Services,
@@ -70,7 +76,6 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
             .await,
         ],
         colocation::LiquidityProvider::UniswapV2,
-        false,
     );
 
     let services = Services::new(&onchain).await;
@@ -85,59 +90,82 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
         ],
     );
 
-    // Configure autopilot-leader only with test_solver
-    let (_config_file_leader, config_arg_leader) =
-        Configuration::test("test_solver", solver1.address()).to_cli_args();
+    let leader_config = Configuration::test("test_solver", solver1.address());
+    let leader_config = Configuration {
+        metrics_address: "0.0.0.0:9590".parse().unwrap(),
+        api_address: "0.0.0.0:12088".parse().unwrap(),
+        run_loop: RunLoopConfig {
+            enable_leader_lock: true,
+            ..leader_config.run_loop
+        },
+        shared: SharedConfig {
+            gas_estimators: vec![TestDefault::test_default()],
+            ..leader_config.shared
+        },
+        order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+            "test_quoter",
+            "http://localhost:11088/test_solver",
+        )]),
+
+        ..leader_config
+    };
 
     let autopilot_leader = services
-        .start_autopilot_with_shutdown_controller(
-            None,
-            vec![
-                config_arg_leader,
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
-                    .to_string(),
-                "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-                "--metrics-address=0.0.0.0:9590".to_string(),
-                "--api-address=0.0.0.0:12088".to_string(),
-                "--enable-leader-lock=true".to_string(),
-            ],
-            control,
-        )
+        .start_autopilot_with_shutdown_controller(leader_config, control)
         .await;
 
-    // Configure autopilot-backup only with test_solver2
-    let (_config_file_follower, config_arg_follower) =
-        Configuration::test("test_solver2", solver2.address()).to_cli_args();
+    let follower_config = Configuration::test("test_solver2", solver2.address());
+    let follower_config = Configuration {
+        metrics_address: "0.0.0.0:9591".parse().unwrap(),
+        api_address: "0.0.0.0:12089".parse().unwrap(),
+        run_loop: RunLoopConfig {
+            enable_leader_lock: true,
+            ..follower_config.run_loop
+        },
+        order_quoting: OrderQuoting::test_with_drivers(vec![ExternalSolver::new(
+            "test_quoter",
+            "http://localhost:11088/test_solver2",
+        )]),
+        shared: SharedConfig {
+            gas_estimators: vec![TestDefault::test_default()],
+            ..follower_config.shared
+        },
+        ..follower_config
+    };
 
-    let _autopilot_follower = services
-        .start_autopilot(
-            None,
-            vec![
-                config_arg_follower,
-                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver2"
-                    .to_string(),
-                "--gas-estimators=http://localhost:11088/gasprice".to_string(),
-                "--metrics-address=0.0.0.0:9591".to_string(),
-                "--api-address=0.0.0.0:12089".to_string(),
-                "--enable-leader-lock=true".to_string(),
-            ],
-        )
-        .await;
+    let _autopilot_follower = services.start_autopilot(follower_config).await;
 
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver1,test_solver2|http://localhost:11088/test_solver2".to_string(),
-            "--native-price-estimators=Forwarder|http://0.0.0.0:9588".to_string(),
-        ])
+        .start_api(configs::orderbook::Configuration {
+            order_quoting: OrderQuoting::test_with_drivers(vec![
+                ExternalSolver::new("test_quoter", "http://localhost:11088/test_solver1"),
+                ExternalSolver::new("test_solver2", "http://localhost:11088/test_solver2"),
+            ]),
+            native_price_estimation: configs::orderbook::native_price::NativePriceConfig {
+                estimators: configs::native_price_estimators::NativePriceEstimators::new(vec![
+                    vec![
+                        configs::native_price_estimators::NativePriceEstimator::forwarder(
+                            "http://0.0.0.0:9588".parse().unwrap(),
+                        ),
+                    ],
+                ]),
+                ..configs::orderbook::native_price::NativePriceConfig::test_default()
+            },
+            ..configs::orderbook::Configuration::test_default()
+        })
         .await;
 
-    let order = || {
+    // `valid_to` has 1-second resolution, so iterations that complete within a
+    // single second would otherwise sign the exact same order and get rejected
+    // as duplicates. Shift `valid_to` per iteration to keep each order's UID
+    // unique.
+    let order = |i: u32| {
         OrderCreation {
             sell_token: *token_a.address(),
             sell_amount: 10u64.eth(),
             buy_token: *onchain.contracts().weth.address(),
             buy_amount: 5u64.eth(),
-            valid_to: model::time::now_in_epoch_seconds() + 300,
+            valid_to: model::time::now_in_epoch_seconds() + 300 + i,
             kind: OrderKind::Sell,
             ..Default::default()
         }
@@ -152,7 +180,7 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
     // - only test_solver should participate and settle
     for i in 1..=10 {
         tracing::info!("Tx with autopilot-leader {i}");
-        let uid = services.create_order(&order()).await.unwrap();
+        let uid = services.create_order(&order(i)).await.unwrap();
 
         tracing::info!("waiting for trade");
         let indexed_trades = || async {
@@ -185,7 +213,8 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
         .await
         .unwrap();
 
-    // Wait for the follower to step up as leader by checking its metrics endpoint
+    // Wait for the follower to step up as leader by checking its metrics
+    // endpoint
     let is_follower_leader = || async {
         onchain.mint_block().await;
         let Ok(response) = reqwest::get("http://0.0.0.0:9591/metrics").await else {
@@ -203,12 +232,12 @@ async fn dual_autopilot_only_leader_produces_auctions(web3: Web3) {
 
     // Run 10 txs, autopilot-backup is in charge
     // - only test_solver2 should participate and settle
-    for i in 1..=10 {
+    for i in 11..=20 {
         tracing::info!("Tx with autopilot-backup {i}");
         let uid_cell = std::cell::Cell::new(None);
         let try_create_order = || async {
             onchain.mint_block().await;
-            if let Ok(uid) = services.create_order(&order()).await {
+            if let Ok(uid) = services.create_order(&order(i)).await {
                 uid_cell.set(Some(uid));
                 return true;
             }

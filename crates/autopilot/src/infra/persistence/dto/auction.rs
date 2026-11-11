@@ -1,30 +1,32 @@
 use {
     super::order::Order,
-    crate::domain::{self, auction::Price, eth},
+    crate::domain::{self, auction::Price},
     alloy::primitives::{Address, U256},
+    eth_domain_types as eth,
     number::serialization::HexOrDecimalU256,
     serde::{Deserialize, Serialize},
     serde_with::serde_as,
     std::collections::BTreeMap,
 };
 
-pub fn from_domain(auction: domain::RawAuctionData) -> RawAuctionData {
+/// Converts the auction into the shape that gets archived to the DB and S3.
+///
+/// Takes the auction by reference so the caller can keep using it afterwards
+/// without a deep clone.
+pub fn from_domain(auction: &domain::RawAuctionData) -> RawAuctionData {
     RawAuctionData {
         block: auction.block,
         orders: auction
             .orders
-            .into_iter()
+            .iter()
             .map(super::order::from_domain)
             .collect(),
         prices: auction
             .prices
-            .into_iter()
-            .map(|(key, value)| (key.0, value.get().0))
+            .iter()
+            .map(|(key, value)| (**key, value.get().0))
             .collect(),
-        surplus_capturing_jit_order_owners: auction
-            .surplus_capturing_jit_order_owners
-            .into_iter()
-            .collect(),
+        surplus_capturing_jit_order_owners: auction.surplus_capturing_jit_order_owners.clone(),
     }
 }
 
@@ -66,7 +68,7 @@ impl Auction {
                 .prices
                 .into_iter()
                 .map(|(key, value)| {
-                    Price::try_new(value.into()).map(|price| (eth::TokenAddress(key), price))
+                    Price::try_new(value.into()).map(|price| (eth::TokenAddress::from(key), price))
                 })
                 .collect::<Result<_, _>>()?,
             surplus_capturing_jit_order_owners: self

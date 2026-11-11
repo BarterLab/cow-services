@@ -1,0 +1,59 @@
+[package]
+name = "solana-indexer"
+version = "0.1.0"
+authors = ["Cow Protocol Developers <dev@cow.fi>"]
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Solana settlement indexer for CoW Protocol"
+repository = "https://github.com/cowprotocol/services"
+
+[lib]
+name = "solana_indexer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "solana-indexer"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+async-trait = { workspace = true }
+bigdecimal = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+configs = { workspace = true }
+cow-settlement-interface = { workspace = true }
+cow-solana-rpc = { workspace = true }
+database = { workspace = true }
+derive_more = { workspace = true }
+futures = { workspace = true }
+humantime-serde = { workspace = true }
+observe = { workspace = true }
+prometheus = { workspace = true }
+prometheus-metric-storage = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde-ext = { workspace = true, features = ["solana"] }
+solana-sdk = { workspace = true }
+solana-transaction-status-client-types = { workspace = true }
+spl-token-2022-interface = { workspace = true }
+spl-token-interface = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+yellowstone-grpc-client = { workspace = true }
+yellowstone-grpc-proto = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+cow-settlement-client = { workspace = true }
+cow-solana-rpc = { workspace = true, features = ["test-util"] }
+serde_json = { workspace = true }
+wincode = { workspace = true }
+
+[lints]
+workspace = true
