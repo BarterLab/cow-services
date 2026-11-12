@@ -29,6 +29,8 @@ pub struct BlockInfo {
     pub gas_limit: U256,
     pub gas_price: U256,
     pub base_fee: u64,
+    /// Child base fee under Ethereum Mainnet EIP-1559 parameters.
+    pub next_base_fee: u64,
     /// When the system noticed the new block.
     pub observed_at: Instant,
 }
@@ -43,6 +45,7 @@ impl Default for BlockInfo {
             gas_limit: Default::default(),
             gas_price: Default::default(),
             base_fee: Default::default(),
+            next_base_fee: Default::default(),
             observed_at: Instant::now(),
         }
     }
@@ -56,6 +59,8 @@ impl PartialEq<Self> for BlockInfo {
             && self.timestamp == other.timestamp
             && self.gas_limit == other.gas_limit
             && self.gas_price == other.gas_price
+            && self.base_fee == other.base_fee
+            && self.next_base_fee == other.next_base_fee
     }
 }
 
@@ -84,6 +89,9 @@ impl TryFrom<alloy_rpc_types::Header> for BlockInfo {
             base_fee: value
                 .base_fee_per_gas
                 .ok_or_else(|| anyhow!("no base fee available"))?,
+            next_base_fee: value
+                .next_block_base_fee(alloy_eips::eip1559::BaseFeeParams::ethereum())
+                .ok_or_else(|| anyhow!("no next base fee available"))?,
             observed_at: Instant::now(),
         })
     }
@@ -404,6 +412,24 @@ mod tests {
         futures::StreamExt,
         tokio::time::{Duration, timeout},
     };
+
+    #[test]
+    fn mainnet_child_base_fee_tracks_parent_gas_usage() {
+        for (base_fee, gas_used, child_fee) in [
+            (1_000_000_000, 0, 875_000_000),
+            (1_000_000_000, 15_000_000, 1_000_000_000),
+            (1_000_000_000, 30_000_000, 1_125_000_000),
+            (1, 30_000_000, 2),
+        ] {
+            let mut header: alloy_rpc_types::Header = Default::default();
+            header.inner.base_fee_per_gas = Some(base_fee);
+            header.inner.gas_limit = 30_000_000;
+            header.inner.gas_used = gas_used;
+            let block = BlockInfo::try_from(header).unwrap();
+            assert_eq!(block.base_fee, base_fee);
+            assert_eq!(block.next_base_fee, child_fee);
+        }
+    }
 
     fn new_block(number: u64) -> BlockInfo {
         BlockInfo {

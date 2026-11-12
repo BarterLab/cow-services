@@ -78,7 +78,8 @@ impl Auction {
         });
 
         let gas_est = eth.gas_price().await?;
-        let base_fee = eth.current_block().borrow().base_fee;
+        let head = *eth.current_block().borrow();
+        let base_fee = eth.inclusion_base_fee(&head);
         let gas_price = GasPrice::new(
             U256::from(gas_est.max_fee_per_gas).into(),
             U256::from(gas_est.max_priority_fee_per_gas).into(),
