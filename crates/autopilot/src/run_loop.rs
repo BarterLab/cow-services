@@ -1211,6 +1211,7 @@ mod tests {
             gas_limit: Default::default(),
             gas_price: Default::default(),
             base_fee: Default::default(),
+            next_base_fee: Default::default(),
             observed_at: Instant::now(),
         }
     }

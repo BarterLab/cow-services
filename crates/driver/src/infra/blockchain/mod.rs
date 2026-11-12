@@ -232,6 +232,11 @@ impl Ethereum {
         &self.inner.current_block
     }
 
+    /// Fee of the next inclusion block, computed from an already observed head.
+    pub fn inclusion_base_fee(&self, head: &ethrpc::block_stream::BlockInfo) -> u64 {
+        if self.chain() == Chain::Mainnet { head.next_base_fee } else { head.base_fee }
+    }
+
     /// The gas price is determined based on the deadline by which the
     /// transaction must be included on-chain. A shorter deadline requires a
     /// higher gas price to increase the likelihood of timely inclusion.
@@ -343,7 +348,7 @@ impl Ethereum {
         state_overrides: Option<&StateOverride>,
         state_overrides_block: Option<StateOverrideBlock>,
     ) -> Result<eth::Gas, Error> {
-        let tx = self.simulation_transaction(tx).await?;
+        let tx = self.simulation_transaction(tx, None).await?;
 
         let estimate = self
             .web3
@@ -366,16 +371,21 @@ impl Ethereum {
         tx: eth::Tx,
         context: &SimulationContext,
     ) -> Result<eth::Gas, Error> {
-        self.ensure_simulation_context_current(context).await?;
-
-        let tx = self.simulation_transaction(tx).await?;
-        let gas = self
+        let base = self.checked_simulation_context_block(context).await?;
+        let base_fee = if self.chain() == Chain::Mainnet {
+            Some(base.header.next_block_base_fee(alloy::eips::eip1559::BaseFeeParams::ethereum())
+                .ok_or_else(|| Error::GasPrice(anyhow!("no next-block base fee available")))?)
+        } else {
+            None
+        };
+        let block_overrides = context.block_overrides(base_fee);
+        let tx = self.simulation_transaction(tx, base_fee).await?;
+        let gas: alloy::primitives::U64 = self
             .web3
             .provider
-            .estimate_gas(tx.clone())
-            .overrides(context.state_overrides().clone())
-            .with_block_overrides(context.block_overrides())
-            .block(context.base_block_id())
+            .raw_request("eth_estimateGas".into(), (
+                &tx, context.base_block_id(), context.state_overrides(), &block_overrides,
+            ))
             .await
             .map_err(|error| {
                 tracing::error!(
@@ -385,17 +395,16 @@ impl Ethereum {
                         tx,
                         context.base_block_id(),
                         context.state_overrides(),
-                        context.block_overrides(),
+                        block_overrides,
                     ]),
                     rpc_error = ?error.as_error_resp(),
                     "Simulation context RPC failed",
                 );
                 Error::Rpc(error)
-            })?
-            .into();
+            })?;
 
         self.ensure_simulation_context_current(context).await?;
-        Ok(gas)
+        Ok(gas.to::<u64>().into())
     }
 
     /// Ensure a one-block simulation lease still points at the canonical head.
@@ -403,6 +412,13 @@ impl Ethereum {
         &self,
         context: &SimulationContext,
     ) -> Result<(), Error> {
+        self.checked_simulation_context_block(context).await.map(|_| ())
+    }
+
+    async fn checked_simulation_context_block(
+        &self,
+        context: &SimulationContext,
+    ) -> Result<alloy::rpc::types::Block, Error> {
         let latest = self
             .web3
             .provider
@@ -437,7 +453,7 @@ impl Ethereum {
             });
         }
 
-        Ok(())
+        Ok(latest)
     }
 
     fn simulation_gas_limit(&self) -> Result<u64, Error> {
@@ -447,7 +463,7 @@ impl Ethereum {
             .map_err(|err| Error::GasPrice(anyhow!("invalid transaction gas limit: {err}")))
     }
 
-    async fn simulation_transaction(&self, tx: eth::Tx) -> Result<TransactionRequest, Error> {
+    async fn simulation_transaction(&self, tx: eth::Tx, base_fee: Option<u64>) -> Result<TransactionRequest, Error> {
         let tx = TransactionRequest::default()
             .with_gas_limit(self.simulation_gas_limit()?)
             .from(tx.from)
@@ -456,14 +472,18 @@ impl Ethereum {
             .input(tx.input.into())
             .access_list(tx.access_list.into());
 
-        Ok(match self.simulation_gas_price().await {
+        let gas_price = match base_fee {
+            Some(base_fee) => Some(self.gas_price().await?.effective(base_fee)),
+            None => self.simulation_gas_price().await,
+        };
+        Ok(match gas_price {
             Some(gas_price) => tx.with_gas_price(gas_price),
             None => tx,
         })
     }
 
     pub async fn trace(&self, tx: &eth::Tx) -> Result<eth::Gas, Error> {
-        let tx = self.simulation_transaction(tx.clone()).await?;
+        let tx = self.simulation_transaction(tx.clone(), None).await?;
         simulator::ethereum::trace_gas(&self.web3, tx)
             .await
             .map_err(|err| match err {

@@ -2,7 +2,7 @@ use {
     alloy::{
         eips::BlockId,
         primitives::{B256, U256},
-        rpc::types::{BlockOverrides, state::StateOverride},
+        rpc::types::state::StateOverride,
     },
     std::sync::Arc,
 };
@@ -90,10 +90,17 @@ impl SimulationContext {
         BlockId::hash_canonical(self.base_hash)
     }
 
-    pub(crate) fn block_overrides(&self) -> BlockOverrides {
-        BlockOverrides::default()
-            .with_number(U256::from(self.target_block))
-            .with_time(self.target_timestamp)
+    pub(crate) fn block_overrides(&self, base_fee: Option<u64>) -> serde_json::Value {
+        let mut overrides = serde_json::json!({
+            "number": U256::from(self.target_block),
+            "time": U256::from(self.target_timestamp),
+        });
+        if let Some(base_fee) = base_fee {
+            // Alloy's BlockOverrides serializes `baseFee`, which the Mainnet
+            // RPC silently ignores. Geth requires `baseFeePerGas`.
+            overrides["baseFeePerGas"] = serde_json::json!(U256::from(base_fee));
+        }
+        overrides
     }
 }
 
@@ -138,9 +145,10 @@ mod tests {
         assert_eq!(context.target_block(), 0x123_457);
         assert_eq!(context.target_timestamp(), 0x123_459);
 
-        let encoded = serde_json::to_value(context.block_overrides()).unwrap();
+        let encoded = serde_json::to_value(context.block_overrides(Some(1_125_000_000))).unwrap();
         assert_eq!(encoded["number"], "0x123457");
         assert_eq!(encoded["time"], "0x123459");
+        assert_eq!(encoded["baseFeePerGas"], "0x430e2340");
     }
 
     #[test]
