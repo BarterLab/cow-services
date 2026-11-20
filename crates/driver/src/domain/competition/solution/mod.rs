@@ -826,11 +826,18 @@ impl Solution {
         native: crate::infra::solver::ManageNativeToken,
         sender: eth::Address,
     ) -> Result<Settlement, Error> {
-        self.encode_for_submission(auction, eth, simulator, native, SubmissionMode::Direct(sender))
-            .await
+        self.encode_for_submission(
+            auction,
+            eth,
+            simulator,
+            native,
+            SubmissionMode::Direct(sender),
+        )
+        .await
     }
 
-    /// Encode and validate the transaction envelope for the chosen submission mode.
+    /// Encode and validate the transaction envelope for the chosen submission
+    /// mode.
     pub async fn encode_for_submission(
         self,
         auction: &competition::Auction,

@@ -54,7 +54,8 @@ pub struct Settlement {
     /// The gas parameters used by the settlement.
     pub gas: Gas,
     mode: SubmissionMode,
-    /// Submission envelopes validated for this mode, including required access lists.
+    /// Submission envelopes validated for this mode, including required access
+    /// lists.
     #[debug(ignore)]
     reference_internalized: eth::Tx,
     #[debug(ignore)]

@@ -6,7 +6,11 @@ use {
                 Solution,
                 auction,
                 solution::{
-                    Error, Id, Interaction, Settlement, interaction::Custom,
+                    Error,
+                    Id,
+                    Interaction,
+                    Settlement,
+                    interaction::Custom,
                     settlement::Internalization,
                 },
             },
@@ -250,7 +254,8 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
     assert!(calls.lock().unwrap().is_empty());
 
     assert!(matches!(
-        exact_solution.clone()
+        exact_solution
+            .clone()
             .encode_from(&auction, &eth, &simulator, native, UNFUNDED_SOLVER)
             .await,
         Err(Error::SolverAccountInsufficientBalance(_))
@@ -293,7 +298,8 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
         .unwrap();
     assert_delegated(&redelegated, replacement);
 
-    // The same signer must be validated again when the destination and calldata change.
+    // The same signer must be validated again when the destination and calldata
+    // change.
     let reverted_to_direct = redelegated
         .for_sender(replacement, &eth, &simulator)
         .await
@@ -325,7 +331,13 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
     .unwrap();
     exact_solution.set_simulation_context(context).unwrap();
     let exact = exact_solution
-        .encode_for_submission(&auction, &eth, &simulator, native, delegated_mode(replacement))
+        .encode_for_submission(
+            &auction,
+            &eth,
+            &simulator,
+            native,
+            delegated_mode(replacement),
+        )
         .await
         .unwrap();
     let encoded = exact.encode(&eth, None).unwrap();
