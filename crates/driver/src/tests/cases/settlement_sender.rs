@@ -1,10 +1,16 @@
 use {
     crate::{
-        domain::competition::{
-            Auction,
-            Solution,
-            auction,
-            solution::{Id, Interaction, interaction::Custom, settlement::Internalization},
+        domain::{
+            competition::{
+                Auction,
+                Solution,
+                auction,
+                solution::{
+                    Error, Id, Interaction, Settlement, interaction::Custom,
+                    settlement::Internalization,
+                },
+            },
+            mempools::SubmissionMode,
         },
         infra::{
             Ethereum,
@@ -35,6 +41,8 @@ use {
 
 type Calls = Arc<Mutex<Vec<Value>>>;
 
+const UNFUNDED_SOLVER: Address = Address::repeat_byte(0xaa);
+
 async fn rpc(State(calls): State<Calls>, Json(request): Json<Value>) -> Json<Value> {
     let result = match request["method"].as_str().unwrap() {
         "eth_chainId" => json!("0x1"),
@@ -49,6 +57,7 @@ async fn rpc(State(calls): State<Calls>, Json(request): Json<Value>) -> Json<Val
         "eth_call" => json!(B256::ZERO),
         "eth_gasPrice" => json!("0x2"),
         "eth_estimateGas" => json!("0xea60"),
+        "eth_getBalance" if request["params"][0] == json!(UNFUNDED_SOLVER) => json!("0x0"),
         "eth_getBalance" => json!("0xde0b6b3a7640000"),
         other => panic!("unexpected RPC method {other}"),
     };
@@ -65,6 +74,7 @@ fn assert_revalidated(calls: &[Value], sender: Address, internalized: &eth::Tx, 
     assert_eq!(gas.len(), 2);
     for (request, prepared) in gas.into_iter().zip([internalized, full]) {
         assert_eq!(request["from"], json!(sender));
+        assert_eq!(request["to"], json!(prepared.to));
         let input = request
             .get("input")
             .or_else(|| request.get("data"))
@@ -124,7 +134,7 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
     ));
     let solver = Solver::try_new(
         Config {
-            accounts: vec![Account::Address(Address::repeat_byte(0xaa))],
+            accounts: vec![Account::Address(UNFUNDED_SOLVER)],
             ..Default::default()
         },
         eth.clone(),
@@ -180,6 +190,12 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
     let direct = prepared.transaction(Internalization::Enable);
     let full = prepared.transaction(Internalization::Disable);
     assert_ne!(direct.input, full.input);
+    for (mode, transaction) in [
+        (Internalization::Enable, direct),
+        (Internalization::Disable, full),
+    ] {
+        assert_eq!(prepared.protocol_calldata(mode), transaction.input);
+    }
     assert_revalidated(
         &std::mem::take(&mut *calls.lock().unwrap()),
         original,
@@ -233,6 +249,68 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
     }
     assert!(calls.lock().unwrap().is_empty());
 
+    assert!(matches!(
+        exact_solution.clone()
+            .encode_from(&auction, &eth, &simulator, native, UNFUNDED_SOLVER)
+            .await,
+        Err(Error::SolverAccountInsufficientBalance(_))
+    ));
+    calls.lock().unwrap().clear();
+
+    let delegated_mode = |submitter_eoa| SubmissionMode::Delegated {
+        submitter_eoa,
+        solver_eoa: UNFUNDED_SOLVER,
+    };
+    let assert_delegated = |candidate: &Settlement, payer| {
+        let wrapped = candidate.transaction(Internalization::Enable);
+        let wrapped_full = candidate.transaction(Internalization::Disable);
+        for (mode, wrapper, canonical) in [
+            (Internalization::Enable, wrapped, direct),
+            (Internalization::Disable, wrapped_full, full),
+        ] {
+            assert_eq!(candidate.protocol_calldata(mode), canonical.input);
+            assert_eq!(wrapper.from, payer);
+            assert_eq!(wrapper.to, UNFUNDED_SOLVER);
+            assert_eq!(&wrapper.input[..20], canonical.to.as_slice());
+            assert_eq!(&wrapper.input[20..], canonical.input.as_ref());
+        }
+        assert_revalidated(
+            &std::mem::take(&mut *calls.lock().unwrap()),
+            payer,
+            wrapped,
+            wrapped_full,
+        );
+    };
+    let delegated = exact_solution
+        .clone()
+        .encode_for_submission(&auction, &eth, &simulator, native, delegated_mode(original))
+        .await
+        .unwrap();
+    assert_delegated(&delegated, original);
+    let redelegated = delegated
+        .for_submission(delegated_mode(replacement), &eth, &simulator)
+        .await
+        .unwrap();
+    assert_delegated(&redelegated, replacement);
+
+    // The same signer must be validated again when the destination and calldata change.
+    let reverted_to_direct = redelegated
+        .for_sender(replacement, &eth, &simulator)
+        .await
+        .unwrap();
+    let restored = reverted_to_direct.transaction(Internalization::Enable);
+    let restored_full = reverted_to_direct.transaction(Internalization::Disable);
+    assert_eq!(restored.to, direct.to);
+    assert_eq!(restored.input, direct.input);
+    assert_eq!(restored_full.to, full.to);
+    assert_eq!(restored_full.input, full.input);
+    assert_revalidated(
+        &std::mem::take(&mut *calls.lock().unwrap()),
+        replacement,
+        restored,
+        restored_full,
+    );
+
     let mut state = alloy::rpc::types::state::StateOverride::default();
     state.insert(Address::repeat_byte(0x88), Default::default());
     let target = eth::BlockNo(2);
@@ -247,14 +325,26 @@ async fn prepared_settlement_reuses_payer_and_revalidates_a_new_one() {
     .unwrap();
     exact_solution.set_simulation_context(context).unwrap();
     let exact = exact_solution
-        .encode_from(&auction, &eth, &simulator, native, replacement)
+        .encode_for_submission(&auction, &eth, &simulator, native, delegated_mode(replacement))
         .await
         .unwrap();
+    let encoded = exact.encode(&eth, None).unwrap();
+    assert_eq!(
+        encoded.internalized.input,
+        exact.transaction(Internalization::Enable).input
+    );
+    assert_eq!(
+        encoded.uninternalized.input,
+        exact.transaction(Internalization::Disable).input
+    );
     assert_eq!(exact.submission_deadline(eth::BlockNo(1)), None);
     assert_eq!(exact.submission_deadline(eth::BlockNo(7)), Some(target));
     let encoded = exact.encode(&eth, Some(eth::BlockNo(7))).unwrap();
     for tx in [encoded.internalized, encoded.uninternalized] {
-        let settle = settleCall::abi_decode(&tx.input).unwrap();
+        assert_eq!(tx.from, replacement);
+        assert_eq!(tx.to, UNFUNDED_SOLVER);
+        assert_eq!(&tx.input[..20], direct.to.as_slice());
+        let settle = settleCall::abi_decode(&tx.input[20..]).unwrap();
         let guard = checkDeadlineCall::abi_decode(&settle.interactions[0][0].callData).unwrap();
         assert_eq!(guard.deadline, U256::from(target.0));
     }

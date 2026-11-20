@@ -15,10 +15,14 @@ use {
                 order::{self},
                 solution::{self, Interaction, Trade, error},
             },
+            mempools::{SubmissionMode, prepare_submission},
         },
         infra::{blockchain::Ethereum, solver::ManageNativeToken},
     },
-    alloy::{primitives::U256, rpc::types::state::StateOverride},
+    alloy::{
+        primitives::{Bytes, U256},
+        rpc::types::state::StateOverride,
+    },
     eth_domain_types as eth,
     futures::{FutureExt, future::try_join_all},
     simulator::{self, Simulator},
@@ -49,7 +53,8 @@ pub struct Settlement {
     pub auction_id: auction::Id,
     /// The gas parameters used by the settlement.
     pub gas: Gas,
-    /// Access list required for ETH transfers to smart-contract wallets
+    mode: SubmissionMode,
+    /// Submission envelopes validated for this mode, including required access lists.
     #[debug(ignore)]
     reference_internalized: eth::Tx,
     #[debug(ignore)]
@@ -81,7 +86,7 @@ impl Settlement {
         eth: &Ethereum,
         simulator: &Simulator,
         native: ManageNativeToken,
-        sender: eth::Address,
+        mode: SubmissionMode,
     ) -> Result<Self, Error> {
         // For a settlement to be valid, the solution has to respect some rules
         // which would otherwise lead to slashing. Check those rules
@@ -117,7 +122,7 @@ impl Settlement {
         let approvals_uninternalized: Vec<_> = approvals_disable.collect();
 
         let encode_reference = |internalization, approvals: &[eth::allowance::Approval]| {
-            let mut tx = encoding::tx(
+            let tx = encoding::tx(
                 auction_id,
                 &native_prices,
                 &solution,
@@ -127,8 +132,7 @@ impl Settlement {
                 native,
                 None,
             )?;
-            tx.from = sender;
-            Ok::<_, Error>(tx)
+            Ok::<_, Error>(prepare_submission(&tx, &mode))
         };
         let mut internalized = encode_reference(Internalization::Enable, &approvals_internalized)?;
         let mut uninternalized =
@@ -144,6 +148,7 @@ impl Settlement {
         Ok(Self {
             auction_id,
             gas,
+            mode,
             native,
             solution,
             native_prices,
@@ -246,10 +251,20 @@ impl Settlement {
         }
     }
 
+    /// The transaction envelope validated for the current submission mode.
     pub fn transaction(&self, internalization: Internalization) -> &eth::Tx {
         match internalization {
             Internalization::Enable => &self.reference_internalized,
             Internalization::Disable => &self.reference_uninternalized,
+        }
+    }
+
+    /// Calldata sent to the original settlement or flashloan router.
+    pub fn protocol_calldata(&self, internalization: Internalization) -> Bytes {
+        let input = &self.transaction(internalization).input;
+        match self.mode {
+            SubmissionMode::Direct(_) => input.clone(),
+            SubmissionMode::Delegated { .. } => input.slice(eth::Address::len_bytes()..),
         }
     }
 
@@ -259,10 +274,23 @@ impl Settlement {
         eth: &Ethereum,
         simulator: &Simulator,
     ) -> Result<Self, Error> {
+        self.for_submission(SubmissionMode::Direct(sender), eth, simulator)
+            .await
+    }
+
+    /// Rebuild and validate the envelope when the submission mode changes.
+    pub async fn for_submission(
+        &self,
+        mode: SubmissionMode,
+        eth: &Ethereum,
+        simulator: &Simulator,
+    ) -> Result<Self, Error> {
         let mut updated = self.clone();
-        if updated.reference_internalized.from != sender {
-            updated.reference_internalized.from = sender;
-            updated.reference_uninternalized.from = sender;
+        if self.mode != mode {
+            updated.reference_internalized =
+                self.encode_transaction(eth, Internalization::Enable, None, mode)?;
+            updated.reference_uninternalized =
+                self.encode_transaction(eth, Internalization::Disable, None, mode)?;
             updated.gas = Self::validate_sender(
                 &updated.solution,
                 &mut updated.reference_internalized,
@@ -271,6 +299,7 @@ impl Settlement {
                 simulator,
             )
             .await?;
+            updated.mode = mode;
         }
         Ok(updated)
     }
@@ -289,6 +318,31 @@ impl Settlement {
 
     pub fn simulation_context(&self) -> Option<&SimulationContext> {
         self.solution.simulation_context()
+    }
+
+    fn encode_transaction(
+        &self,
+        eth: &Ethereum,
+        internalization: Internalization,
+        deadline: Option<eth::BlockNo>,
+        mode: SubmissionMode,
+    ) -> Result<eth::Tx, Error> {
+        let approvals = match internalization {
+            Internalization::Enable => &self.approvals_internalized,
+            Internalization::Disable => &self.approvals_uninternalized,
+        };
+        // Encode the original protocol call before applying the selected mode.
+        let tx = encoding::tx(
+            self.auction_id,
+            &self.native_prices,
+            &self.solution,
+            eth.contracts(),
+            approvals.iter().cloned(),
+            internalization,
+            self.native,
+            deadline,
+        )?;
+        Ok(prepare_submission(&tx, &mode))
     }
 
     /// Encode the settlement into a submission-ready [`EncodedSettlement`].
@@ -310,22 +364,7 @@ impl Settlement {
             if deadline.is_none() {
                 return Ok(self.transaction(internalization).clone());
             }
-            let approvals = match internalization {
-                Internalization::Enable => &self.approvals_internalized,
-                Internalization::Disable => &self.approvals_uninternalized,
-            };
-
-            let mut tx = encoding::tx(
-                self.auction_id,
-                &self.native_prices,
-                &self.solution,
-                eth.contracts(),
-                approvals.iter().cloned(),
-                internalization,
-                self.native,
-                deadline,
-            )?;
-            tx.from = self.reference_internalized.from;
+            let mut tx = self.encode_transaction(eth, internalization, deadline, self.mode)?;
             tx.set_access_list(self.transaction(internalization).access_list.clone());
             Ok(tx)
         };
