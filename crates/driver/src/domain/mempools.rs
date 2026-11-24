@@ -34,7 +34,7 @@ const GAS_PRICE_BUMP_PCT: u64 = 13;
 const CANCELLATION_GAS_AMOUNT: u64 = 22_000;
 
 /// How the settlement transaction should be submitted on-chain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionMode {
     /// Solver EOA signs and submits directly to the settlement contract.
     Direct(eth::Address),

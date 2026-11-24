@@ -7,6 +7,7 @@ use {
         domain::{
             self,
             competition::{self, order},
+            mempools::SubmissionMode,
         },
         infra::{
             blockchain::{self, Ethereum},
@@ -825,8 +826,28 @@ impl Solution {
         native: crate::infra::solver::ManageNativeToken,
         sender: eth::Address,
     ) -> Result<Settlement, Error> {
+        self.encode_for_submission(
+            auction,
+            eth,
+            simulator,
+            native,
+            SubmissionMode::Direct(sender),
+        )
+        .await
+    }
+
+    /// Encode and validate the transaction envelope for the chosen submission
+    /// mode.
+    pub async fn encode_for_submission(
+        self,
+        auction: &competition::Auction,
+        eth: &Ethereum,
+        simulator: &Simulator,
+        native: crate::infra::solver::ManageNativeToken,
+        mode: SubmissionMode,
+    ) -> Result<Settlement, Error> {
         let auction_id = auction.auction_id().ok_or(Error::MissingAuctionId)?;
-        Settlement::new(self, auction, auction_id, eth, simulator, native, sender).await
+        Settlement::new(self, auction, auction_id, eth, simulator, native, mode).await
     }
 
     /// Swap this quote solution's single user order for the real signed
